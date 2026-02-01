@@ -13,13 +13,20 @@
 # limitations under the License.
 
 """
-Bimanual Teleoperation Script for OpenArm
+Bimanual Teleoperation / OpenPI Client for OpenArm
 
-Controls both robot arms using Vive controllers or keyboard.
+Supports two modes:
+  - Teleoperation mode (default): Manual control via keyboard/VR/gamepad
+  - Client mode (--client): Acts as OpenPI client, receives actions from π₀ server
 
 Usage:
+    # Teleoperation mode:
     python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt
-    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --device keyboard
+    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --input keyboard
+
+    # OpenPI client mode (connect to π₀ policy server):
+    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --client
+    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --client --host localhost --port 8000
 """
 
 import argparse
@@ -28,13 +35,24 @@ import sys
 from isaaclab.app import AppLauncher
 
 # Parse arguments
-parser = argparse.ArgumentParser(description="Bimanual Teleoperation for OpenArm")
+parser = argparse.ArgumentParser(description="Bimanual Teleoperation / OpenPI Client for OpenArm")
 parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-v0", help="Task name")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint")
 parser.add_argument("--input", type=str, default="keyboard", choices=["vive", "keyboard", "gamepad", "xr"],
                     help="Input device for teleoperation (xr = VR handtracking)")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Controller sensitivity")
+
+# OpenPI client mode arguments
+parser.add_argument("--client", action="store_true", help="Run as OpenPI client instead of teleop")
+parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
+parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
+parser.add_argument("--action_horizon", type=int, default=10, help="Action chunk size")
+parser.add_argument("--prompt", type=str, default="perform the bimanual manipulation task", 
+                    help="Task prompt for VLA")
+parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency for client mode")
+parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes (client mode)")
+parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode (client mode)")
 
 # Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
@@ -57,6 +75,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
+import time
 import torch
 import numpy as np
 
@@ -72,6 +91,211 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import openarm.tasks  # noqa: F401
 
+
+# =============================================================================
+# OpenPI Environment Wrapper for Bimanual OpenArm
+# =============================================================================
+
+class OpenArmBimanualEnvironment:
+    """
+    OpenPI-compatible Environment wrapper for Bimanual OpenArm in Isaac Lab.
+    
+    Provides the same interface as openpi_client.runtime.Environment,
+    using ALOHA-style observation format for bimanual robots:
+    - State: [left_arm_joints(7), left_gripper(1), right_arm_joints(7), right_gripper(1)] = 16 DOF
+    - Images: cam_high, cam_left_wrist, cam_right_wrist
+    """
+
+    # Bimanual OpenArm: 7 arm joints + 1 gripper per arm = 16 total
+    NUM_ARM_JOINTS = 7
+    TOTAL_DOF = 16  # (7+1) * 2
+    IMAGE_SIZE = 224
+
+    def __init__(self, env, policy, prompt: str = "perform the task"):
+        """
+        Args:
+            env: Isaac Lab wrapped environment
+            policy: Trained RL policy for low-level control
+            prompt: Task prompt for VLA
+        """
+        self._env = env
+        self._policy = policy
+        self._prompt = prompt
+        self._device = "cuda:0"
+        
+        # Get unwrapped env for direct access
+        self._unwrapped = env.unwrapped
+        if hasattr(self._unwrapped, 'unwrapped'):
+            self._unwrapped = self._unwrapped.unwrapped
+        
+        # State
+        self._obs = None
+        self._done = True
+        self._step_count = 0
+
+    def reset(self) -> None:
+        """Reset the environment."""
+        self._obs, _ = self._env.reset()
+        self._done = False
+        self._step_count = 0
+
+    def is_episode_complete(self) -> bool:
+        """Check if episode is complete."""
+        return self._done
+
+    def get_observation(self) -> dict:
+        """
+        Get observation in ALOHA-compatible format for OpenPI.
+        
+        Returns:
+            dict with:
+                - state: [16] array (left_arm(7), left_gripper(1), right_arm(7), right_gripper(1))
+                - images: dict with camera images in [C, H, W] format
+                - prompt: task instruction
+        """
+        if self._obs is None:
+            raise RuntimeError("Observation not set. Call reset() first.")
+        
+        robot = self._unwrapped.scene["robot"]
+        joint_pos = robot.data.joint_pos[0].cpu().numpy()
+        
+        # Extract left and right arm joints + grippers
+        # Joint ordering based on openarm_bimanual.py:
+        # left_joint1-7, left_finger_joint, right_joint1-7, right_finger_joint
+        num_joints = len(joint_pos)
+        
+        if num_joints >= 16:
+            # Full bimanual: 7 left arm + 1 left gripper + 7 right arm + 1 right gripper
+            left_arm = joint_pos[0:7]
+            left_gripper = np.clip(joint_pos[7:8] / 0.044, 0.0, 1.0)
+            right_arm = joint_pos[8:15]
+            right_gripper = np.clip(joint_pos[15:16] / 0.044, 0.0, 1.0)
+        else:
+            # Fallback: split evenly
+            half = num_joints // 2
+            left_arm = joint_pos[0:min(7, half-1)]
+            left_gripper = np.clip(joint_pos[half-1:half] / 0.044, 0.0, 1.0) if half > 0 else np.array([0.0])
+            right_arm = joint_pos[half:half+7] if num_joints > half else np.zeros(7)
+            right_gripper = np.clip(joint_pos[-1:] / 0.044, 0.0, 1.0)
+        
+        # Pad to correct sizes if needed
+        left_arm = np.pad(left_arm, (0, max(0, 7 - len(left_arm))), mode='constant')
+        right_arm = np.pad(right_arm, (0, max(0, 7 - len(right_arm))), mode='constant')
+        left_gripper = left_gripper if len(left_gripper) == 1 else np.array([0.0])
+        right_gripper = right_gripper if len(right_gripper) == 1 else np.array([0.0])
+        
+        # Combine into ALOHA-style state: [left_arm, left_gripper, right_arm, right_gripper]
+        state = np.concatenate([left_arm, left_gripper, right_arm, right_gripper]).astype(np.float32)
+        
+        # Camera images in [C, H, W] format (placeholder - replace with actual cameras if available)
+        black_image = np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
+        
+        return {
+            "state": state,
+            "images": {
+                "cam_high": black_image.copy(),
+                "cam_left_wrist": black_image.copy(),
+                "cam_right_wrist": black_image.copy(),
+            },
+            "prompt": self._prompt,
+        }
+
+    def apply_action(self, action: dict) -> None:
+        """
+        Apply action from OpenPI policy.
+        
+        The VLA returns actions in ALOHA format:
+        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+        
+        For now, we use the trained RL policy to execute low-level control.
+        """
+        # Get action from OpenPI response (could be used for task-space targets)
+        vla_actions = action.get("actions")
+        
+        # TODO: Map VLA actions to end-effector pose targets for the command manager
+        # if vla_actions is not None:
+        #     # Convert joint targets to EE pose targets if needed
+        #     pass
+        
+        # Step with RL policy
+        with torch.inference_mode():
+            actions = self._policy(self._obs)
+        
+        self._obs, _, dones, _ = self._env.step(actions)
+        self._step_count += 1
+        
+        if hasattr(dones, 'any'):
+            self._done = dones.any().item()
+        else:
+            self._done = bool(dones)
+        
+        if self._done:
+            self._obs, _ = self._env.get_observations()
+
+
+def run_openpi_client(env, policy, args):
+    """Run the environment as an OpenPI client."""
+    
+    # Import OpenPI client components
+    try:
+        from openpi_client import action_chunk_broker
+        from openpi_client import websocket_client_policy
+        from openpi_client.runtime import runtime as openpi_runtime
+        from openpi_client.runtime.agents import policy_agent
+    except ImportError as e:
+        print(f"\n[ERROR] OpenPI client not installed: {e}")
+        print("[INFO] Install with: pip install -e /path/to/openpi/packages/openpi-client")
+        print("[INFO] For example: pip install -e ../openpi/packages/openpi-client")
+        return
+    
+    print("\n" + "="*60)
+    print("OPENARM BIMANUAL - OPENPI CLIENT MODE")
+    print("="*60)
+    print(f"Connecting to π₀ server at {args.host}:{args.port}")
+    print(f"Action horizon: {args.action_horizon}")
+    print(f"Max Hz: {args.max_hz}")
+    print(f"Prompt: {args.prompt}")
+    print("="*60 + "\n")
+    
+    # Create OpenPI-compatible environment wrapper
+    openpi_env = OpenArmBimanualEnvironment(
+        env=env,
+        policy=policy,
+        prompt=args.prompt,
+    )
+    
+    # Create OpenPI runtime
+    runtime = openpi_runtime.Runtime(
+        environment=openpi_env,
+        agent=policy_agent.PolicyAgent(
+            policy=action_chunk_broker.ActionChunkBroker(
+                policy=websocket_client_policy.WebsocketClientPolicy(
+                    host=args.host,
+                    port=args.port,
+                ),
+                action_horizon=args.action_horizon,
+            )
+        ),
+        subscribers=[],
+        max_hz=args.max_hz,
+        num_episodes=args.num_episodes,
+        max_episode_steps=args.max_episode_steps,
+    )
+    
+    print("[INFO] Starting OpenPI client loop...")
+    print("[INFO] Press Ctrl+C to stop\n")
+    
+    try:
+        runtime.run()
+    except KeyboardInterrupt:
+        print("\n[INFO] Client stopped by user")
+    
+    print("[INFO] OpenPI client finished")
+
+
+# =============================================================================
+# Teleoperation Input Devices
+# =============================================================================
 
 class KeyboardDevice:
     """Keyboard control using Isaac Sim's input system."""
@@ -569,17 +793,13 @@ class XRDevice:
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Main teleoperation loop."""
+    """Main entry point - runs either teleop or OpenPI client mode."""
     
-    print("\n" + "="*60)
-    print("OPENARM BIMANUAL TELEOPERATION")
-    print("="*60)
-    
-    # Configure environment for teleoperation
+    # Configure environment
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = "cuda:0"
     
-    # Disable randomization for stable teleop
+    # Disable randomization for stable control
     if hasattr(env_cfg, 'observations') and hasattr(env_cfg.observations, 'policy'):
         env_cfg.observations.policy.enable_corruption = False
     
@@ -600,21 +820,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy = runner.get_inference_policy(device=env.unwrapped.device)
     print("[INFO] Policy loaded successfully!")
     
+    # Branch based on mode
+    if args_cli.client:
+        # OpenPI client mode
+        run_openpi_client(env, policy, args_cli)
+    else:
+        # Teleoperation mode
+        run_teleop(env, policy, args_cli)
+    
+    env.close()
+    print("[INFO] Environment closed")
+
+
+def run_teleop(env, policy, args):
+    """Run teleoperation mode with manual input devices."""
+    
+    print("\n" + "="*60)
+    print("OPENARM BIMANUAL TELEOPERATION")
+    print("="*60)
+    
     # Initialize input device
-    print(f"\n[INFO] Initializing {args_cli.input} input...")
-    if args_cli.input == "xr":
-        input_device = XRDevice(args_cli.sensitivity)
-    elif args_cli.input == "vive":
+    print(f"\n[INFO] Initializing {args.input} input...")
+    if args.input == "xr":
+        input_device = XRDevice(args.sensitivity)
+    elif args.input == "vive":
         try:
-            input_device = ViveDevice(args_cli.sensitivity)
+            input_device = ViveDevice(args.sensitivity)
         except RuntimeError as e:
             print(f"[WARN] {e}")
             print("[INFO] Falling back to keyboard control")
-            input_device = KeyboardDevice(args_cli.sensitivity)
-    elif args_cli.input == "gamepad":
-        input_device = GamepadDevice(args_cli.sensitivity)
+            input_device = KeyboardDevice(args.sensitivity)
+    elif args.input == "gamepad":
+        input_device = GamepadDevice(args.sensitivity)
     else:
-        input_device = KeyboardDevice(args_cli.sensitivity)
+        input_device = KeyboardDevice(args.sensitivity)
+    
+    # Get unwrapped env for command manager access
+    unwrapped = env.unwrapped
+    if hasattr(unwrapped, 'unwrapped'):
+        unwrapped = unwrapped.unwrapped
     
     # Get initial observations
     obs = env.get_observations()
@@ -630,7 +874,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             left_pose, right_pose = input_device.get_poses()
             
             # Update environment commands with teleop poses
-            unwrapped = env.unwrapped.unwrapped  # Get through wrappers
             if hasattr(unwrapped, 'command_manager'):
                 # Convert to tensors
                 left_cmd = torch.tensor(left_pose, dtype=torch.float32, device="cuda:0")
@@ -666,9 +909,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 
     except KeyboardInterrupt:
         print("\n[INFO] Teleoperation stopped by user")
-    finally:
-        env.close()
-        print("[INFO] Environment closed")
 
 
 if __name__ == "__main__":

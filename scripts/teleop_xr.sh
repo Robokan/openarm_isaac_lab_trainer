@@ -2,6 +2,8 @@
 set -e
 
 # XR Teleoperation for OpenArm using WiVRn + Isaac Sim's built-in XR (local)
+# NOTE: This script is for TELEOPERATION ONLY (not OpenPI client mode)
+#       For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client
 #
 # Prerequisites:
 #   1. WiVRn server running: flatpak run io.github.wivrn.wivrn
@@ -162,10 +164,22 @@ if [[ "${INPUT_MODE}" == "xr" ]]; then
 --/app/extensions/enabled/omni.kit.xr.profile.ar=true"
 fi
 
+# Filter out --client flag if passed (this script is for teleoperation only)
+# For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client
+FILTERED_ARGS=()
+for arg in "$@"; do
+    if [[ "$arg" == "--client" ]]; then
+        echo "[INFO] Ignoring --client flag - teleop_xr.sh is for teleoperation only"
+        echo "[INFO] For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client"
+    else
+        FILTERED_ARGS+=("$arg")
+    fi
+done
+
 python ./scripts/teleoperation/teleop_bimanual.py \
     --task ${TASK} \
     --checkpoint ${CHECKPOINT} \
     --input ${INPUT_MODE} \
     --num_envs 1 \
     ${KIT_ARGS:+--kit_args "${KIT_ARGS}"} \
-    "$@"
+    "${FILTERED_ARGS[@]}"
