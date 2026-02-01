@@ -348,30 +348,163 @@ class XRDevice:
         self.sensitivity = sensitivity
         self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
+        self._reported_session = False
+        self._xr_log_path = "/tmp/xr_device.log"
+        self._last_enable_attempt = 0.0
+        self._enable_interval_s = 5.0
+        self._input = None
+        self._keyboard = None
+        self._sub_keyboard = None
+        try:
+            with open(self._xr_log_path, "w", encoding="utf-8") as f:
+                f.write("")
+        except Exception:
+            pass
         
         try:
-            from isaaclab.devices.openxr import OpenXRDeviceBase
+            import time
             from omni.kit.xr.core import XRCore
             
             self._xr_core = XRCore.get_singleton()
-            print("[XRDevice] OpenXR initialized via Isaac Lab")
+            self._log("[XRDevice] OpenXR initialized via Isaac Lab")
+            self._setup_keyboard_listener()
+            try:
+                self._enable_first_available_profile()
+            except Exception:
+                # Continue even if profile enabling isn't supported
+                pass
             
-            print("\n" + "="*60)
-            print("XR HANDTRACKING TELEOPERATION")
-            print("="*60)
-            print("Move your VR controllers to control the robot arms!")
-            print("Left controller  -> Left arm")
-            print("Right controller -> Right arm")
-            print("="*60 + "\n")
+            # Wait briefly for XR session to start
+            for _ in range(50):
+                if self._is_session_running():
+                    break
+                time.sleep(0.1)
+            self._log(f"[XRDevice] Session running: {self._is_session_running()}")
+            try:
+                self._dump_status(prefix="[XRDevice]")
+            except Exception as exc:
+                self._log(f"[XRDevice] Warning: failed to query XR status: {exc}")
+            
+            self._log("\n" + "="*60)
+            self._log("XR HANDTRACKING TELEOPERATION")
+            self._log("="*60)
+            self._log("Move your VR controllers to control the robot arms!")
+            self._log("Left controller  -> Left arm")
+            self._log("Right controller -> Right arm")
+            self._log("="*60 + "\n")
             
         except ImportError as e:
-            print(f"[XRDevice] Warning: OpenXR not available: {e}")
-            print("[XRDevice] Falling back to static poses")
+            self._log(f"[XRDevice] Warning: OpenXR not available: {e}")
+            self._log("[XRDevice] Falling back to static poses")
             self._xr_core = None
         except Exception as e:
-            print(f"[XRDevice] Warning: XR init failed: {e}")
+            self._log(f"[XRDevice] Warning: XR init failed: {e}")
             self._xr_core = None
     
+    def _log(self, message: str):
+        print(message, flush=True)
+        try:
+            with open(self._xr_log_path, "a", encoding="utf-8") as f:
+                f.write(message + "\n")
+        except Exception:
+            pass
+
+    def _dump_status(self, prefix: str = "[XRDevice]"):
+        try:
+            profiles = self._xr_core.get_profile_name_list()
+            systems = self._xr_core.get_system_names()
+            self._log(f"{prefix} Profiles: {profiles}")
+            self._log(f"{prefix} Systems: {systems}")
+            if hasattr(self._xr_core, "is_xr_enabled"):
+                self._log(f"{prefix} XR enabled: {self._xr_core.is_xr_enabled()}")
+            if hasattr(self._xr_core, "is_xr_display_enabled"):
+                self._log(f"{prefix} XR display enabled: {self._xr_core.is_xr_display_enabled()}")
+            if hasattr(self._xr_core, "is_xr_viewport_enabled"):
+                self._log(f"{prefix} XR viewport enabled: {self._xr_core.is_xr_viewport_enabled()}")
+        except Exception as exc:
+            self._log(f"{prefix} Warning: failed to query XR status: {exc}")
+
+    def _setup_keyboard_listener(self):
+        try:
+            import carb.input
+            import omni.appwindow
+
+            self._input = carb.input.acquire_input_interface()
+            self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+            self._sub_keyboard = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_keyboard_event)
+            self._log("[XRDevice] Press 'X' in the Isaac Sim window to retry XR session start")
+        except Exception as exc:
+            self._log(f"[XRDevice] Keyboard listener not available: {exc}")
+
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        try:
+            import carb.input
+            if event.type != carb.input.KeyboardEventType.KEY_PRESS:
+                return True
+            if event.input in (carb.input.KeyboardInput.X, carb.input.KeyboardInput.KEY_X):
+                self._log("[XRDevice] Manual XR enable requested")
+                self._enable_first_available_profile()
+                self._dump_status(prefix="[XRDevice][After X]")
+        except Exception:
+            pass
+        return True
+
+    def _enable_first_available_profile(self):
+        # Prefer an available XR profile if provided by the runtime
+        profile_names = []
+        try:
+            profile_names = [p for p in self._xr_core.get_profile_name_list() if p]
+        except Exception:
+            profile_names = []
+        # Fall back to common names (both cases)
+        if not profile_names:
+            profile_names = ["vr", "ar", "VR", "AR"]
+
+        for name in profile_names:
+            try:
+                # Try static request (some builds expose this as a static method)
+                from omni.kit.xr.core import XRCore
+
+                XRCore.request_enable_profile(name)
+                self._log(f"[XRDevice] Requested XR profile (static): {name}")
+            except Exception as exc:
+                self._log(f"[XRDevice] Failed static enable for '{name}': {exc}")
+
+            try:
+                # Also try enabling via XRProfile
+                profile = None
+                if hasattr(self._xr_core, "ensure_profile"):
+                    profile = self._xr_core.ensure_profile(name)
+                elif hasattr(self._xr_core, "get_profile"):
+                    profile = self._xr_core.get_profile(name)
+                if profile is not None and hasattr(profile, "request_enable_profile"):
+                    profile.request_enable_profile()
+                    self._log(f"[XRDevice] Requested XR profile (profile): {name}")
+                break
+            except Exception as exc:
+                self._log(f"[XRDevice] Failed profile enable for '{name}': {exc}")
+        self._dump_status(prefix="[XRDevice][After enable]")
+
+    def _is_session_running(self) -> bool:
+        if self._xr_core is None:
+            return False
+        if hasattr(self._xr_core, "is_session_running"):
+            return bool(self._xr_core.is_session_running())
+        # Fallback: check if XR is enabled and a profile is enabled
+        try:
+            if hasattr(self._xr_core, "is_xr_enabled") and not self._xr_core.is_xr_enabled():
+                return False
+            profile = None
+            if hasattr(self._xr_core, "get_current_xr_profile"):
+                profile = self._xr_core.get_current_xr_profile()
+            elif hasattr(self._xr_core, "get_current_profile"):
+                profile = self._xr_core.get_current_profile()
+            if profile is not None and hasattr(profile, "is_enabled"):
+                return bool(profile.is_enabled())
+        except Exception:
+            return False
+        return False
+
     def get_poses(self):
         if self._xr_core is None:
             return self.left_pose.copy(), self.right_pose.copy()
@@ -381,26 +514,57 @@ class XRDevice:
             from omni.kit.xr.core import XRCore
             xr = XRCore.get_singleton()
             
-            if xr and xr.is_session_running():
-                # Get left hand pose
-                left_hand = xr.get_controller_pose("left")
-                if left_hand is not None:
+            if xr and self._is_session_running():
+                # Try controller pose helpers first
+                left_hand = None
+                right_hand = None
+                if hasattr(xr, "get_controller_pose"):
+                    left_hand = xr.get_controller_pose("left")
+                    right_hand = xr.get_controller_pose("right")
+                # Fallback to input devices if needed
+                if left_hand is None and hasattr(xr, "get_input_device"):
+                    left_dev = xr.get_input_device("/user/hand/left")
+                    if left_dev is not None and hasattr(left_dev, "get_pose"):
+                        left_hand = left_dev.get_pose()
+                if right_hand is None and hasattr(xr, "get_input_device"):
+                    right_dev = xr.get_input_device("/user/hand/right")
+                    if right_dev is not None and hasattr(right_dev, "get_pose"):
+                        right_hand = right_dev.get_pose()
+
+                if left_hand is not None and hasattr(left_hand, "GetTranslation"):
                     pos = left_hand.GetTranslation()
-                    self.left_pose[:3] = [pos[0] * self.sensitivity, 
-                                          pos[1] * self.sensitivity, 
+                    self.left_pose[:3] = [pos[0] * self.sensitivity,
+                                          pos[1] * self.sensitivity,
                                           pos[2] * self.sensitivity]
-                
-                # Get right hand pose
-                right_hand = xr.get_controller_pose("right")
-                if right_hand is not None:
+                if right_hand is not None and hasattr(right_hand, "GetTranslation"):
                     pos = right_hand.GetTranslation()
-                    self.right_pose[:3] = [pos[0] * self.sensitivity, 
-                                           pos[1] * self.sensitivity, 
+                    self.right_pose[:3] = [pos[0] * self.sensitivity,
+                                           pos[1] * self.sensitivity,
                                            pos[2] * self.sensitivity]
+            else:
+                import time
+                now = time.time()
+                if now - self._last_enable_attempt > self._enable_interval_s:
+                    self._last_enable_attempt = now
+                    self._log("[XRDevice] Session not running; attempting to enable profile")
+                    try:
+                        self._enable_first_available_profile()
+                    except Exception as exc:
+                        self._log(f"[XRDevice] Profile enable attempt failed: {exc}")
+                if not self._reported_session:
+                    self._log("[XRDevice] Session not running; using static poses")
+                    self._reported_session = True
         except Exception as e:
             pass  # Silently continue with last known poses
         
         return self.left_pose.copy(), self.right_pose.copy()
+
+    def __del__(self):
+        if self._input and self._keyboard and self._sub_keyboard:
+            try:
+                self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub_keyboard)
+            except Exception:
+                pass
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")

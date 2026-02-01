@@ -1,0 +1,8 @@
+{
+  "file_format_version": "1.0.0",
+  "runtime": {
+    "name": "WiVRn",
+    "library_path": "/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libopenxr_wivrn.so",
+    "MND_libmonado_path": "/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libmonado_wivrn.so"
+  }
+}
