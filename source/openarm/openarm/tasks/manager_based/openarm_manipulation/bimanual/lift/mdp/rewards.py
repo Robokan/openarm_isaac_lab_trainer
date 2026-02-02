@@ -142,8 +142,8 @@ def object_to_correct_pail(
     env: ManagerBasedRLEnv,
     std: float,
     minimal_height: float,
-    left_pail_pos: tuple = (0.4, 0.45, 0.1),
-    right_pail_pos: tuple = (0.4, -0.45, 0.1),
+    left_pail_pos: tuple = (0.3, 0.35, 0.1),   # On ground beside table
+    right_pail_pos: tuple = (0.3, -0.35, 0.1),  # On ground beside table
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
     """Reward for moving object toward the correct pail (only when lifted).
@@ -173,8 +173,8 @@ def object_to_correct_pail(
 
 def object_in_correct_pail(
     env: ManagerBasedRLEnv,
-    left_pail_pos: tuple = (0.4, 0.45, 0.0),
-    right_pail_pos: tuple = (0.4, -0.45, 0.0),
+    left_pail_pos: tuple = (0.3, 0.35, 0.0),
+    right_pail_pos: tuple = (0.3, -0.35, 0.0),
     threshold: float = 0.1,
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:

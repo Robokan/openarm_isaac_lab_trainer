@@ -109,7 +109,7 @@ def object_type_indicator(
 
 def left_pail_position(
     env: ManagerBasedRLEnv,
-    pail_pos: tuple = (0.4, 0.45, 0.1),
+    pail_pos: tuple = (0.3, 0.35, 0.1),  # On ground beside table
 ) -> torch.Tensor:
     """Position of the left pail (for cubes)."""
     pos = torch.tensor(pail_pos, device=env.device)
@@ -118,7 +118,7 @@ def left_pail_position(
 
 def right_pail_position(
     env: ManagerBasedRLEnv,
-    pail_pos: tuple = (0.4, -0.45, 0.1),
+    pail_pos: tuple = (0.3, -0.35, 0.1),  # On ground beside table
 ) -> torch.Tensor:
     """Position of the right pail (for fruit)."""
     pos = torch.tensor(pail_pos, device=env.device)
@@ -127,8 +127,8 @@ def right_pail_position(
 
 def target_pail_position(
     env: ManagerBasedRLEnv,
-    left_pail_pos: tuple = (0.4, 0.45, 0.1),
-    right_pail_pos: tuple = (0.4, -0.45, 0.1),
+    left_pail_pos: tuple = (0.3, 0.35, 0.1),   # On ground beside table
+    right_pail_pos: tuple = (0.3, -0.35, 0.1),  # On ground beside table
     object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
 ) -> torch.Tensor:
     """Position of the target pail based on object type.

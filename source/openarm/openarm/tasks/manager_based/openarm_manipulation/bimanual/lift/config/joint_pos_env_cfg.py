@@ -151,16 +151,16 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=[0.35, 0, 0.15], rot=[1, 0, 0, 0]  # Above table surface, will drop
+                pos=[0.35, 0, 0.3], rot=[1, 0, 0, 0]  # Above table surface (table at z=0.255)
             ),
             spawn=UsdFileCfg(
                 usd_path=MUG_ASSETS[0],  # Use first mug for all environments
                 rigid_props=RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
-                    solver_velocity_iteration_count=1,
-                    max_angular_velocity=1000.0,
-                    max_linear_velocity=1000.0,
-                    max_depenetration_velocity=5.0,
+                    solver_velocity_iteration_count=8,
+                    max_angular_velocity=100.0,  # Reduced to prevent spinning out
+                    max_linear_velocity=10.0,    # Reduced to prevent shooting away
+                    max_depenetration_velocity=2.0,  # Balanced: prevents ejection but allows collision response
                     disable_gravity=False,
                 ),
                 collision_props=CollisionPropertiesCfg(

@@ -80,7 +80,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     - Cube → Left hand picks up → Drop in left_square_pail
     - Fruit → Right hand picks up → Drop in right_square_pail
     
-    Note: The factory USD already contains the "Danny" table (surface at z≈0).
+    Note: The factory USD already contains the "Danny" table (surface at z=0.255).
     """
 
     # Robot: will be populated by agent env cfg (use factory USD with built-in table)
@@ -93,22 +93,22 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     # Target object: will be populated by agent env cfg (cube or fruit)
     object: RigidObjectCfg = MISSING
 
-    # Left pail for mugs (positioned on left side of table, clear of table edge)
+    # Left pail for mugs (on ground beside table)
     left_pail = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/LeftPail",
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=[0.4, 0.45, 0.0], rot=[1, 0, 0, 0]
+            pos=[0.3, 0.35, 0.0], rot=[1, 0, 0, 0]
         ),
         spawn=UsdFileCfg(
             usd_path="https://omniverse-content-staging.s3.us-west-2.amazonaws.com/Assets/simready_content/common_assets/props/squarepail_a01/squarepail_a01.usd",
         ),
     )
     
-    # Right pail for fruit (positioned on right side of table, clear of table edge)
+    # Right pail for fruit (on ground beside table)
     right_pail = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/RightPail",
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=[0.4, -0.45, 0.0], rot=[1, 0, 0, 0]
+            pos=[0.3, -0.35, 0.0], rot=[1, 0, 0, 0]
         ),
         spawn=UsdFileCfg(
             usd_path="https://omniverse-content-staging.s3.us-west-2.amazonaws.com/Assets/simready_content/common_assets/props/squarepail_a01/squarepail_a01.usd",
@@ -145,7 +145,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command terms for the MDP.
     
-    The goal position for the lifted object.
+    The goal position for the lifted object - above the left pail for mugs.
     """
 
     object_pose = mdp.UniformPoseCommandCfg(
@@ -154,9 +154,9 @@ class CommandsCfg:
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.3, 0.5),
-            pos_y=(-0.2, 0.2),
-            pos_z=(0.15, 0.35),
+            pos_x=(0.3, 0.3),    # Left pail x position
+            pos_y=(0.35, 0.35),  # Left pail y position
+            pos_z=(0.255, 0.255),  # At table height
             roll=(0.0, 0.0),
             pitch=(0.0, 0.0),
             yaw=(0.0, 0.0),
@@ -295,7 +295,7 @@ class EventCfg:
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
-    # Randomize object position and orientation on table (Danny table surface at z≈0)
+    # Randomize object position and orientation on table (Danny table surface at z=0.255)
     # Object spawns in front of robot, biased left or right so one arm is closer
     # Random yaw rotation so mugs/fruit face different directions
     reset_object_position = EventTerm(
@@ -303,12 +303,16 @@ class EventCfg:
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.15, 0.15),
-                "y": (-0.25, 0.25),
-                "z": (0.1, 0.1),  # Above table surface (table is at z≈0)
+                "x": (-0.1, 0.1),   # Tighter range to keep mug on table
+                "y": (-0.15, 0.15), # Tighter range to keep mug on table
+                "z": (0.0, 0.0),    # No offset - use init_state z position (0.3)
                 "yaw": (-3.14159, 3.14159),  # Full 360° rotation around Z
             },
-            "velocity_range": {},
+            "velocity_range": {
+                "x": (0.0, 0.0),
+                "y": (0.0, 0.0),
+                "z": (0.0, 0.0),
+            },  # Explicitly zero velocity
             "asset_cfg": SceneEntityCfg("object"),  # No body_names - use root
         },
     )
@@ -344,23 +348,23 @@ class RewardsCfg:
         weight=-0.5,
     )
 
-    # Lifting the object
+    # Lifting the object (table surface at z=0.255, so lifted = z > 0.32)
     lifting_object = RewTerm(
         func=mdp.object_is_lifted,
-        params={"minimal_height": 0.06},
+        params={"minimal_height": 0.32},
         weight=15.0,
     )
 
     # Moving object toward correct pail (once lifted)
     object_to_pail = RewTerm(
         func=mdp.object_to_correct_pail,
-        params={"std": 0.3, "minimal_height": 0.06},
+        params={"std": 0.3, "minimal_height": 0.32},
         weight=16.0,
     )
 
     object_to_pail_fine = RewTerm(
         func=mdp.object_to_correct_pail,
-        params={"std": 0.05, "minimal_height": 0.06},
+        params={"std": 0.05, "minimal_height": 0.32},
         weight=5.0,
     )
     
@@ -401,10 +405,10 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Terminate if object falls off table
+    # Terminate if object falls off table (table at z=0.255, so fallen = z < 0.2)
     object_dropping = DoneTerm(
         func=mdp.root_height_below_minimum,
-        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object")},
+        params={"minimum_height": 0.2, "asset_cfg": SceneEntityCfg("object")},
     )
 
 
