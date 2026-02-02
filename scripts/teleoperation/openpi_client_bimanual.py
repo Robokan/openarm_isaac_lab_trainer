@@ -18,6 +18,12 @@ OpenPI Client for Bimanual OpenArm
 Connects to a π₀ policy server and executes VLA actions in Isaac Lab simulation.
 This is a drop-in replacement for the OpenPI ALOHA simulator.
 
+Cameras:
+    Uses the openarm_bimanual_factory.usd which has cameras mounted on:
+    - openarm_body_link (base/high camera)
+    - openarm_left_link7 (left wrist camera)
+    - openarm_right_link7 (right wrist camera)
+
 Usage:
     python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt
     python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --host localhost --port 8000
@@ -45,6 +51,9 @@ parser.add_argument("--max_hz", type=float, default=50.0, help="Max control freq
 parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to run")
 parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode")
 
+# Camera options
+parser.add_argument("--no_cameras", action="store_true", help="Disable camera capture (use black images)")
+
 # Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -61,11 +70,14 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import torch
 import numpy as np
+import cv2
 
 from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 from isaaclab.utils.assets import retrieve_file_path
+from isaaclab.sensors import Camera, CameraCfg
+from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 
@@ -94,27 +106,98 @@ class OpenArmBimanualEnvironment:
     TOTAL_DOF = 16  # (7+1) * 2
     IMAGE_SIZE = 224
 
-    def __init__(self, env, policy, prompt: str = "perform the task"):
+    def __init__(self, env, policy, prompt: str = "perform the task", use_cameras: bool = True):
         """
         Args:
             env: Isaac Lab wrapped environment
             policy: Trained RL policy for low-level control (fallback)
             prompt: Task prompt for VLA
+            use_cameras: Whether to capture camera images (False = black images)
         """
         self._env = env
         self._policy = policy
         self._prompt = prompt
         self._device = "cuda:0"
+        self._use_cameras = use_cameras
         
         # Get unwrapped env for direct access
         self._unwrapped = env.unwrapped
         if hasattr(self._unwrapped, 'unwrapped'):
             self._unwrapped = self._unwrapped.unwrapped
         
+        # Initialize cameras if enabled
+        self._cameras = {}
+        if self._use_cameras:
+            self._init_cameras()
+        
         # State
         self._obs = None
         self._done = True
         self._step_count = 0
+
+    def _init_cameras(self):
+        """Initialize camera sensors attached to the robot."""
+        try:
+            import omni.isaac.core.utils.prims as prim_utils
+            
+            # Camera prim paths (relative to robot)
+            # These cameras should exist in the openarm_bimanual_factory.usd
+            camera_configs = {
+                "cam_high": "{ENV_REGEX_NS}/Robot/openarm_body_link/Camera",
+                "cam_left_wrist": "{ENV_REGEX_NS}/Robot/openarm_left_link7/Camera", 
+                "cam_right_wrist": "{ENV_REGEX_NS}/Robot/openarm_right_link7/Camera",
+            }
+            
+            # Check if cameras exist in the USD
+            for name, prim_path in camera_configs.items():
+                # Replace ENV_REGEX_NS with env_0 for the first environment
+                resolved_path = prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0")
+                if prim_utils.is_prim_path_valid(resolved_path):
+                    print(f"[INFO] Found camera: {name} at {resolved_path}")
+                    self._cameras[name] = resolved_path
+                else:
+                    print(f"[WARN] Camera not found: {name} at {resolved_path}")
+            
+            if not self._cameras:
+                print("[WARN] No cameras found in USD. Using black images.")
+                print("[INFO] Make sure to use the factory USD with cameras:")
+                print("       openarm_bimanual_factory.usd")
+                self._use_cameras = False
+                
+        except Exception as e:
+            print(f"[WARN] Failed to initialize cameras: {e}")
+            self._use_cameras = False
+
+    def _capture_camera(self, camera_name: str) -> np.ndarray:
+        """Capture image from a camera sensor."""
+        if not self._use_cameras or camera_name not in self._cameras:
+            return np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
+        
+        try:
+            import omni.replicator.core as rep
+            from omni.isaac.sensor import Camera as IsaacCamera
+            
+            prim_path = self._cameras[camera_name]
+            
+            # Get camera render product
+            camera = IsaacCamera(prim_path)
+            camera.initialize()
+            
+            # Get RGBA image
+            rgba = camera.get_rgba()
+            
+            if rgba is not None:
+                # Convert RGBA to RGB, resize, and transpose to [C, H, W]
+                rgb = rgba[:, :, :3]
+                rgb_resized = cv2.resize(rgb, (self.IMAGE_SIZE, self.IMAGE_SIZE))
+                rgb_chw = np.transpose(rgb_resized, (2, 0, 1))  # [H, W, C] -> [C, H, W]
+                return rgb_chw.astype(np.uint8)
+            
+        except Exception as e:
+            # Silently fall back to black image
+            pass
+        
+        return np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
 
     def reset(self) -> None:
         """Reset the environment."""
@@ -170,16 +253,25 @@ class OpenArmBimanualEnvironment:
         # Combine into ALOHA-style state: [left_arm, left_gripper, right_arm, right_gripper]
         state = np.concatenate([left_arm, left_gripper, right_arm, right_gripper]).astype(np.float32)
         
-        # Camera images in [C, H, W] format (placeholder - replace with actual cameras if available)
-        black_image = np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
-        
-        return {
-            "state": state,
-            "images": {
+        # Capture camera images
+        if self._use_cameras:
+            images = {
+                "cam_high": self._capture_camera("cam_high"),
+                "cam_left_wrist": self._capture_camera("cam_left_wrist"),
+                "cam_right_wrist": self._capture_camera("cam_right_wrist"),
+            }
+        else:
+            # Placeholder black images
+            black_image = np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
+            images = {
                 "cam_high": black_image.copy(),
                 "cam_left_wrist": black_image.copy(),
                 "cam_right_wrist": black_image.copy(),
-            },
+            }
+        
+        return {
+            "state": state,
+            "images": images,
             "prompt": self._prompt,
         }
 
@@ -274,6 +366,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy = runner.get_inference_policy(device=env.unwrapped.device)
     print("[INFO] Policy loaded successfully!")
     
+    use_cameras = not args_cli.no_cameras
+    
     print("\n" + "="*60)
     print("OPENARM BIMANUAL - OPENPI CLIENT")
     print("="*60)
@@ -283,6 +377,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"Episodes: {args_cli.num_episodes}")
     print(f"Max steps/episode: {args_cli.max_episode_steps}")
     print(f"Prompt: {args_cli.prompt}")
+    print(f"Cameras: {'enabled' if use_cameras else 'disabled (black images)'}")
     print("="*60 + "\n")
     
     # Create OpenPI-compatible environment wrapper
@@ -290,6 +385,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env=env,
         policy=policy,
         prompt=args_cli.prompt,
+        use_cameras=use_cameras,
     )
     
     # Create OpenPI runtime

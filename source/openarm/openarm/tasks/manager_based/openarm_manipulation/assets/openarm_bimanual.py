@@ -104,3 +104,20 @@ OPEN_ARM_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 1e2
 
 This configuration is useful for task-space control using differential IK.
 """
+
+# Factory config with cameras (uses openarm_bimanual_factory.usd)
+# Cameras are mounted on:
+#   - openarm_body_link (base/high camera)
+#   - openarm_left_link7 (left wrist camera)
+#   - openarm_right_link7 (right wrist camera)
+OPEN_ARM_FACTORY_CFG = OPEN_ARM_CFG.copy()
+OPEN_ARM_FACTORY_CFG.spawn.usd_path = f"{OPENARM_ROOT_DIR}/usds/openarm_bimanual/openarm_bimanual_factory.usd"
+"""Configuration of OpenArm robot with cameras for VLA/OpenPI integration."""
+
+OPEN_ARM_FACTORY_HIGH_PD_CFG = OPEN_ARM_FACTORY_CFG.copy()
+OPEN_ARM_FACTORY_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 400.0
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].damping = 80.0
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 2e3
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 1e2
+"""Configuration of OpenArm robot with cameras and stiffer PD control."""

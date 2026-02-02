@@ -83,6 +83,8 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 import gymnasium as gym
 import os
+import signal
+import threading
 import torch
 from datetime import datetime
 
@@ -208,8 +210,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    # Flag to track if training should stop
+    stop_training = threading.Event()
+    
+    # Monitor thread to check if window is closed (non-headless mode)
+    def monitor_window():
+        import time
+        while not stop_training.is_set():
+            time.sleep(0.5)
+            if not simulation_app.is_running():
+                print("\n[INFO] Window closed - triggering shutdown...")
+                os.kill(os.getpid(), signal.SIGINT)
+                break
+    
+    # Start monitor thread for non-headless mode
+    if not args_cli.headless:
+        monitor_thread = threading.Thread(target=monitor_window, daemon=True)
+        monitor_thread.start()
+    
+    # Check for window close during training by wrapping in try/except
+    try:
+        # run training
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    except KeyboardInterrupt:
+        print("\n[INFO] Training interrupted - saving checkpoint...")
+        runner.save(os.path.join(log_dir, "model_interrupted.pt"))
+    finally:
+        stop_training.set()
 
     # close the simulator
     env.close()

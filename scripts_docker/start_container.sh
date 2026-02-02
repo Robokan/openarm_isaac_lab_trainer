@@ -8,6 +8,10 @@ IMAGE="nvcr.io/nvidia/isaac-lab:2.3.0"
 CONTAINER_NAME="isaac-lab"
 DISPLAY_NUM="${DISPLAY:-:1}"
 
+# Get repo root (parent of scripts_docker)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
 # Check if container already exists
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Container '${CONTAINER_NAME}' already exists."
@@ -54,7 +58,7 @@ docker run --name ${CONTAINER_NAME} -d --gpus all \
    -v ~/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw \
    -v ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw \
    -v ~/docker/isaac-sim/documents:/root/Documents:rw \
-   -v "$(dirname "$(realpath "$0")")":/workspace/openarm_isaac_lab:rw \
+   -v "${REPO_ROOT}":/workspace/openarm_isaac_lab:rw \
    --entrypoint bash \
    ${IMAGE} \
    -c "tail -f /dev/null"
