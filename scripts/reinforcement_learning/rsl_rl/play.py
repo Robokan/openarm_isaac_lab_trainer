@@ -64,6 +64,8 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
+import signal
+import threading
 import time
 import torch
 
@@ -148,18 +150,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    def load_checkpoint(path):
+        """Load checkpoint and return policy."""
+        print(f"[INFO]: Loading model checkpoint from: {path}")
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(path)
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
+        return runner, policy
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+    # Initial checkpoint load
+    runner, policy = load_checkpoint(resume_path)
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
@@ -185,31 +190,102 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # Set up keyboard input for checkpoint reload
+    import carb.input
+    import omni.appwindow
+    
+    input_interface = carb.input.acquire_input_interface()
+    app_window = omni.appwindow.get_default_app_window()
+    keyboard = app_window.get_keyboard()
+    reload_requested = [False]  # Use list to allow modification in callback
+    reset_requested = [False]
+    
+    def on_keyboard_event(event, *args, **kwargs):
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input == carb.input.KeyboardInput.L:
+                reload_requested[0] = True
+                return True  # Consume event to prevent UI from handling it
+            elif event.input == carb.input.KeyboardInput.R:
+                reset_requested[0] = True
+                return True  # Consume event to prevent UI from handling it
+        return False
+    
+    # Subscribe to keyboard events (priority subscription to override UI)
+    keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
+    print("[INFO] Press 'L' to reload checkpoint, 'R' to reset environment, close window to exit")
+
+    # Background thread to monitor for window close (non-headless mode)
+    # This allows graceful exit when the user closes the visualization window
+    stop_requested = threading.Event()
+    
+    def monitor_app():
+        """Monitor simulation app and signal stop when window is closed."""
+        while not stop_requested.is_set():
+            if not simulation_app.is_running():
+                print("\n[INFO] Window closed. Exiting...")
+                os.kill(os.getpid(), signal.SIGINT)
+                break
+            time.sleep(0.5)
+    
+    if not args_cli.headless:
+        monitor_thread = threading.Thread(target=monitor_app, daemon=True)
+        monitor_thread.start()
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
-    # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
+    
+    # simulate environment with proper cleanup on exit
+    try:
+        while simulation_app.is_running():
+            start_time = time.time()
+            
+            # Check for checkpoint reload request
+            if reload_requested[0]:
+                reload_requested[0] = False
+                print("\n[INFO] Reloading checkpoint...")
+                runner, policy = load_checkpoint(resume_path)
+                print("[INFO] Checkpoint reloaded successfully!")
+            
+            # Check for environment reset request (set flag for next step)
+            force_reset = reset_requested[0]
+            if force_reset:
+                reset_requested[0] = False
+                print("\n[INFO] Resetting environment...")
+                # Set episode length high to trigger timeout on next step
+                with torch.no_grad():
+                    env.unwrapped.episode_length_buf[:] = 999999
+            
+            # run everything in inference mode
+            with torch.inference_mode():
+                # agent stepping
+                actions = policy(obs)
+            
+            # env stepping (outside inference mode to allow reset)
             obs, _, _, _ = env.step(actions)
-        if args_cli.video:
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+            
+            if force_reset:
+                obs = env.get_observations()
+                print("[INFO] Environment reset!")
+            if args_cli.video:
+                timestep += 1
+                # Exit the play loop after recording one video
+                if timestep == args_cli.video_length:
+                    break
 
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
-
-    # close the simulator
-    env.close()
+            # time delay for real-time evaluation
+            sleep_time = dt - (time.time() - start_time)
+            if args_cli.real_time and sleep_time > 0:
+                time.sleep(sleep_time)
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user. Closing...")
+    finally:
+        # Signal monitor thread to stop
+        stop_requested.set()
+        # Unsubscribe from keyboard events
+        input_interface.unsubscribe_to_keyboard_events(keyboard, keyboard_sub)
+        # close the simulator
+        env.close()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ Object types:
 
 import math
 
-from isaaclab.assets import RigidObjectCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import FrameTransformerCfg
@@ -182,15 +182,25 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
 
 @configclass
 class OpenArmBimanualCubeLiftEnvCfg_PLAY(OpenArmBimanualCubeLiftEnvCfg):
-    """Play configuration with fewer environments and no domain randomization."""
+    """Play configuration with single environment and warehouse for visualization."""
 
     def __post_init__(self):
         # Post init of parent
         super().__post_init__()
 
-        # Reduce number of environments for visualization
-        self.scene.num_envs = 50
+        # Single environment for visualization
+        self.scene.num_envs = 1
         self.scene.env_spacing = 2.5
         
         # Disable randomization for cleaner visualization
         self.observations.policy.enable_corruption = False
+        
+        # Add warehouse environment for visualization (not used in headless training)
+        self.scene.warehouse = AssetBaseCfg(
+            prim_path="/World/Warehouse",
+            init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
+            spawn=UsdFileCfg(
+                usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            ),
+        )

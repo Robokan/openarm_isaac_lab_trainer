@@ -116,17 +116,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     )
 
     # Note: Table "Danny" and lighting are part of the factory USD
-    
-    # Warehouse environment (centered on the environment grid)
-    # Visual only - no collisions to avoid physics overflow
-    warehouse = AssetBaseCfg(
-        prim_path="/World/Warehouse",
-        init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
-        spawn=UsdFileCfg(
-            usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
-            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-        ),
-    )
+    # Note: Warehouse is only added in PLAY config (not needed for headless training)
     
     # Ground plane for physics (invisible, just for collisions)
     plane = AssetBaseCfg(
@@ -467,5 +457,5 @@ class BimanualLiftEnvCfg(ManagerBasedRLEnvCfg):
 
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 64 * 1024  # Increased for bimanual robot + objects
         self.sim.physx.friction_correlation_distance = 0.00625
