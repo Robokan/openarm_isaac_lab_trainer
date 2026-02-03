@@ -9,6 +9,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "${REPO_ROOT}"
 
+# Disable Isaac Sim startup dialog
+export OMNI_KIT_DISABLE_STARTUP_PAGE=1
+
 # Avoid system CUDA libs overriding Isaac Sim bundled libs
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     _clean_ld=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '^/usr/local/cuda' | paste -sd: -)

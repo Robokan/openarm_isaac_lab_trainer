@@ -16,6 +16,7 @@ import math
 
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
@@ -119,7 +120,7 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
         # post init of parent
         super().__post_init__()
         # make a smaller scene for play
-        self.scene.num_envs = 50
+        self.scene.num_envs = 4096
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
@@ -137,26 +138,77 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
 
 @configclass
 class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
-    """Reach configuration with expanded workspace for teleoperation training."""
+    """Reach configuration with expanded workspace for teleoperation training.
+    
+    Uses uniform box sampling for target positions:
+    - Box center: (0.34, 0.0, 0.36)
+    - Box size: (0.45, 0.63, 0.24)
+    
+    Orientations are restricted to ±60° roll/pitch and ±90° yaw for natural poses.
+    """
 
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
 
-        # Expand reach workspace to cover full arm reach
-        self.commands.left_ee_pose.ranges.pos_x = (0.05, 0.6)
-        self.commands.left_ee_pose.ranges.pos_y = (0.05, 0.45)
-        self.commands.left_ee_pose.ranges.pos_z = (0.15, 0.65)
-        self.commands.left_ee_pose.ranges.roll = (-math.pi, math.pi)
-        self.commands.left_ee_pose.ranges.pitch = (-math.pi, math.pi)
-        self.commands.left_ee_pose.ranges.yaw = (-math.pi, math.pi)
+        # Create marker configs with unique paths for each arm
+        left_goal_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/left_goal_pose"
+        )
+        left_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+        left_body_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/left_body_pose"
+        )
+        left_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
 
-        self.commands.right_ee_pose.ranges.pos_x = (0.05, 0.6)
-        self.commands.right_ee_pose.ranges.pos_y = (-0.45, -0.05)
-        self.commands.right_ee_pose.ranges.pos_z = (0.15, 0.65)
-        self.commands.right_ee_pose.ranges.roll = (-math.pi, math.pi)
-        self.commands.right_ee_pose.ranges.pitch = (-math.pi, math.pi)
-        self.commands.right_ee_pose.ranges.yaw = (-math.pi, math.pi)
+        right_goal_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/right_goal_pose"
+        )
+        right_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+        right_body_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/right_body_pose"
+        )
+        right_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+
+        # Use uniform box sampling for left arm
+        # Box center: (0.34, 0.0, 0.36), size: (0.45, 0.63, 0.24)
+        # x: 0.115 to 0.565, y: -0.315 to 0.315, z: 0.24 to 0.48
+        # Orientation: roll ±30°, pitch fixed at 270°, yaw ~160°-200°
+        self.commands.left_ee_pose = mdp.UniformPoseCommandCfg(
+            asset_name="robot",
+            body_name="openarm_left_hand",
+            resampling_time_range=(4.0, 4.0),
+            debug_vis=True,
+            ranges=mdp.UniformPoseCommandCfg.Ranges(
+                pos_x=(0.115, 0.565),
+                pos_y=(-0.315, 0.315),
+                pos_z=(0.24, 0.48),
+                roll=(-math.pi / 2, math.pi / 2),
+                pitch=(math.pi - math.pi / 2, math.pi + math.pi / 2),
+                yaw=(math.pi - math.pi / 2, math.pi + math.pi / 2),
+            ),
+            goal_pose_visualizer_cfg=left_goal_marker,
+            current_pose_visualizer_cfg=left_body_marker,
+        )
+
+        # Use uniform box sampling for right arm
+        # Same box as left arm
+        self.commands.right_ee_pose = mdp.UniformPoseCommandCfg(
+            asset_name="robot",
+            body_name="openarm_right_hand",
+            resampling_time_range=(4.0, 4.0),
+            debug_vis=True,
+            ranges=mdp.UniformPoseCommandCfg.Ranges(
+                pos_x=(0.115, 0.565),
+                pos_y=(-0.315, 0.315),
+                pos_z=(0.24, 0.48),
+                roll=(-math.pi / 2, math.pi / 2),
+                pitch=(math.pi - math.pi / 2, math.pi + math.pi / 2),
+                yaw=(math.pi - math.pi / 2, math.pi + math.pi / 2),
+            ),
+            goal_pose_visualizer_cfg=right_goal_marker,
+            current_pose_visualizer_cfg=right_body_marker,
+        )
 
         # Randomize starting joint pose (arms only, smaller offsets)
         self.events.reset_robot_joints.func = mdp.reset_joints_by_offset

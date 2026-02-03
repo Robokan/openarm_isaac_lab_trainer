@@ -54,5 +54,5 @@ class OpenArmReachPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class OpenArmReachTeleopPPORunnerCfg(OpenArmReachPPORunnerCfg):
-    max_iterations = 20000
+    max_iterations = 50000
     experiment_name = "openarm_bi_reach_teleop"
