@@ -138,13 +138,14 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
 
 @configclass
 class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
-    """Reach configuration with expanded workspace for teleoperation training.
+    """Reach configuration with reachability-aware sampling for teleoperation.
     
-    Uses uniform box sampling for target positions:
-    - Box center: (0.34, 0.0, 0.36)
-    - Box size: (0.45, 0.63, 0.24)
+    Uses sphere + box intersection for target positions:
+    - Sphere: centered at shoulder, radius = arm length (0.40m)
+    - Box: practical workspace limits
     
-    Orientations are restricted to ±60° roll/pitch and ±90° yaw for natural poses.
+    This ensures all targets are within physical arm reach.
+    Orientations are ±45° around gripper-down pose.
     """
 
     def __post_init__(self):
@@ -170,19 +171,20 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
         )
         right_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
 
-        # Use uniform box sampling for left arm
-        # Box center: (0.34, 0.0, 0.36), size: (0.45, 0.63, 0.24)
-        # x: 0.115 to 0.565, y: -0.315 to 0.315, z: 0.24 to 0.48
-        # Orientation: roll ±30°, pitch fixed at 270°, yaw ~160°-200°
-        self.commands.left_ee_pose = mdp.UniformPoseCommandCfg(
+        # Left arm: sphere (arm reach) + box (workspace) intersection
+        # Sphere: shoulder at (0, -0.15, 0.7), radius 0.40m
+        # Box: x [0, 0.5], y [-0.5, 0.2], z [0.3, 1.0]
+        self.commands.left_ee_pose = mdp.SphericalPoseCommandCfg(
             asset_name="robot",
             body_name="openarm_left_hand",
             resampling_time_range=(4.0, 4.0),
             debug_vis=True,
-            ranges=mdp.UniformPoseCommandCfg.Ranges(
-                pos_x=(0.115, 0.565),
-                pos_y=(-0.315, 0.315),
-                pos_z=(0.24, 0.48),
+            sphere_center=(0.0, -0.15, 0.7),
+            sphere_radius=0.45,
+            box_x=(0.115, 0.565),
+            box_y=(-0.315, 0.315),
+            box_z=(0.24, 0.48),
+            ranges=mdp.SphericalPoseCommandCfg.Ranges(
                 roll=(-math.pi / 4, math.pi / 4),
                 pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
                 yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
@@ -191,17 +193,20 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
             current_pose_visualizer_cfg=left_body_marker,
         )
 
-        # Use uniform box sampling for right arm
-        # Same box as left arm
-        self.commands.right_ee_pose = mdp.UniformPoseCommandCfg(
+        # Right arm: sphere (arm reach) + box (workspace) intersection
+        # Sphere: shoulder at (0, 0.15, 0.7), radius 0.40m
+        # Box: x [0, 0.5], y [-0.2, 0.5], z [0.3, 1.0]
+        self.commands.right_ee_pose = mdp.SphericalPoseCommandCfg(
             asset_name="robot",
             body_name="openarm_right_hand",
             resampling_time_range=(4.0, 4.0),
             debug_vis=True,
-            ranges=mdp.UniformPoseCommandCfg.Ranges(
-                pos_x=(0.115, 0.565),
-                pos_y=(-0.315, 0.315),
-                pos_z=(0.24, 0.48),
+            sphere_center=(0.0, 0.15, 0.7),
+            sphere_radius=0.56,
+            box_x=(0.115, 0.565),
+            box_y=(-0.315, 0.315),
+            box_z=(0.24, 0.48),
+            ranges=mdp.SphericalPoseCommandCfg.Ranges(
                 roll=(-math.pi / 4, math.pi / 4),
                 pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
                 yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),

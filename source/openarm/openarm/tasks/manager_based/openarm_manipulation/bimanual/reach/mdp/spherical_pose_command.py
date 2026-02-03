@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spherical pose command generator for sampling target poses."""
+"""Spherical pose command generator with box constraints."""
 
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ if TYPE_CHECKING:
 
 
 class SphericalPoseCommand(UniformPoseCommand):
-    """Command generator for pose commands within a sphere.
+    """Command generator for pose commands within sphere + box intersection.
 
-    Positions are sampled uniformly within a sphere defined by
-    a center point and radius. An optional constraint limits
-    sampling to a half-space (e.g., x >= min_x).
+    Positions are sampled uniformly within a sphere (arm reach) AND
+    constrained to a box (practical workspace). Only positions that
+    satisfy BOTH constraints are accepted.
 
     For orientation, it samples uniformly the euler angles
     (roll-pitch-yaw) and converts to quaternion (w, x, y, z).
@@ -61,9 +61,20 @@ class SphericalPoseCommand(UniformPoseCommand):
             self.cfg.sphere_center, device=device, dtype=torch.float32
         )
         radius = self.cfg.sphere_radius
-        min_x = self.cfg.min_x
 
-        # Sample until we get n valid poses (geometric constraint only)
+        # Box constraints
+        box_min = torch.tensor([
+            self.cfg.box_x[0],
+            self.cfg.box_y[0],
+            self.cfg.box_z[0]
+        ], device=device, dtype=torch.float32)
+        box_max = torch.tensor([
+            self.cfg.box_x[1],
+            self.cfg.box_y[1],
+            self.cfg.box_z[1]
+        ], device=device, dtype=torch.float32)
+
+        # Sample until we get n valid poses
         positions = torch.zeros(n, 3, device=device)
         remaining = torch.ones(n, dtype=torch.bool, device=device)
 
@@ -90,14 +101,25 @@ class SphericalPoseCommand(UniformPoseCommand):
             # Apply center offset
             new_pos = torch.stack([x, y, z], dim=-1) + center
 
-            # Check geometric constraint: x >= min_x
-            valid = new_pos[:, 0] >= min_x
+            # Check box constraints
+            in_box = (
+                (new_pos[:, 0] >= box_min[0]) & (new_pos[:, 0] <= box_max[0]) &
+                (new_pos[:, 1] >= box_min[1]) & (new_pos[:, 1] <= box_max[1]) &
+                (new_pos[:, 2] >= box_min[2]) & (new_pos[:, 2] <= box_max[2])
+            )
+
             remaining_idx = torch.where(remaining)[0]
-            valid_idx = torch.where(valid)[0]
+            valid_idx = torch.where(in_box)[0]
 
             for vi in valid_idx:
                 positions[remaining_idx[vi]] = new_pos[vi]
                 remaining[remaining_idx[vi]] = False
+
+        # Fallback for any remaining (use sphere center clamped to box)
+        if remaining.any():
+            fallback = center.clone()
+            fallback = torch.clamp(fallback, box_min, box_max)
+            positions[remaining] = fallback
 
         # Sample orientations
         euler_angles = torch.zeros(n, 3, device=device)
@@ -119,7 +141,7 @@ class SphericalPoseCommand(UniformPoseCommand):
 
 @configclass
 class SphericalPoseCommandCfg(CommandTermCfg):
-    """Configuration for spherical pose command generator."""
+    """Configuration for spherical + box constrained pose command."""
 
     class_type: type = SphericalPoseCommand
 
@@ -132,17 +154,27 @@ class SphericalPoseCommandCfg(CommandTermCfg):
     make_quat_unique: bool = False
     """Whether to make the quaternion unique. Defaults to False."""
 
-    # Sphere parameters
+    # Sphere parameters (shoulder-centered arm reach)
     sphere_center: tuple[float, float, float] = MISSING
-    """Center of the sphere (x, y, z) in the robot base frame."""
+    """Center of the sphere (shoulder position) in robot base frame."""
 
     sphere_radius: float = MISSING
-    """Radius of the sphere in meters."""
+    """Radius of the sphere (arm length) in meters."""
 
+    # Box constraints (practical workspace limits)
+    box_x: tuple[float, float] = (0.0, 1.0)
+    """X-axis bounds (min, max) for the workspace box."""
+
+    box_y: tuple[float, float] = (-1.0, 1.0)
+    """Y-axis bounds (min, max) for the workspace box."""
+
+    box_z: tuple[float, float] = (0.0, 1.5)
+    """Z-axis bounds (min, max) for the workspace box."""
+
+    # Deprecated - kept for compatibility
     min_x: float = 0.0
-    """Minimum x coordinate. Only positions with x >= min_x are sampled."""
+    """Deprecated. Use box_x instead."""
 
-    # Kept for compatibility but not used
     validate_ik: bool = False
     """Deprecated. IK validation is no longer supported."""
 
