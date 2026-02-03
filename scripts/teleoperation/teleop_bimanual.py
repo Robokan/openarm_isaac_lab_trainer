@@ -97,6 +97,11 @@ class KeyboardDevice:
         # Track euler angles for easier rotation (roll, pitch, yaw)
         self.left_euler = np.array([0.0, 0.0, 0.0])
         self.right_euler = np.array([0.0, 0.0, 0.0])
+        # Gripper values: 0.0 = open, 1.0 = closed
+        self.left_gripper = 0.0
+        self.right_gripper = 0.0
+        self.gripper_step = 0.05  # How fast gripper opens/closes
+        self.markers_visible = True  # Toggle for marker visibility
         self.active_hand = "left"
         self._carb_input = carb.input
         self._key_states = {}  # Track held keys for polling
@@ -122,11 +127,16 @@ class KeyboardDevice:
         print("  J/L: Yaw left/right")
         print("  U/O: Roll left/right")
         print("")
+        print("Gripper (active hand):")
+        print("  ; : Close gripper")
+        print("  ' : Open gripper")
+        print("")
         print("Hand Selection:")
         print("  1: Select LEFT hand")
         print("  2: Select RIGHT hand")
         print("")
         print("Other:")
+        print("  M: Toggle marker visibility")
         print("  R: Reset poses to default")
         print("  Ctrl+C: Quit")
         print("="*60 + "\n")
@@ -163,10 +173,16 @@ class KeyboardDevice:
                 self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
                 self.left_euler = np.array([0.0, 0.0, 0.0])
                 self.right_euler = np.array([0.0, 0.0, 0.0])
+                self.left_gripper = 0.0
+                self.right_gripper = 0.0
                 print("[Keyboard] Poses reset")
                 return False
+            elif key == self._carb_input.KeyboardInput.M:
+                self.markers_visible = not self.markers_visible
+                print(f"[Keyboard] Markers {'visible' if self.markers_visible else 'hidden'}")
+                return False
         
-        # Check if it's a movement/rotation key we handle
+        # Check if it's a movement/rotation/gripper key we handle
         movement_keys = {
             self._carb_input.KeyboardInput.W,
             self._carb_input.KeyboardInput.S,
@@ -180,6 +196,8 @@ class KeyboardDevice:
             self._carb_input.KeyboardInput.L,
             self._carb_input.KeyboardInput.U,
             self._carb_input.KeyboardInput.O,
+            self._carb_input.KeyboardInput.SEMICOLON,
+            self._carb_input.KeyboardInput.APOSTROPHE,
         }
         
         if key in movement_keys:
@@ -245,6 +263,18 @@ class KeyboardDevice:
         # Update quaternion if rotation changed
         if rot_changed:
             pose[3:7] = self._euler_to_quat(euler[0], euler[1], euler[2])
+        
+        # Gripper updates (for active hand)
+        if self.active_hand == "left":
+            if self._key_states.get(self._carb_input.KeyboardInput.SEMICOLON, False):
+                self.left_gripper = min(1.0, self.left_gripper + self.gripper_step)
+            if self._key_states.get(self._carb_input.KeyboardInput.APOSTROPHE, False):
+                self.left_gripper = max(0.0, self.left_gripper - self.gripper_step)
+        else:
+            if self._key_states.get(self._carb_input.KeyboardInput.SEMICOLON, False):
+                self.right_gripper = min(1.0, self.right_gripper + self.gripper_step)
+            if self._key_states.get(self._carb_input.KeyboardInput.APOSTROPHE, False):
+                self.right_gripper = max(0.0, self.right_gripper - self.gripper_step)
         
     def get_poses(self):
         return self.left_pose.copy(), self.right_pose.copy()
@@ -1088,12 +1118,14 @@ def run_teleop(env, args):
     right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
     sim_device = unwrapped.device if hasattr(unwrapped, "device") else "cuda:0"
     
-    # IK setup
-    print("[INFO] Setting up IK controllers...")
+    # IK setup - SPLIT CONTROL:
+    # - Joints 1-4: IK for position only (shoulder/elbow)
+    # - Joints 5-7: Direct control from euler angles (wrist)
+    print("[INFO] Setting up split IK controllers (position-only for joints 1-4)...")
     
-    # Create IK controllers for each arm
+    # Create IK controllers for position-only control (first 4 joints)
     ik_cfg = DifferentialIKControllerCfg(
-        command_type="pose",
+        command_type="position",  # Only 3-DOF position control
         use_relative_mode=False,
         ik_method="dls",
         ik_params={"lambda_val": 0.1},
@@ -1101,39 +1133,45 @@ def run_teleop(env, args):
     left_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     right_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     
-    # Get joint IDs for each arm
-    left_arm_joint_ids, left_joint_names = robot.find_joints([
+    # Get joint IDs - split into position joints (1-4) and wrist joints (5-7)
+    left_pos_joint_ids, left_pos_joint_names = robot.find_joints([
         "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
-        "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6",
-        "openarm_left_joint7"
+        "openarm_left_joint4"
     ])
-    right_arm_joint_ids, right_joint_names = robot.find_joints([
+    left_wrist_joint_ids, left_wrist_joint_names = robot.find_joints([
+        "openarm_left_joint5", "openarm_left_joint6", "openarm_left_joint7"
+    ])
+    right_pos_joint_ids, right_pos_joint_names = robot.find_joints([
         "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
-        "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
-        "openarm_right_joint7"
+        "openarm_right_joint4"
+    ])
+    right_wrist_joint_ids, right_wrist_joint_names = robot.find_joints([
+        "openarm_right_joint5", "openarm_right_joint6", "openarm_right_joint7"
     ])
     
-    # Get body IDs for end-effectors
+    # Get body IDs for end-effectors (still use hand for position tracking)
     left_body_ids, _ = robot.find_bodies("openarm_left_hand")
     right_body_ids, _ = robot.find_bodies("openarm_right_hand")
     left_body_idx = left_body_ids[0]
     right_body_idx = right_body_ids[0]
     
     # For fixed-base robots, jacobian body index is offset by 1
+    # Only use first 4 joints for position IK
     if robot.is_fixed_base:
         left_jacobi_body_idx = left_body_idx - 1
         right_jacobi_body_idx = right_body_idx - 1
-        left_jacobi_joint_ids = left_arm_joint_ids
-        right_jacobi_joint_ids = right_arm_joint_ids
+        left_jacobi_joint_ids = left_pos_joint_ids  # Only joints 1-4
+        right_jacobi_joint_ids = right_pos_joint_ids  # Only joints 1-4
     else:
         left_jacobi_body_idx = left_body_idx
         right_jacobi_body_idx = right_body_idx
-        left_jacobi_joint_ids = [i + 6 for i in left_arm_joint_ids]
-        right_jacobi_joint_ids = [i + 6 for i in right_arm_joint_ids]
+        left_jacobi_joint_ids = [i + 6 for i in left_pos_joint_ids]
+        right_jacobi_joint_ids = [i + 6 for i in right_pos_joint_ids]
     
-    print(f"[INFO] Left arm joints: {left_joint_names}")
-    print(f"[INFO] Right arm joints: {right_joint_names}")
-    print(f"[INFO] Left EE body index: {left_body_idx}, Right EE body index: {right_body_idx}")
+    print(f"[INFO] Left position joints (IK): {left_pos_joint_names}")
+    print(f"[INFO] Left wrist joints (direct): {left_wrist_joint_names}")
+    print(f"[INFO] Right position joints (IK): {right_pos_joint_names}")
+    print(f"[INFO] Right wrist joints (direct): {right_wrist_joint_names}")
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -1163,6 +1201,7 @@ def run_teleop(env, args):
         robot.write_joint_position_to_sim(right_open, joint_ids=right_gripper_ids)
     
     step_count = 0
+    prev_markers_visible = True  # Track previous visibility state
     
     try:
         while simulation_app.is_running() and step_count < 100000:
@@ -1170,10 +1209,41 @@ def run_teleop(env, args):
             if hasattr(input_device, 'update'):
                 input_device.update()
             
+            # Toggle marker visibility if changed
+            if hasattr(input_device, 'markers_visible'):
+                if input_device.markers_visible != prev_markers_visible:
+                    prev_markers_visible = input_device.markers_visible
+                    # Toggle visibility of all marker prims
+                    try:
+                        import omni.usd
+                        from pxr import UsdGeom
+                        stage = omni.usd.get_context().get_stage()
+                        count = 0
+                        # Find all prims with marker-related names
+                        for prim in stage.Traverse():
+                            prim_path = str(prim.GetPath())
+                            # Match goal_pose, body_pose markers
+                            if ("goal_pose" in prim_path or "body_pose" in prim_path or 
+                                ("Visuals" in prim_path and "Command" in prim_path)):
+                                try:
+                                    imageable = UsdGeom.Imageable(prim)
+                                    if imageable:
+                                        if input_device.markers_visible:
+                                            imageable.MakeVisible()
+                                        else:
+                                            imageable.MakeInvisible()
+                                        count += 1
+                                except:
+                                    pass
+                        if count > 0:
+                            print(f"[Markers] Toggled {count} prims {'visible' if input_device.markers_visible else 'hidden'}")
+                    except Exception as e:
+                        print(f"[WARN] Could not toggle markers: {e}")
+            
             # Get controller poses
             left_pose, right_pose = input_device.get_poses()
             
-            # Map trigger pulls to gripper positions (open by default, close when trigger pulled)
+            # Map trigger/keyboard to gripper positions (open by default, close when triggered)
             left_trigger = 0.0
             right_trigger = 0.0
             if hasattr(input_device, "get_gripper_targets"):
@@ -1182,6 +1252,10 @@ def run_teleop(env, args):
                     left_trigger = float(np.clip(lt, 0.0, 1.0))
                 if rt is not None:
                     right_trigger = float(np.clip(rt, 0.0, 1.0))
+            # Use keyboard gripper values if available
+            if hasattr(input_device, "left_gripper"):
+                left_trigger = input_device.left_gripper
+                right_trigger = input_device.right_gripper
             
             # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
             if left_gripper_ids:
@@ -1203,14 +1277,26 @@ def run_teleop(env, args):
                 )
                 robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
             
-            # ===== IK-based control =====
-            # Convert poses to tensors (pose format: x, y, z, qw, qx, qy, qz)
-            left_target_pos = torch.tensor(left_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
-            left_target_quat = torch.tensor(left_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
-            right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
-            right_target_quat = torch.tensor(right_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            # ===== SPLIT CONTROL =====
+            # Position IK (joints 1-4) + Direct wrist control (joints 5-7)
             
-            # Get current end-effector poses in robot base frame
+            # Convert position targets to tensors
+            left_target_pos = torch.tensor(left_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            
+            # Get euler angles from input device for direct wrist control
+            if hasattr(input_device, 'left_euler'):
+                left_euler = input_device.left_euler
+                right_euler = input_device.right_euler
+            else:
+                # For VR/gamepad, extract euler from quaternion
+                left_quat = left_pose[3:7]  # qw, qx, qy, qz
+                right_quat = right_pose[3:7]
+                # Convert to euler (simplified - may need adjustment for VR)
+                left_euler = np.array([0.0, 0.0, 0.0])
+                right_euler = np.array([0.0, 0.0, 0.0])
+            
+            # Get current end-effector position in robot base frame
             root_pos_w = robot.data.root_pos_w
             root_quat_w = robot.data.root_quat_w
             
@@ -1228,12 +1314,11 @@ def run_teleop(env, args):
                 root_pos_w, root_quat_w, right_ee_pos_w, right_ee_quat_w
             )
             
-            # Get Jacobians for each arm
+            # Get Jacobians - only for position joints (1-4)
             jacobians = robot.root_physx_view.get_jacobians()
             
-            # Left arm Jacobian (extract only the relevant joints)
+            # Left arm Jacobian (only position joints, only position rows)
             left_jacobian_w = jacobians[:, left_jacobi_body_idx, :, left_jacobi_joint_ids]
-            # Transform to body frame
             base_rot_matrix = math_utils.matrix_from_quat(math_utils.quat_inv(root_quat_w))
             left_jacobian_b = left_jacobian_w.clone()
             left_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, :3, :])
@@ -1245,28 +1330,42 @@ def run_teleop(env, args):
             right_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, :3, :])
             right_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, 3:, :])
             
-            # Get current joint positions
-            left_joint_pos = robot.data.joint_pos[:, left_arm_joint_ids]
-            right_joint_pos = robot.data.joint_pos[:, right_arm_joint_ids]
+            # Get current position joint values (joints 1-4 only)
+            left_pos_joint_vals = robot.data.joint_pos[:, left_pos_joint_ids]
+            right_pos_joint_vals = robot.data.joint_pos[:, right_pos_joint_ids]
             
-            # Set target poses in IK controllers
-            left_target_cmd = torch.cat([left_target_pos, left_target_quat], dim=1)
-            right_target_cmd = torch.cat([right_target_pos, right_target_quat], dim=1)
+            # ===== POSITION IK (joints 1-4) =====
+            # Set position-only target (ee_quat is required for display but not used in IK)
+            left_ik_controller.set_command(left_target_pos, ee_quat=left_ee_quat_b)
+            right_ik_controller.set_command(right_target_pos, ee_quat=right_ee_quat_b)
             
-            left_ik_controller.set_command(left_target_cmd)
-            right_ik_controller.set_command(right_target_cmd)
-            
-            # Compute IK to get desired joint positions
-            left_joint_pos_des = left_ik_controller.compute(
-                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
+            # Compute IK to get desired joint positions for joints 1-4
+            left_pos_joints_des = left_ik_controller.compute(
+                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_pos_joint_vals
             )
-            right_joint_pos_des = right_ik_controller.compute(
-                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
+            right_pos_joints_des = right_ik_controller.compute(
+                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_pos_joint_vals
+            )
+            
+            # ===== DIRECT WRIST CONTROL (joints 5-7) =====
+            # Convert euler angles directly to wrist joint positions
+            # Joint axes: 5=Z, 6=X, 7=Y
+            # Euler: roll=X, pitch=Y, yaw=Z
+            # Mapping: joint5=yaw(Z), joint6=roll(X), joint7=pitch(Y)
+            left_wrist_joints_des = torch.tensor(
+                [[left_euler[2], left_euler[0], left_euler[1]]],  # yaw, roll, pitch
+                dtype=torch.float32, device=sim_device
+            )
+            right_wrist_joints_des = torch.tensor(
+                [[right_euler[2], right_euler[0], right_euler[1]]],  # yaw, roll, pitch
+                dtype=torch.float32, device=sim_device
             )
             
             # Apply joint position targets
-            robot.set_joint_position_target(left_joint_pos_des, joint_ids=left_arm_joint_ids)
-            robot.set_joint_position_target(right_joint_pos_des, joint_ids=right_arm_joint_ids)
+            robot.set_joint_position_target(left_pos_joints_des, joint_ids=left_pos_joint_ids)
+            robot.set_joint_position_target(left_wrist_joints_des, joint_ids=left_wrist_joint_ids)
+            robot.set_joint_position_target(right_pos_joints_des, joint_ids=right_pos_joint_ids)
+            robot.set_joint_position_target(right_wrist_joints_des, joint_ids=right_wrist_joint_ids)
             
             # Write the articulation data to simulation
             robot.write_data_to_sim()
