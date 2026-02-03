@@ -13,20 +13,13 @@
 # limitations under the License.
 
 """
-Bimanual Teleoperation / OpenPI Client for OpenArm
+Bimanual IK Teleoperation for OpenArm
 
-Supports two modes:
-  - Teleoperation mode (default): Manual control via keyboard/VR/gamepad
-  - Client mode (--client): Acts as OpenPI client, receives actions from π₀ server
+Uses inverse kinematics to control bimanual robot arms via keyboard or VR controllers.
 
 Usage:
-    # Teleoperation mode:
-    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt
-    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --input keyboard
-
-    # OpenPI client mode (connect to π₀ policy server):
-    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --client
-    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --checkpoint /path/to/model.pt --client --host localhost --port 8000
+    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --input keyboard
+    python teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 --input xr
 """
 
 import argparse
@@ -35,24 +28,12 @@ import sys
 from isaaclab.app import AppLauncher
 
 # Parse arguments
-parser = argparse.ArgumentParser(description="Bimanual Teleoperation / OpenPI Client for OpenArm")
+parser = argparse.ArgumentParser(description="Bimanual IK Teleoperation for OpenArm")
 parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-v0", help="Task name")
-parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint")
 parser.add_argument("--input", type=str, default="keyboard", choices=["vive", "keyboard", "gamepad", "xr"],
                     help="Input device for teleoperation (xr = VR handtracking)")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
 parser.add_argument("--sensitivity", type=float, default=1.0, help="Controller sensitivity")
-
-# OpenPI client mode arguments
-parser.add_argument("--client", action="store_true", help="Run as OpenPI client instead of teleop")
-parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
-parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
-parser.add_argument("--action_horizon", type=int, default=10, help="Action chunk size")
-parser.add_argument("--prompt", type=str, default="perform the bimanual manipulation task", 
-                    help="Task prompt for VLA")
-parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency for client mode")
-parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes (client mode)")
-parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode (client mode)")
 parser.add_argument("--viewer-eye", type=float, nargs=3, default=None,
                     help="Initial viewer eye position (x y z)")
 parser.add_argument("--viewer-lookat", type=float, nargs=3, default=None,
@@ -86,218 +67,14 @@ import torch
 import numpy as np
 import math
 
-from rsl_rl.runners import OnPolicyRunner
-
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
-from isaaclab.utils.assets import retrieve_file_path
-
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+import isaaclab.utils.math as math_utils
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import openarm.tasks  # noqa: F401
-
-
-# =============================================================================
-# OpenPI Environment Wrapper for Bimanual OpenArm
-# =============================================================================
-
-class OpenArmBimanualEnvironment:
-    """
-    OpenPI-compatible Environment wrapper for Bimanual OpenArm in Isaac Lab.
-    
-    Provides the same interface as openpi_client.runtime.Environment,
-    using ALOHA-style observation format for bimanual robots:
-    - State: [left_arm_joints(7), left_gripper(1), right_arm_joints(7), right_gripper(1)] = 16 DOF
-    - Images: cam_high, cam_left_wrist, cam_right_wrist
-    """
-
-    # Bimanual OpenArm: 7 arm joints + 1 gripper per arm = 16 total
-    NUM_ARM_JOINTS = 7
-    TOTAL_DOF = 16  # (7+1) * 2
-    IMAGE_SIZE = 224
-
-    def __init__(self, env, policy, prompt: str = "perform the task"):
-        """
-        Args:
-            env: Isaac Lab wrapped environment
-            policy: Trained RL policy for low-level control
-            prompt: Task prompt for VLA
-        """
-        self._env = env
-        self._policy = policy
-        self._prompt = prompt
-        self._device = "cuda:0"
-        
-        # Get unwrapped env for direct access
-        self._unwrapped = env.unwrapped
-        if hasattr(self._unwrapped, 'unwrapped'):
-            self._unwrapped = self._unwrapped.unwrapped
-        
-        # State
-        self._obs = None
-        self._done = True
-        self._step_count = 0
-
-    def reset(self) -> None:
-        """Reset the environment."""
-        self._obs, _ = self._env.reset()
-        self._done = False
-        self._step_count = 0
-
-    def is_episode_complete(self) -> bool:
-        """Check if episode is complete."""
-        return self._done
-
-    def get_observation(self) -> dict:
-        """
-        Get observation in ALOHA-compatible format for OpenPI.
-        
-        Returns:
-            dict with:
-                - state: [16] array (left_arm(7), left_gripper(1), right_arm(7), right_gripper(1))
-                - images: dict with camera images in [C, H, W] format
-                - prompt: task instruction
-        """
-        if self._obs is None:
-            raise RuntimeError("Observation not set. Call reset() first.")
-        
-        robot = self._unwrapped.scene["robot"]
-        joint_pos = robot.data.joint_pos[0].cpu().numpy()
-        
-        # Extract left and right arm joints + grippers
-        # Joint ordering based on openarm_bimanual.py:
-        # left_joint1-7, left_finger_joint, right_joint1-7, right_finger_joint
-        num_joints = len(joint_pos)
-        
-        if num_joints >= 16:
-            # Full bimanual: 7 left arm + 1 left gripper + 7 right arm + 1 right gripper
-            left_arm = joint_pos[0:7]
-            left_gripper = np.clip(joint_pos[7:8] / 0.044, 0.0, 1.0)
-            right_arm = joint_pos[8:15]
-            right_gripper = np.clip(joint_pos[15:16] / 0.044, 0.0, 1.0)
-        else:
-            # Fallback: split evenly
-            half = num_joints // 2
-            left_arm = joint_pos[0:min(7, half-1)]
-            left_gripper = np.clip(joint_pos[half-1:half] / 0.044, 0.0, 1.0) if half > 0 else np.array([0.0])
-            right_arm = joint_pos[half:half+7] if num_joints > half else np.zeros(7)
-            right_gripper = np.clip(joint_pos[-1:] / 0.044, 0.0, 1.0)
-        
-        # Pad to correct sizes if needed
-        left_arm = np.pad(left_arm, (0, max(0, 7 - len(left_arm))), mode='constant')
-        right_arm = np.pad(right_arm, (0, max(0, 7 - len(right_arm))), mode='constant')
-        left_gripper = left_gripper if len(left_gripper) == 1 else np.array([0.0])
-        right_gripper = right_gripper if len(right_gripper) == 1 else np.array([0.0])
-        
-        # Combine into ALOHA-style state: [left_arm, left_gripper, right_arm, right_gripper]
-        state = np.concatenate([left_arm, left_gripper, right_arm, right_gripper]).astype(np.float32)
-        
-        # Camera images in [C, H, W] format (placeholder - replace with actual cameras if available)
-        black_image = np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
-        
-        return {
-            "state": state,
-            "images": {
-                "cam_high": black_image.copy(),
-                "cam_left_wrist": black_image.copy(),
-                "cam_right_wrist": black_image.copy(),
-            },
-            "prompt": self._prompt,
-        }
-
-    def apply_action(self, action: dict) -> None:
-        """
-        Apply action from OpenPI policy.
-        
-        The VLA returns actions in ALOHA format:
-        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
-        
-        For now, we use the trained RL policy to execute low-level control.
-        """
-        # Get action from OpenPI response (could be used for task-space targets)
-        vla_actions = action.get("actions")
-        
-        # TODO: Map VLA actions to end-effector pose targets for the command manager
-        # if vla_actions is not None:
-        #     # Convert joint targets to EE pose targets if needed
-        #     pass
-        
-        # Step with RL policy
-        with torch.inference_mode():
-            actions = self._policy(self._obs)
-        
-        self._obs, _, dones, _ = self._env.step(actions)
-        self._step_count += 1
-        
-        if hasattr(dones, 'any'):
-            self._done = dones.any().item()
-        else:
-            self._done = bool(dones)
-        
-        if self._done:
-            self._obs, _ = self._env.get_observations()
-
-
-def run_openpi_client(env, policy, args):
-    """Run the environment as an OpenPI client."""
-    
-    # Import OpenPI client components
-    try:
-        from openpi_client import action_chunk_broker
-        from openpi_client import websocket_client_policy
-        from openpi_client.runtime import runtime as openpi_runtime
-        from openpi_client.runtime.agents import policy_agent
-    except ImportError as e:
-        print(f"\n[ERROR] OpenPI client not installed: {e}")
-        print("[INFO] Install with: pip install -e /path/to/openpi/packages/openpi-client")
-        print("[INFO] For example: pip install -e ../openpi/packages/openpi-client")
-        return
-    
-    print("\n" + "="*60)
-    print("OPENARM BIMANUAL - OPENPI CLIENT MODE")
-    print("="*60)
-    print(f"Connecting to π₀ server at {args.host}:{args.port}")
-    print(f"Action horizon: {args.action_horizon}")
-    print(f"Max Hz: {args.max_hz}")
-    print(f"Prompt: {args.prompt}")
-    print("="*60 + "\n")
-    
-    # Create OpenPI-compatible environment wrapper
-    openpi_env = OpenArmBimanualEnvironment(
-        env=env,
-        policy=policy,
-        prompt=args.prompt,
-    )
-    
-    # Create OpenPI runtime
-    runtime = openpi_runtime.Runtime(
-        environment=openpi_env,
-        agent=policy_agent.PolicyAgent(
-            policy=action_chunk_broker.ActionChunkBroker(
-                policy=websocket_client_policy.WebsocketClientPolicy(
-                    host=args.host,
-                    port=args.port,
-                ),
-                action_horizon=args.action_horizon,
-            )
-        ),
-        subscribers=[],
-        max_hz=args.max_hz,
-        num_episodes=args.num_episodes,
-        max_episode_steps=args.max_episode_steps,
-    )
-    
-    print("[INFO] Starting OpenPI client loop...")
-    print("[INFO] Press Ctrl+C to stop\n")
-    
-    try:
-        runtime.run()
-    except KeyboardInterrupt:
-        print("\n[INFO] Client stopped by user")
-    
-    print("[INFO] OpenPI client finished")
 
 
 # =============================================================================
@@ -313,10 +90,16 @@ class KeyboardDevice:
         
         self.sensitivity = sensitivity
         self.step_size = 0.01 * sensitivity
+        self.rot_step = 0.05  # radians per update (~3 degrees)
         # Initial poses (x, y, z, qw, qx, qy, qz)
         self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
+        # Track euler angles for easier rotation (roll, pitch, yaw)
+        self.left_euler = np.array([0.0, 0.0, 0.0])
+        self.right_euler = np.array([0.0, 0.0, 0.0])
         self.active_hand = "left"
+        self._carb_input = carb.input
+        self._key_states = {}  # Track held keys for polling
         
         # Set up keyboard input
         self._input = carb.input.acquire_input_interface()
@@ -324,13 +107,20 @@ class KeyboardDevice:
         self._keyboard = self._app_window.get_keyboard()
         self._sub_keyboard = self._input.subscribe_to_keyboard_events(self._keyboard, self._on_keyboard_event)
         
+        print("[KeyboardDevice] Keyboard input initialized")
+        
         print("\n" + "="*60)
         print("KEYBOARD TELEOPERATION CONTROLS")
         print("="*60)
-        print("Movement (active hand):")
+        print("Position (active hand):")
         print("  W/S: Forward/Backward (X)")
         print("  A/D: Left/Right (Y)")  
         print("  Q/E: Up/Down (Z)")
+        print("")
+        print("Rotation (active hand):")
+        print("  I/K: Pitch up/down")
+        print("  J/L: Yaw left/right")
+        print("  U/O: Roll left/right")
         print("")
         print("Hand Selection:")
         print("  1: Select LEFT hand")
@@ -342,41 +132,119 @@ class KeyboardDevice:
         print("="*60 + "\n")
     
     def _on_keyboard_event(self, event, *args, **kwargs):
-        """Handle keyboard events from Isaac Sim."""
-        import carb.input
+        """Handle keyboard events from Isaac Sim.
         
-        # Only process key press events
-        if event.type != carb.input.KeyboardEventType.KEY_PRESS:
+        Returns False for keys we handle to prevent UI from consuming them.
+        Returns True for other keys to let them propagate.
+        """
+        key = event.input
+        
+        # Track key states for all events
+        if event.type == self._carb_input.KeyboardEventType.KEY_PRESS:
+            self._key_states[key] = True
+        elif event.type == self._carb_input.KeyboardEventType.KEY_RELEASE:
+            self._key_states[key] = False
+            return True  # Let release events propagate
+        elif event.type != self._carb_input.KeyboardEventType.KEY_REPEAT:
             return True
         
-        # Get the key
-        key = event.input
+        # Handle one-shot keys (hand selection, reset)
+        if event.type == self._carb_input.KeyboardEventType.KEY_PRESS:
+            if key == self._carb_input.KeyboardInput.KEY_1:
+                self.active_hand = "left"
+                print("[Keyboard] Active: LEFT hand")
+                return False
+            elif key == self._carb_input.KeyboardInput.KEY_2:
+                self.active_hand = "right"
+                print("[Keyboard] Active: RIGHT hand")
+                return False
+            elif key == self._carb_input.KeyboardInput.R:
+                self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
+                self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
+                self.left_euler = np.array([0.0, 0.0, 0.0])
+                self.right_euler = np.array([0.0, 0.0, 0.0])
+                print("[Keyboard] Poses reset")
+                return False
+        
+        # Check if it's a movement/rotation key we handle
+        movement_keys = {
+            self._carb_input.KeyboardInput.W,
+            self._carb_input.KeyboardInput.S,
+            self._carb_input.KeyboardInput.A,
+            self._carb_input.KeyboardInput.D,
+            self._carb_input.KeyboardInput.Q,
+            self._carb_input.KeyboardInput.E,
+            self._carb_input.KeyboardInput.I,
+            self._carb_input.KeyboardInput.K,
+            self._carb_input.KeyboardInput.J,
+            self._carb_input.KeyboardInput.L,
+            self._carb_input.KeyboardInput.U,
+            self._carb_input.KeyboardInput.O,
+        }
+        
+        if key in movement_keys:
+            return False  # Consume movement keys
+        
+        return True  # Let other keys propagate
+    
+    def _euler_to_quat(self, roll, pitch, yaw):
+        """Convert euler angles (roll, pitch, yaw) to quaternion (w, x, y, z)."""
+        cr = np.cos(roll / 2)
+        sr = np.sin(roll / 2)
+        cp = np.cos(pitch / 2)
+        sp = np.sin(pitch / 2)
+        cy = np.cos(yaw / 2)
+        sy = np.sin(yaw / 2)
+        
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+        return np.array([w, x, y, z])
+    
+    def update(self):
+        """Poll key states and update poses. Call this each frame."""
         pose = self.left_pose if self.active_hand == "left" else self.right_pose
+        euler = self.left_euler if self.active_hand == "left" else self.right_euler
         
-        if key == carb.input.KeyboardInput.W:
+        # Position updates
+        if self._key_states.get(self._carb_input.KeyboardInput.W, False):
             pose[0] += self.step_size
-        elif key == carb.input.KeyboardInput.S:
+        if self._key_states.get(self._carb_input.KeyboardInput.S, False):
             pose[0] -= self.step_size
-        elif key == carb.input.KeyboardInput.A:
+        if self._key_states.get(self._carb_input.KeyboardInput.A, False):
             pose[1] += self.step_size
-        elif key == carb.input.KeyboardInput.D:
+        if self._key_states.get(self._carb_input.KeyboardInput.D, False):
             pose[1] -= self.step_size
-        elif key == carb.input.KeyboardInput.Q:
+        if self._key_states.get(self._carb_input.KeyboardInput.Q, False):
             pose[2] += self.step_size
-        elif key == carb.input.KeyboardInput.E:
+        if self._key_states.get(self._carb_input.KeyboardInput.E, False):
             pose[2] -= self.step_size
-        elif key == carb.input.KeyboardInput.KEY_1:
-            self.active_hand = "left"
-            print("Active: LEFT hand")
-        elif key == carb.input.KeyboardInput.KEY_2:
-            self.active_hand = "right"
-            print("Active: RIGHT hand")
-        elif key == carb.input.KeyboardInput.R:
-            self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
-            self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
-            print("Poses reset")
         
-        return True
+        # Rotation updates (euler angles: roll, pitch, yaw)
+        rot_changed = False
+        if self._key_states.get(self._carb_input.KeyboardInput.U, False):
+            euler[0] -= self.rot_step  # Roll left
+            rot_changed = True
+        if self._key_states.get(self._carb_input.KeyboardInput.O, False):
+            euler[0] += self.rot_step  # Roll right
+            rot_changed = True
+        if self._key_states.get(self._carb_input.KeyboardInput.I, False):
+            euler[1] += self.rot_step  # Pitch up
+            rot_changed = True
+        if self._key_states.get(self._carb_input.KeyboardInput.K, False):
+            euler[1] -= self.rot_step  # Pitch down
+            rot_changed = True
+        if self._key_states.get(self._carb_input.KeyboardInput.J, False):
+            euler[2] += self.rot_step  # Yaw left
+            rot_changed = True
+        if self._key_states.get(self._carb_input.KeyboardInput.L, False):
+            euler[2] -= self.rot_step  # Yaw right
+            rot_changed = True
+        
+        # Update quaternion if rotation changed
+        if rot_changed:
+            pose[3:7] = self._euler_to_quat(euler[0], euler[1], euler[2])
         
     def get_poses(self):
         return self.left_pose.copy(), self.right_pose.copy()
@@ -1136,8 +1004,9 @@ def _set_viewport_camera(camera_path: str) -> bool:
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
-    """Main entry point - runs either teleop or OpenPI client mode."""
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg=None):
+    """Main entry point for IK-based teleoperation."""
+    # Note: agent_cfg is passed by hydra but not used for IK control
     
     # Configure environment
     env_cfg.scene.num_envs = args_cli.num_envs
@@ -1175,36 +1044,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         except Exception as exc:
             print(f"[WARN] Unable to set viewport camera: {exc}")
     
-    # Wrap for RSL-RL
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    print("[INFO] Using IK-based control")
     
-    # Load checkpoint
-    print(f"[INFO] Loading checkpoint: {args_cli.checkpoint}")
-    checkpoint_path = retrieve_file_path(args_cli.checkpoint)
-    
-    # Create policy runner to load the model
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(checkpoint_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    print("[INFO] Policy loaded successfully!")
-    
-    # Branch based on mode
-    if args_cli.client:
-        # OpenPI client mode
-        run_openpi_client(env, policy, args_cli)
-    else:
-        # Teleoperation mode
-        run_teleop(env, policy, args_cli)
+    # Run IK teleoperation
+    run_teleop(env, args_cli)
     
     env.close()
     print("[INFO] Environment closed")
 
 
-def run_teleop(env, policy, args):
-    """Run teleoperation mode with manual input devices."""
+def run_teleop(env, args):
+    """Run IK-based teleoperation with manual input devices."""
     
     print("\n" + "="*60)
-    print("OPENARM BIMANUAL TELEOPERATION")
+    print("OPENARM BIMANUAL IK TELEOPERATION")
     print("="*60)
     
     # Initialize input device
@@ -1223,20 +1076,64 @@ def run_teleop(env, policy, args):
     else:
         input_device = KeyboardDevice(args.sensitivity)
     
-    # Get unwrapped env for command manager access
+    # Get unwrapped env
     unwrapped = env.unwrapped
     if hasattr(unwrapped, 'unwrapped'):
         unwrapped = unwrapped.unwrapped
-    
-    # Get initial observations
-    obs = env.get_observations()
 
     # Gripper joints (optional trigger control)
     gripper_open_pos = 0.044
     robot = unwrapped.scene["robot"]
     left_gripper_ids, _ = robot.find_joints("openarm_left_finger_joint.*")
     right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
-    sim_device = env.unwrapped.device if hasattr(env.unwrapped, "device") else "cuda:0"
+    sim_device = unwrapped.device if hasattr(unwrapped, "device") else "cuda:0"
+    
+    # IK setup
+    print("[INFO] Setting up IK controllers...")
+    
+    # Create IK controllers for each arm
+    ik_cfg = DifferentialIKControllerCfg(
+        command_type="pose",
+        use_relative_mode=False,
+        ik_method="dls",
+        ik_params={"lambda_val": 0.1},
+    )
+    left_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
+    right_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
+    
+    # Get joint IDs for each arm
+    left_arm_joint_ids, left_joint_names = robot.find_joints([
+        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
+        "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6",
+        "openarm_left_joint7"
+    ])
+    right_arm_joint_ids, right_joint_names = robot.find_joints([
+        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
+        "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
+        "openarm_right_joint7"
+    ])
+    
+    # Get body IDs for end-effectors
+    left_body_ids, _ = robot.find_bodies("openarm_left_hand")
+    right_body_ids, _ = robot.find_bodies("openarm_right_hand")
+    left_body_idx = left_body_ids[0]
+    right_body_idx = right_body_ids[0]
+    
+    # For fixed-base robots, jacobian body index is offset by 1
+    if robot.is_fixed_base:
+        left_jacobi_body_idx = left_body_idx - 1
+        right_jacobi_body_idx = right_body_idx - 1
+        left_jacobi_joint_ids = left_arm_joint_ids
+        right_jacobi_joint_ids = right_arm_joint_ids
+    else:
+        left_jacobi_body_idx = left_body_idx
+        right_jacobi_body_idx = right_body_idx
+        left_jacobi_joint_ids = [i + 6 for i in left_arm_joint_ids]
+        right_jacobi_joint_ids = [i + 6 for i in right_arm_joint_ids]
+    
+    print(f"[INFO] Left arm joints: {left_joint_names}")
+    print(f"[INFO] Right arm joints: {right_joint_names}")
+    print(f"[INFO] Left EE body index: {left_body_idx}, Right EE body index: {right_body_idx}")
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -1269,25 +1166,13 @@ def run_teleop(env, policy, args):
     
     try:
         while simulation_app.is_running() and step_count < 100000:
+            # Update input device (poll key states for keyboard)
+            if hasattr(input_device, 'update'):
+                input_device.update()
+            
             # Get controller poses
             left_pose, right_pose = input_device.get_poses()
             
-            # Update environment commands with teleop poses
-            if hasattr(unwrapped, 'command_manager'):
-                # Convert to tensors
-                left_cmd = torch.tensor(left_pose, dtype=torch.float32, device="cuda:0")
-                right_cmd = torch.tensor(right_pose, dtype=torch.float32, device="cuda:0")
-                
-                # Set left arm target
-                if "left_ee_pose" in unwrapped.command_manager._terms:
-                    unwrapped.command_manager._terms["left_ee_pose"].command[:, :3] = left_cmd[:3].unsqueeze(0)
-                    unwrapped.command_manager._terms["left_ee_pose"].command[:, 3:7] = left_cmd[3:7].unsqueeze(0)
-                
-                # Set right arm target
-                if "right_ee_pose" in unwrapped.command_manager._terms:
-                    unwrapped.command_manager._terms["right_ee_pose"].command[:, :3] = right_cmd[:3].unsqueeze(0)
-                    unwrapped.command_manager._terms["right_ee_pose"].command[:, 3:7] = right_cmd[3:7].unsqueeze(0)
-
             # Map trigger pulls to gripper positions (open by default, close when trigger pulled)
             left_trigger = 0.0
             right_trigger = 0.0
@@ -1318,12 +1203,79 @@ def run_teleop(env, policy, args):
                 )
                 robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
             
-            # Run policy
-            with torch.inference_mode():
-                actions = policy(obs)
+            # ===== IK-based control =====
+            # Convert poses to tensors (pose format: x, y, z, qw, qx, qy, qz)
+            left_target_pos = torch.tensor(left_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            left_target_quat = torch.tensor(left_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            right_target_quat = torch.tensor(right_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
             
-            # Step environment
-            obs, _, dones, _ = env.step(actions)
+            # Get current end-effector poses in robot base frame
+            root_pos_w = robot.data.root_pos_w
+            root_quat_w = robot.data.root_quat_w
+            
+            # Left arm EE pose
+            left_ee_pos_w = robot.data.body_pos_w[:, left_body_idx]
+            left_ee_quat_w = robot.data.body_quat_w[:, left_body_idx]
+            left_ee_pos_b, left_ee_quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, left_ee_pos_w, left_ee_quat_w
+            )
+            
+            # Right arm EE pose
+            right_ee_pos_w = robot.data.body_pos_w[:, right_body_idx]
+            right_ee_quat_w = robot.data.body_quat_w[:, right_body_idx]
+            right_ee_pos_b, right_ee_quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, right_ee_pos_w, right_ee_quat_w
+            )
+            
+            # Get Jacobians for each arm
+            jacobians = robot.root_physx_view.get_jacobians()
+            
+            # Left arm Jacobian (extract only the relevant joints)
+            left_jacobian_w = jacobians[:, left_jacobi_body_idx, :, left_jacobi_joint_ids]
+            # Transform to body frame
+            base_rot_matrix = math_utils.matrix_from_quat(math_utils.quat_inv(root_quat_w))
+            left_jacobian_b = left_jacobian_w.clone()
+            left_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, :3, :])
+            left_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, 3:, :])
+            
+            # Right arm Jacobian
+            right_jacobian_w = jacobians[:, right_jacobi_body_idx, :, right_jacobi_joint_ids]
+            right_jacobian_b = right_jacobian_w.clone()
+            right_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, :3, :])
+            right_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, 3:, :])
+            
+            # Get current joint positions
+            left_joint_pos = robot.data.joint_pos[:, left_arm_joint_ids]
+            right_joint_pos = robot.data.joint_pos[:, right_arm_joint_ids]
+            
+            # Set target poses in IK controllers
+            left_target_cmd = torch.cat([left_target_pos, left_target_quat], dim=1)
+            right_target_cmd = torch.cat([right_target_pos, right_target_quat], dim=1)
+            
+            left_ik_controller.set_command(left_target_cmd)
+            right_ik_controller.set_command(right_target_cmd)
+            
+            # Compute IK to get desired joint positions
+            left_joint_pos_des = left_ik_controller.compute(
+                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
+            )
+            right_joint_pos_des = right_ik_controller.compute(
+                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
+            )
+            
+            # Apply joint position targets
+            robot.set_joint_position_target(left_joint_pos_des, joint_ids=left_arm_joint_ids)
+            robot.set_joint_position_target(right_joint_pos_des, joint_ids=right_arm_joint_ids)
+            
+            # Write the articulation data to simulation
+            robot.write_data_to_sim()
+            
+            # Step the simulation directly (bypass env.step to avoid command manager resampling)
+            unwrapped.sim.step(render=True)
+            
+            # Update robot data from simulation
+            robot.update(unwrapped.sim.get_physics_dt())
             
             # Print status periodically
             step_count += 1
@@ -1332,10 +1284,6 @@ def run_teleop(env, policy, args):
                       f"L:[{left_pose[0]:.2f},{left_pose[1]:.2f},{left_pose[2]:.2f}] | "
                       f"R:[{right_pose[0]:.2f},{right_pose[1]:.2f},{right_pose[2]:.2f}] | "
                       f"Grip L:{left_trigger:.2f} R:{right_trigger:.2f}")
-            
-            # Handle reset if episode ends
-            if dones.any():
-                obs = env.get_observations()
                 
     except KeyboardInterrupt:
         print("\n[INFO] Teleoperation stopped by user")

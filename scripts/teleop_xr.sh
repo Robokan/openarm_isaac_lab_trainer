@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
 set -e
 
-# XR Teleoperation for OpenArm using WiVRn + Isaac Sim's built-in XR (local)
-# NOTE: This script is for TELEOPERATION ONLY (not OpenPI client mode)
-#       For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client
+# IK Teleoperation for OpenArm using WiVRn + Isaac Sim's built-in XR
+#
+# Uses inverse kinematics for direct control - no trained model needed.
 #
 # Prerequisites:
 #   1. WiVRn server running: flatpak run io.github.wivrn.wivrn
 #   2. Vive XR Elite connected to WiVRn
 #
 # Usage:
-#   ./scripts/teleop_xr.sh              # Bimanual XR teleoperation
+#   ./scripts/teleop_xr.sh              # XR teleoperation with VR controllers
 #   ./scripts/teleop_xr.sh --keyboard   # Test with keyboard (no XR)
 
 INPUT_MODE="xr"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Check for keyboard flag
-if [[ "$1" == "--keyboard" ]]; then
-    INPUT_MODE="keyboard"
-    shift
-fi
+# Check for flags
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keyboard)
+            INPUT_MODE="keyboard"
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
 
 cd "${REPO_ROOT}"
 
@@ -61,26 +68,13 @@ if [[ "$INPUT_MODE" == "xr" ]] && ! pgrep -f "wivrn" > /dev/null; then
 fi
 
 TASK="Isaac-Reach-OpenArm-Bi-Play-v0"
-LOG_PATH="openarm_bi_reach_teleop"
-
-# Find latest checkpoint (prefer teleop-trained)
-CHECKPOINT=$(find "${REPO_ROOT}/logs/rsl_rl/${LOG_PATH}" -name 'model_*.pt' 2>/dev/null | sort -V | tail -1)
-if [[ -z "$CHECKPOINT" ]]; then
-    CHECKPOINT=$(find "${REPO_ROOT}/logs/rsl_rl/openarm_bi_reach" -name 'model_*.pt' 2>/dev/null | sort -V | tail -1)
-fi
-
-if [[ -z "$CHECKPOINT" ]]; then
-    echo "Error: No trained model found."
-    echo "Train first with: ./scripts/train_bimanual_reach.sh --headless"
-    exit 1
-fi
 
 echo ""
 echo "=========================================="
-echo "OPENARM XR TELEOPERATION"
+echo "OPENARM IK TELEOPERATION"
 echo "=========================================="
 echo "Task: ${TASK}"
-echo "Checkpoint: ${CHECKPOINT}"
+echo "Control Mode: Inverse Kinematics (IK)"
 echo "Input Mode: ${INPUT_MODE}"
 echo ""
 if [[ "$INPUT_MODE" == "xr" ]]; then
@@ -94,32 +88,33 @@ fi
 echo "=========================================="
 echo ""
 
-# Run OpenArm teleop with XR
-RUNTIME_JSON_PATH="${REPO_ROOT}/.openxr_runtime.json"
-WIVRN_RUNTIME_JSON_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/share/openxr/1/openxr_wivrn.json"
-WIVRN_RUNTIME_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libopenxr_wivrn.so"
-WIVRN_MONADO_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libmonado_wivrn.so"
-WIVRN_RUNTIME_JSON="${WIVRN_RUNTIME_JSON:-$WIVRN_RUNTIME_JSON_DEFAULT}"
-WIVRN_RUNTIME_LIB="${WIVRN_RUNTIME_LIB:-$WIVRN_RUNTIME_LIB_DEFAULT}"
-WIVRN_MONADO_LIB="${WIVRN_MONADO_LIB:-$WIVRN_MONADO_LIB_DEFAULT}"
-
-if [[ ! -f "${WIVRN_RUNTIME_JSON}" ]]; then
-    echo "Warning: WiVRn OpenXR runtime JSON not found."
-    echo "Expected: ${WIVRN_RUNTIME_JSON}"
-    echo "Falling back to a generated runtime JSON."
-else
-    export XR_RUNTIME_JSON="${WIVRN_RUNTIME_JSON}"
-fi
-
-if [[ ! -f "${WIVRN_RUNTIME_LIB}" ]]; then
-    echo "Error: WiVRn OpenXR runtime library not found."
-    echo "Expected: ${WIVRN_RUNTIME_LIB}"
-    echo "Set WIVRN_RUNTIME_LIB to override."
-    exit 1
-fi
-
-# Ensure WiVRn runtime dependencies are discoverable
+# XR/VR setup (only needed for xr input mode)
+KIT_ARGS=""
 if [[ "${INPUT_MODE}" == "xr" ]]; then
+    RUNTIME_JSON_PATH="${REPO_ROOT}/.openxr_runtime.json"
+    WIVRN_RUNTIME_JSON_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/share/openxr/1/openxr_wivrn.json"
+    WIVRN_RUNTIME_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libopenxr_wivrn.so"
+    WIVRN_MONADO_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libmonado_wivrn.so"
+    WIVRN_RUNTIME_JSON="${WIVRN_RUNTIME_JSON:-$WIVRN_RUNTIME_JSON_DEFAULT}"
+    WIVRN_RUNTIME_LIB="${WIVRN_RUNTIME_LIB:-$WIVRN_RUNTIME_LIB_DEFAULT}"
+    WIVRN_MONADO_LIB="${WIVRN_MONADO_LIB:-$WIVRN_MONADO_LIB_DEFAULT}"
+
+    if [[ ! -f "${WIVRN_RUNTIME_JSON}" ]]; then
+        echo "Warning: WiVRn OpenXR runtime JSON not found."
+        echo "Expected: ${WIVRN_RUNTIME_JSON}"
+        echo "Falling back to a generated runtime JSON."
+    else
+        export XR_RUNTIME_JSON="${WIVRN_RUNTIME_JSON}"
+    fi
+
+    if [[ ! -f "${WIVRN_RUNTIME_LIB}" ]]; then
+        echo "Error: WiVRn OpenXR runtime library not found."
+        echo "Expected: ${WIVRN_RUNTIME_LIB}"
+        echo "Set WIVRN_RUNTIME_LIB to override."
+        exit 1
+    fi
+
+    # Ensure WiVRn runtime dependencies are discoverable
     WIVRN_LIB_DIR="$(dirname "${WIVRN_RUNTIME_LIB}")"
     WIVRN_PARENT_LIB_DIR="$(dirname "${WIVRN_LIB_DIR}")"
     if [[ -d "${WIVRN_LIB_DIR}" ]]; then
@@ -128,10 +123,9 @@ if [[ "${INPUT_MODE}" == "xr" ]]; then
     if [[ -d "${WIVRN_PARENT_LIB_DIR}" ]]; then
         export LD_LIBRARY_PATH="${WIVRN_PARENT_LIB_DIR}:${LD_LIBRARY_PATH:-}"
     fi
-fi
 
-# Validate that the OpenXR runtime library can be loaded
-python - <<PY
+    # Validate that the OpenXR runtime library can be loaded
+    python - <<PY
 import ctypes
 import os
 import sys
@@ -145,8 +139,8 @@ except OSError as exc:
     sys.exit(1)
 PY
 
-if [[ -z "${XR_RUNTIME_JSON:-}" ]]; then
-    cat > "${RUNTIME_JSON_PATH}" <<EOF
+    if [[ -z "${XR_RUNTIME_JSON:-}" ]]; then
+        cat > "${RUNTIME_JSON_PATH}" <<EOF
 {
   "file_format_version": "1.0.0",
   "runtime": {
@@ -156,10 +150,9 @@ if [[ -z "${XR_RUNTIME_JSON:-}" ]]; then
   }
 }
 EOF
-    export XR_RUNTIME_JSON="${RUNTIME_JSON_PATH}"
-fi
-KIT_ARGS=""
-if [[ "${INPUT_MODE}" == "xr" ]]; then
+        export XR_RUNTIME_JSON="${RUNTIME_JSON_PATH}"
+    fi
+
     XR_RENDER_WIDTH="${XR_RENDER_WIDTH:-1280}"
     XR_RENDER_HEIGHT="${XR_RENDER_HEIGHT:-720}"
     KIT_ARGS="--/persistent/xr/system/openxr/runtime=custom \
@@ -173,22 +166,15 @@ if [[ "${INPUT_MODE}" == "xr" ]]; then
 --/app/window/height=${XR_RENDER_HEIGHT}"
 fi
 
-# Filter out --client flag if passed (this script is for teleoperation only)
-# For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client
-FILTERED_ARGS=()
-for arg in "$@"; do
-    if [[ "$arg" == "--client" ]]; then
-        echo "[INFO] Ignoring --client flag - teleop_xr.sh is for teleoperation only"
-        echo "[INFO] For OpenPI client mode, use: ./scripts/teleop_bimanual.sh --client"
-    else
-        FILTERED_ARGS+=("$arg")
-    fi
-done
-
-python ./scripts/teleoperation/teleop_bimanual.py \
+# Build command
+TELEOP_CMD="python ./scripts/teleoperation/teleop_bimanual.py \
     --task ${TASK} \
-    --checkpoint ${CHECKPOINT} \
     --input ${INPUT_MODE} \
-    --num_envs 1 \
-    ${KIT_ARGS:+--kit_args "${KIT_ARGS}"} \
-    "${FILTERED_ARGS[@]}"
+    --num_envs 1"
+
+if [[ -n "${KIT_ARGS}" ]]; then
+    TELEOP_CMD="${TELEOP_CMD} --kit_args \"${KIT_ARGS}\""
+fi
+
+# Execute the command
+eval ${TELEOP_CMD} "$@"
