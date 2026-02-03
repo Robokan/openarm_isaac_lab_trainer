@@ -14,9 +14,12 @@
 
 import math
 
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 
-from isaaclab.managers import EventTermCfg as EventTerm
 from .. import mdp
 from ..reach_env_cfg import (
     ReachEnvCfg,
@@ -120,3 +123,13 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+
+        # add warehouse environment for visualization
+        self.scene.warehouse = AssetBaseCfg(
+            prim_path="/World/Warehouse",
+            init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
+            spawn=UsdFileCfg(
+                usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            ),
+        )

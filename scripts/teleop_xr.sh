@@ -60,7 +60,7 @@ if [[ "$INPUT_MODE" == "xr" ]] && ! pgrep -f "wivrn" > /dev/null; then
     fi
 fi
 
-TASK="Isaac-Reach-OpenArm-Bi-v0"
+TASK="Isaac-Reach-OpenArm-Bi-Play-v0"
 LOG_PATH="openarm_bi_reach"
 
 # Find latest checkpoint
@@ -157,11 +157,17 @@ EOF
 fi
 KIT_ARGS=""
 if [[ "${INPUT_MODE}" == "xr" ]]; then
+    XR_RENDER_WIDTH="${XR_RENDER_WIDTH:-1280}"
+    XR_RENDER_HEIGHT="${XR_RENDER_HEIGHT:-720}"
     KIT_ARGS="--/persistent/xr/system/openxr/runtime=custom \
 --/persistent/xr/system/openxr/activeRuntimeJSON=${XR_RUNTIME_JSON} \
 --/app/extensions/enabled/omni.kit.xr.system.openxr=true \
 --/app/extensions/enabled/omni.kit.xr.profile.vr=true \
---/app/extensions/enabled/omni.kit.xr.profile.ar=true"
+--/app/extensions/enabled/omni.kit.xr.profile.ar=true \
+--/app/renderer/resolution/width=${XR_RENDER_WIDTH} \
+--/app/renderer/resolution/height=${XR_RENDER_HEIGHT} \
+--/app/window/width=${XR_RENDER_WIDTH} \
+--/app/window/height=${XR_RENDER_HEIGHT}"
 fi
 
 # Filter out --client flag if passed (this script is for teleoperation only)
