@@ -53,6 +53,12 @@ parser.add_argument("--prompt", type=str, default="perform the bimanual manipula
 parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency for client mode")
 parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes (client mode)")
 parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode (client mode)")
+parser.add_argument("--viewer-eye", type=float, nargs=3, default=None,
+                    help="Initial viewer eye position (x y z)")
+parser.add_argument("--viewer-lookat", type=float, nargs=3, default=None,
+                    help="Initial viewer look-at position (x y z)")
+parser.add_argument("--viewport-camera", type=str, default=None,
+                    help="Viewport camera prim path to render from (overrides auto selection)")
 
 # Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
@@ -791,6 +797,44 @@ class XRDevice:
                 pass
 
 
+def _find_body_camera_prim(stage, body_name: str, camera_names: list[str]) -> str | None:
+    """Find a camera prim under a body link by name."""
+    try:
+        for prim in stage.Traverse():
+            if not prim.IsValid():
+                continue
+            if prim.GetTypeName() != "Camera":
+                continue
+            if prim.GetName() not in camera_names:
+                continue
+            path = prim.GetPath().pathString
+            if body_name in path:
+                return path
+    except Exception:
+        return None
+    return None
+
+
+def _set_viewport_camera(camera_path: str) -> bool:
+    """Set active viewport camera to the given prim path."""
+    try:
+        import omni.kit.viewport.utility as viewport_utils
+        viewport = viewport_utils.get_active_viewport()
+        if viewport is None:
+            return False
+        if hasattr(viewport, "set_active_camera"):
+            viewport.set_active_camera(camera_path)
+        elif hasattr(viewport, "set_camera_path"):
+            viewport.set_camera_path(camera_path)
+        elif hasattr(viewport, "camera_path"):
+            viewport.camera_path = camera_path
+        else:
+            viewport_utils.set_active_viewport_camera(viewport, camera_path)
+        return True
+    except Exception:
+        return False
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Main entry point - runs either teleop or OpenPI client mode."""
@@ -798,6 +842,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Configure environment
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.sim.device = "cuda:0"
+
+    if hasattr(env_cfg, "viewer"):
+        if args_cli.viewer_eye is not None:
+            env_cfg.viewer.eye = tuple(args_cli.viewer_eye)
+        if args_cli.viewer_lookat is not None:
+            env_cfg.viewer.lookat = tuple(args_cli.viewer_lookat)
     
     # Disable randomization for stable control
     if hasattr(env_cfg, 'observations') and hasattr(env_cfg.observations, 'policy'):
@@ -806,6 +856,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Create environment
     print(f"\n[INFO] Creating environment: {args_cli.task}")
     env = gym.make(args_cli.task, cfg=env_cfg)
+
+    # If in XR mode, set viewport to EgoVR camera by default (or user override)
+    if args_cli.input == "xr":
+        try:
+            import omni.usd
+            stage = omni.usd.get_context().get_stage()
+            camera_path = args_cli.viewport_camera
+            if camera_path is None:
+                camera_path = _find_body_camera_prim(stage, "openarm_body_link", ["EgoVR", "Ego", "Camera"])
+            if camera_path:
+                if _set_viewport_camera(camera_path):
+                    print(f"[INFO] Viewport camera set to: {camera_path}")
+                else:
+                    print(f"[WARN] Failed to set viewport camera: {camera_path}")
+            else:
+                print("[WARN] EgoVR camera not found under openarm_body_link")
+        except Exception as exc:
+            print(f"[WARN] Unable to set viewport camera: {exc}")
     
     # Wrap for RSL-RL
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
