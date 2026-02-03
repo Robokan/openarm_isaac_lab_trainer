@@ -84,6 +84,7 @@ import os
 import time
 import torch
 import numpy as np
+import math
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -505,6 +506,9 @@ class GamepadDevice:
         
         return self.left_pose.copy(), self.right_pose.copy()
 
+    def get_gripper_targets(self):
+        return None, None
+
 
 class ViveDevice:
     """Vive controller input via OpenVR/SteamVR."""
@@ -549,12 +553,29 @@ class ViveDevice:
         if not p.bPoseIsValid:
             return None
         m = p.mDeviceToAbsoluteTracking
+        quat = _quat_from_rot_matrix(
+            m[0][0], m[0][1], m[0][2],
+            m[1][0], m[1][1], m[1][2],
+            m[2][0], m[2][1], m[2][2],
+        )
         return np.array([
             m[0][3] * self.sensitivity,
             m[1][3] * self.sensitivity, 
             m[2][3] * self.sensitivity,
-            1.0, 0.0, 0.0, 0.0  # Simplified quaternion
+            quat[0], quat[1], quat[2], quat[3]
         ])
+
+    def _get_trigger(self, controller_id):
+        if controller_id is None:
+            return None
+        try:
+            _, state = self.vr.getControllerState(controller_id)
+            # OpenVR: trigger is typically rAxis[1].x in [0, 1]
+            if hasattr(state, "rAxis") and len(state.rAxis) > 1:
+                return float(state.rAxis[1].x)
+        except Exception:
+            return None
+        return None
     
     def get_poses(self):
         left = self._get_pose(self.left_id)
@@ -562,6 +583,11 @@ class ViveDevice:
         if left is not None: self.left_pose = left
         if right is not None: self.right_pose = right
         return self.left_pose.copy(), self.right_pose.copy()
+
+    def get_gripper_targets(self):
+        left = self._get_trigger(self.left_id)
+        right = self._get_trigger(self.right_id)
+        return left, right
     
     def update(self, key: str):
         pass  # VR doesn't need keyboard updates
@@ -761,16 +787,32 @@ class XRDevice:
                     if right_dev is not None and hasattr(right_dev, "get_pose"):
                         right_hand = right_dev.get_pose()
 
-                if left_hand is not None and hasattr(left_hand, "GetTranslation"):
-                    pos = left_hand.GetTranslation()
-                    self.left_pose[:3] = [pos[0] * self.sensitivity,
-                                          pos[1] * self.sensitivity,
-                                          pos[2] * self.sensitivity]
-                if right_hand is not None and hasattr(right_hand, "GetTranslation"):
-                    pos = right_hand.GetTranslation()
-                    self.right_pose[:3] = [pos[0] * self.sensitivity,
-                                           pos[1] * self.sensitivity,
-                                           pos[2] * self.sensitivity]
+                if left_hand is not None:
+                    pos = _pos_from_pose(left_hand)
+                    if pos is not None:
+                        pos = _map_xr_position(pos)
+                        self.left_pose[:3] = [
+                            pos[0] * self.sensitivity,
+                            pos[1] * self.sensitivity,
+                            pos[2] * self.sensitivity,
+                        ]
+                if left_hand is not None:
+                    quat = _quat_from_pose(left_hand)
+                    if quat is not None:
+                        self.left_pose[3:7] = _map_xr_quat(quat)
+                if right_hand is not None:
+                    pos = _pos_from_pose(right_hand)
+                    if pos is not None:
+                        pos = _map_xr_position(pos)
+                        self.right_pose[:3] = [
+                            pos[0] * self.sensitivity,
+                            pos[1] * self.sensitivity,
+                            pos[2] * self.sensitivity,
+                        ]
+                if right_hand is not None:
+                    quat = _quat_from_pose(right_hand)
+                    if quat is not None:
+                        self.right_pose[3:7] = _map_xr_quat(quat)
             else:
                 import time
                 now = time.time()
@@ -789,12 +831,210 @@ class XRDevice:
         
         return self.left_pose.copy(), self.right_pose.copy()
 
+    def _get_trigger_value(self, device):
+        if device is None:
+            return None
+        try:
+            if hasattr(device, "get_input_value"):
+                for key in ("trigger", "/user/hand/left/input/trigger/value", "/user/hand/right/input/trigger/value"):
+                    try:
+                        val = device.get_input_value(key)
+                        if val is not None:
+                            return float(val)
+                    except Exception:
+                        pass
+            if hasattr(device, "get_float"):
+                for key in ("trigger", "/user/hand/left/input/trigger/value", "/user/hand/right/input/trigger/value"):
+                    try:
+                        val = device.get_float(key)
+                        if val is not None:
+                            return float(val)
+                    except Exception:
+                        pass
+            if hasattr(device, "get_axis"):
+                try:
+                    val = device.get_axis("trigger")
+                    if val is not None:
+                        return float(val)
+                except Exception:
+                    pass
+        except Exception:
+            return None
+        return None
+
+    def get_gripper_targets(self):
+        if self._xr_core is None:
+            return None, None
+        try:
+            left_dev = None
+            right_dev = None
+            if hasattr(self._xr_core, "get_input_device"):
+                left_dev = self._xr_core.get_input_device("/user/hand/left")
+                right_dev = self._xr_core.get_input_device("/user/hand/right")
+            left_val = self._get_trigger_value(left_dev)
+            right_val = self._get_trigger_value(right_dev)
+            return left_val, right_val
+        except Exception:
+            return None, None
+
     def __del__(self):
         if self._input and self._keyboard and self._sub_keyboard:
             try:
                 self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub_keyboard)
             except Exception:
                 pass
+
+
+def _quat_from_rot_matrix(m00, m01, m02, m10, m11, m12, m20, m21, m22):
+    """Convert 3x3 rotation matrix to (w, x, y, z) quaternion."""
+    t = m00 + m11 + m22
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m21 - m12) / s
+        y = (m02 - m20) / s
+        z = (m10 - m01) / s
+    elif (m00 > m11) and (m00 > m22):
+        s = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        w = (m21 - m12) / s
+        x = 0.25 * s
+        y = (m01 + m10) / s
+        z = (m02 + m20) / s
+    elif m11 > m22:
+        s = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        w = (m02 - m20) / s
+        x = (m01 + m10) / s
+        y = 0.25 * s
+        z = (m12 + m21) / s
+    else:
+        s = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
+        w = (m10 - m01) / s
+        x = (m02 + m20) / s
+        y = (m12 + m21) / s
+        z = 0.25 * s
+    return np.array([w, x, y, z], dtype=np.float32)
+
+
+def _quat_from_pose(pose):
+    """Best-effort quaternion extraction from an XR pose object."""
+    try:
+        if hasattr(pose, "ExtractRotationQuat"):
+            q = pose.ExtractRotationQuat()
+            if hasattr(q, "GetReal") and hasattr(q, "GetImaginary"):
+                im = q.GetImaginary()
+                return np.array([q.GetReal(), im[0], im[1], im[2]], dtype=np.float32)
+        if hasattr(pose, "GetRotation"):
+            rot = pose.GetRotation()
+            if hasattr(rot, "GetQuaternion"):
+                q = rot.GetQuaternion()
+                return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+            if hasattr(rot, "GetQuat"):
+                q = rot.GetQuat()
+                if hasattr(q, "GetReal") and hasattr(q, "GetImaginary"):
+                    im = q.GetImaginary()
+                    return np.array([q.GetReal(), im[0], im[1], im[2]], dtype=np.float32)
+        if hasattr(pose, "GetQuaternion"):
+            q = pose.GetQuaternion()
+            if len(q) == 4:
+                return np.array([q[3], q[0], q[1], q[2]], dtype=np.float32)
+        if hasattr(pose, "GetRow"):
+            r0 = pose.GetRow(0)
+            r1 = pose.GetRow(1)
+            r2 = pose.GetRow(2)
+            return _quat_from_rot_matrix(r0[0], r0[1], r0[2], r1[0], r1[1], r1[2], r2[0], r2[1], r2[2])
+    except Exception:
+        return None
+    return None
+
+
+def _pos_from_pose(pose):
+    """Best-effort translation extraction from an XR pose object."""
+    try:
+        if hasattr(pose, "GetTranslation"):
+            pos = pose.GetTranslation()
+            if pos is not None:
+                return np.array([pos[0], pos[1], pos[2]], dtype=np.float32)
+        if hasattr(pose, "GetPosition"):
+            pos = pose.GetPosition()
+            if pos is not None:
+                return np.array([pos[0], pos[1], pos[2]], dtype=np.float32)
+        if hasattr(pose, "GetRow"):
+            r3 = pose.GetRow(3)
+            return np.array([r3[0], r3[1], r3[2]], dtype=np.float32)
+        if hasattr(pose, "GetMatrix"):
+            m = pose.GetMatrix()
+            return np.array([m[0][3], m[1][3], m[2][3]], dtype=np.float32)
+    except Exception:
+        return None
+    return None
+
+
+def _map_xr_position(pos):
+    """Map OpenXR position to robot space (swap Y/Z by default)."""
+    try:
+        m = _get_xr_map_matrix()
+        mapped = m @ np.array([pos[0], pos[1], pos[2]], dtype=np.float32)
+        return mapped
+    except Exception:
+        pass
+    return np.array([pos[0], pos[1], pos[2]], dtype=np.float32)
+
+
+def _get_xr_map_matrix():
+    swap_yz = os.environ.get("XR_SWAP_YZ", "1").lower() not in ("0", "false", "no")
+    flip_x = os.environ.get("XR_FLIP_X", "0").lower() not in ("0", "false", "no")
+    flip_z = os.environ.get("XR_FLIP_Z", "1").lower() not in ("0", "false", "no")
+    fx = -1.0 if flip_x else 1.0
+    fz = -1.0 if flip_z else 1.0
+    if swap_yz:
+        # [x, y, z] -> [fx*x, fz*z, y]
+        return np.array([[fx, 0.0, 0.0], [0.0, 0.0, fz], [0.0, 1.0, 0.0]], dtype=np.float32)
+    return np.array([[fx, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, fz]], dtype=np.float32)
+
+
+def _rot_matrix_from_quat(quat):
+    """Convert (w, x, y, z) quaternion to 3x3 rotation matrix."""
+    w, x, y, z = quat
+    ww = w * w
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    return np.array(
+        [
+            [ww + xx - yy - zz, 2.0 * (xy - wz), 2.0 * (xz + wy)],
+            [2.0 * (xy + wz), ww - xx + yy - zz, 2.0 * (yz - wx)],
+            [2.0 * (xz - wy), 2.0 * (yz + wx), ww - xx - yy + zz],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _map_xr_quat(quat):
+    """Map OpenXR orientation into robot space using the same axis mapping."""
+    try:
+        m = _get_xr_map_matrix()
+        r = _rot_matrix_from_quat(quat)
+        r_mapped = m @ r @ m.T
+        # Apply -90° rotation around X so controller Y-forward maps to gripper Z-forward
+        rot_x_deg = float(os.environ.get("XR_GRIPPER_ROT_X_DEG", "-90"))
+        rot_x = math.radians(rot_x_deg)
+        c = math.cos(rot_x)
+        s = math.sin(rot_x)
+        r_fix = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float32)
+        r_mapped = r_mapped @ r_fix
+        return _quat_from_rot_matrix(
+            r_mapped[0, 0], r_mapped[0, 1], r_mapped[0, 2],
+            r_mapped[1, 0], r_mapped[1, 1], r_mapped[1, 2],
+            r_mapped[2, 0], r_mapped[2, 1], r_mapped[2, 2],
+        )
+    except Exception:
+        return quat
 
 
 def _find_body_camera_prim(stage, body_name: str, camera_names: list[str]) -> str | None:
@@ -930,6 +1170,13 @@ def run_teleop(env, policy, args):
     
     # Get initial observations
     obs = env.get_observations()
+
+    # Gripper joints (optional trigger control)
+    gripper_open_pos = 0.044
+    robot = unwrapped.scene["robot"]
+    left_gripper_ids, _ = robot.find_joints("openarm_left_finger_joint.*")
+    right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
+    sim_device = env.unwrapped.device if hasattr(env.unwrapped, "device") else "cuda:0"
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -956,6 +1203,28 @@ def run_teleop(env, policy, args):
                 if "right_ee_pose" in unwrapped.command_manager._terms:
                     unwrapped.command_manager._terms["right_ee_pose"].command[:, :3] = right_cmd[:3].unsqueeze(0)
                     unwrapped.command_manager._terms["right_ee_pose"].command[:, 3:7] = right_cmd[3:7].unsqueeze(0)
+
+            # Optional: map trigger pulls to gripper positions
+            if hasattr(input_device, "get_gripper_targets"):
+                left_trigger, right_trigger = input_device.get_gripper_targets()
+                if left_trigger is not None and left_gripper_ids:
+                    left_trigger = float(np.clip(left_trigger, 0.0, 1.0))
+                    left_pos = gripper_open_pos * (1.0 - left_trigger)
+                    left_targets = torch.full(
+                        (1, len(left_gripper_ids)),
+                        left_pos,
+                        device=sim_device,
+                    )
+                    robot.write_joint_position_to_sim(left_targets, joint_ids=left_gripper_ids)
+                if right_trigger is not None and right_gripper_ids:
+                    right_trigger = float(np.clip(right_trigger, 0.0, 1.0))
+                    right_pos = gripper_open_pos * (1.0 - right_trigger)
+                    right_targets = torch.full(
+                        (1, len(right_gripper_ids)),
+                        right_pos,
+                        device=sim_device,
+                    )
+                    robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
             
             # Run policy
             with torch.inference_mode():

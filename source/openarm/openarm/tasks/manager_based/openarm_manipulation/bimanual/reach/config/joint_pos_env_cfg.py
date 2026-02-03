@@ -15,7 +15,7 @@
 import math
 
 from isaaclab.assets import AssetBaseCfg
-from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
@@ -132,4 +132,40 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
                 usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
             ),
+        )
+
+
+@configclass
+class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
+    """Reach configuration with expanded workspace for teleoperation training."""
+
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        # Expand reach workspace to cover full arm reach
+        self.commands.left_ee_pose.ranges.pos_x = (0.05, 0.6)
+        self.commands.left_ee_pose.ranges.pos_y = (0.05, 0.45)
+        self.commands.left_ee_pose.ranges.pos_z = (0.15, 0.65)
+        self.commands.left_ee_pose.ranges.roll = (-math.pi, math.pi)
+        self.commands.left_ee_pose.ranges.pitch = (-math.pi, math.pi)
+        self.commands.left_ee_pose.ranges.yaw = (-math.pi, math.pi)
+
+        self.commands.right_ee_pose.ranges.pos_x = (0.05, 0.6)
+        self.commands.right_ee_pose.ranges.pos_y = (-0.45, -0.05)
+        self.commands.right_ee_pose.ranges.pos_z = (0.15, 0.65)
+        self.commands.right_ee_pose.ranges.roll = (-math.pi, math.pi)
+        self.commands.right_ee_pose.ranges.pitch = (-math.pi, math.pi)
+        self.commands.right_ee_pose.ranges.yaw = (-math.pi, math.pi)
+
+        # Randomize starting joint pose (arms only, smaller offsets)
+        self.events.reset_robot_joints.func = mdp.reset_joints_by_offset
+        self.events.reset_robot_joints.params["position_range"] = (-0.5, 0.5)
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+        self.events.reset_robot_joints.params["asset_cfg"] = SceneEntityCfg(
+            "robot",
+            joint_names=[
+                "openarm_left_joint[1-7]",
+                "openarm_right_joint[1-7]",
+            ],
         )

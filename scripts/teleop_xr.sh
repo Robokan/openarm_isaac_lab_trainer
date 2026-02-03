@@ -61,10 +61,13 @@ if [[ "$INPUT_MODE" == "xr" ]] && ! pgrep -f "wivrn" > /dev/null; then
 fi
 
 TASK="Isaac-Reach-OpenArm-Bi-Play-v0"
-LOG_PATH="openarm_bi_reach"
+LOG_PATH="openarm_bi_reach_teleop"
 
-# Find latest checkpoint
+# Find latest checkpoint (prefer teleop-trained)
 CHECKPOINT=$(find "${REPO_ROOT}/logs/rsl_rl/${LOG_PATH}" -name 'model_*.pt' 2>/dev/null | sort -V | tail -1)
+if [[ -z "$CHECKPOINT" ]]; then
+    CHECKPOINT=$(find "${REPO_ROOT}/logs/rsl_rl/openarm_bi_reach" -name 'model_*.pt' 2>/dev/null | sort -V | tail -1)
+fi
 
 if [[ -z "$CHECKPOINT" ]]; then
     echo "Error: No trained model found."
