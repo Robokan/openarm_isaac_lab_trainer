@@ -831,48 +831,108 @@ class XRDevice:
         
         return self.left_pose.copy(), self.right_pose.copy()
 
-    def _get_trigger_value(self, device):
+    def _get_trigger_value_from_device(self, device):
+        """Try various methods to get trigger value from an input device."""
         if device is None:
             return None
         try:
+            # Try get_input_value
             if hasattr(device, "get_input_value"):
-                for key in ("trigger", "/user/hand/left/input/trigger/value", "/user/hand/right/input/trigger/value"):
+                for key in ("trigger", "trigger/value", "select", "squeeze"):
                     try:
                         val = device.get_input_value(key)
                         if val is not None:
                             return float(val)
                     except Exception:
                         pass
+            # Try get_float
             if hasattr(device, "get_float"):
-                for key in ("trigger", "/user/hand/left/input/trigger/value", "/user/hand/right/input/trigger/value"):
+                for key in ("trigger", "trigger/value", "select", "squeeze"):
                     try:
                         val = device.get_float(key)
                         if val is not None:
                             return float(val)
                     except Exception:
                         pass
+            # Try get_axis
             if hasattr(device, "get_axis"):
-                try:
-                    val = device.get_axis("trigger")
-                    if val is not None:
+                for key in ("trigger", "select", "squeeze"):
+                    try:
+                        val = device.get_axis(key)
+                        if val is not None:
+                            return float(val)
+                    except Exception:
+                        pass
+            # Try direct attribute access
+            for attr in ("trigger", "trigger_value", "squeeze", "select"):
+                if hasattr(device, attr):
+                    val = getattr(device, attr)
+                    if val is not None and not callable(val):
                         return float(val)
-                except Exception:
-                    pass
         except Exception:
-            return None
+            pass
         return None
 
     def get_gripper_targets(self):
         if self._xr_core is None:
             return None, None
         try:
-            left_dev = None
-            right_dev = None
-            if hasattr(self._xr_core, "get_input_device"):
-                left_dev = self._xr_core.get_input_device("/user/hand/left")
-                right_dev = self._xr_core.get_input_device("/user/hand/right")
-            left_val = self._get_trigger_value(left_dev)
-            right_val = self._get_trigger_value(right_dev)
+            from omni.kit.xr.core import XRCore
+            xr = XRCore.get_singleton()
+            if xr is None:
+                return None, None
+            
+            left_val = None
+            right_val = None
+            
+            # Try method 1: get_input_device with various input names
+            if hasattr(xr, "get_input_device"):
+                left_dev = xr.get_input_device("/user/hand/left")
+                right_dev = xr.get_input_device("/user/hand/right")
+                left_val = self._get_trigger_value_from_device(left_dev)
+                right_val = self._get_trigger_value_from_device(right_dev)
+            
+            # Try method 2: get_controller_inputs
+            if (left_val is None or right_val is None) and hasattr(xr, "get_controller_inputs"):
+                try:
+                    inputs = xr.get_controller_inputs()
+                    if inputs:
+                        if left_val is None:
+                            for key in ("left_trigger", "left_squeeze", "left_select"):
+                                if key in inputs:
+                                    left_val = float(inputs[key])
+                                    break
+                        if right_val is None:
+                            for key in ("right_trigger", "right_squeeze", "right_select"):
+                                if key in inputs:
+                                    right_val = float(inputs[key])
+                                    break
+                except Exception:
+                    pass
+            
+            # Try method 3: get_action_float for action-based input
+            if (left_val is None or right_val is None) and hasattr(xr, "get_action_float"):
+                try:
+                    if left_val is None:
+                        left_val = xr.get_action_float("/user/hand/left/input/trigger/value")
+                    if right_val is None:
+                        right_val = xr.get_action_float("/user/hand/right/input/trigger/value")
+                except Exception:
+                    pass
+            
+            # Try method 4: Access active profile's inputs
+            if (left_val is None or right_val is None) and self._profile is not None:
+                if hasattr(self._profile, "get_inputs"):
+                    try:
+                        inputs = self._profile.get_inputs()
+                        if inputs:
+                            if left_val is None and hasattr(inputs, "left_trigger"):
+                                left_val = float(inputs.left_trigger)
+                            if right_val is None and hasattr(inputs, "right_trigger"):
+                                right_val = float(inputs.right_trigger)
+                    except Exception:
+                        pass
+            
             return left_val, right_val
         except Exception:
             return None, None
@@ -1181,6 +1241,30 @@ def run_teleop(env, policy, args):
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
     
+    # Debug: check what XR input methods are available
+    if hasattr(input_device, "_xr_core") and input_device._xr_core is not None:
+        try:
+            from omni.kit.xr.core import XRCore
+            xr = XRCore.get_singleton()
+            if xr:
+                xr_methods = [m for m in dir(xr) if not m.startswith("_") and callable(getattr(xr, m, None))]
+                print(f"[DEBUG] XR Core methods: {xr_methods[:20]}...")  # First 20 methods
+                if hasattr(xr, "get_input_device"):
+                    left_dev = xr.get_input_device("/user/hand/left")
+                    if left_dev:
+                        dev_methods = [m for m in dir(left_dev) if not m.startswith("_")]
+                        print(f"[DEBUG] Input device methods: {dev_methods[:15]}...")
+        except Exception as e:
+            print(f"[DEBUG] XR introspection failed: {e}")
+    
+    # Set grippers to open position at startup
+    if left_gripper_ids:
+        left_open = torch.full((1, len(left_gripper_ids)), gripper_open_pos, device=sim_device)
+        robot.write_joint_position_to_sim(left_open, joint_ids=left_gripper_ids)
+    if right_gripper_ids:
+        right_open = torch.full((1, len(right_gripper_ids)), gripper_open_pos, device=sim_device)
+        robot.write_joint_position_to_sim(right_open, joint_ids=right_gripper_ids)
+    
     step_count = 0
     
     try:
@@ -1204,27 +1288,35 @@ def run_teleop(env, policy, args):
                     unwrapped.command_manager._terms["right_ee_pose"].command[:, :3] = right_cmd[:3].unsqueeze(0)
                     unwrapped.command_manager._terms["right_ee_pose"].command[:, 3:7] = right_cmd[3:7].unsqueeze(0)
 
-            # Optional: map trigger pulls to gripper positions
+            # Map trigger pulls to gripper positions (open by default, close when trigger pulled)
+            left_trigger = 0.0
+            right_trigger = 0.0
             if hasattr(input_device, "get_gripper_targets"):
-                left_trigger, right_trigger = input_device.get_gripper_targets()
-                if left_trigger is not None and left_gripper_ids:
-                    left_trigger = float(np.clip(left_trigger, 0.0, 1.0))
-                    left_pos = gripper_open_pos * (1.0 - left_trigger)
-                    left_targets = torch.full(
-                        (1, len(left_gripper_ids)),
-                        left_pos,
-                        device=sim_device,
-                    )
-                    robot.write_joint_position_to_sim(left_targets, joint_ids=left_gripper_ids)
-                if right_trigger is not None and right_gripper_ids:
-                    right_trigger = float(np.clip(right_trigger, 0.0, 1.0))
-                    right_pos = gripper_open_pos * (1.0 - right_trigger)
-                    right_targets = torch.full(
-                        (1, len(right_gripper_ids)),
-                        right_pos,
-                        device=sim_device,
-                    )
-                    robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
+                lt, rt = input_device.get_gripper_targets()
+                if lt is not None:
+                    left_trigger = float(np.clip(lt, 0.0, 1.0))
+                if rt is not None:
+                    right_trigger = float(np.clip(rt, 0.0, 1.0))
+            
+            # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+            if left_gripper_ids:
+                left_pos = gripper_open_pos * (1.0 - left_trigger)
+                left_targets = torch.full(
+                    (1, len(left_gripper_ids)),
+                    left_pos,
+                    device=sim_device,
+                )
+                robot.write_joint_position_to_sim(left_targets, joint_ids=left_gripper_ids)
+            
+            # Right gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+            if right_gripper_ids:
+                right_pos = gripper_open_pos * (1.0 - right_trigger)
+                right_targets = torch.full(
+                    (1, len(right_gripper_ids)),
+                    right_pos,
+                    device=sim_device,
+                )
+                robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
             
             # Run policy
             with torch.inference_mode():
@@ -1238,7 +1330,8 @@ def run_teleop(env, policy, args):
             if step_count % 60 == 0:
                 print(f"Step {step_count:5d} | "
                       f"L:[{left_pose[0]:.2f},{left_pose[1]:.2f},{left_pose[2]:.2f}] | "
-                      f"R:[{right_pose[0]:.2f},{right_pose[1]:.2f},{right_pose[2]:.2f}]")
+                      f"R:[{right_pose[0]:.2f},{right_pose[1]:.2f},{right_pose[2]:.2f}] | "
+                      f"Grip L:{left_trigger:.2f} R:{right_trigger:.2f}")
             
             # Handle reset if episode ends
             if dones.any():
