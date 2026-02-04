@@ -237,6 +237,9 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
         self.scene.left_ee_frame.visualizer_cfg = marker_cfg
         self.scene.right_ee_frame.visualizer_cfg = marker_cfg.copy()
 
+        # Note: Cameras (Ego, LeftArm, RightArm) exist in openarm_bimanual_factory.usd
+        # and are accessed directly via the camera API in VLA capture code
+
 
 @configclass
 class OpenArmBimanualCubeLiftEnvCfg_PLAY(OpenArmBimanualCubeLiftEnvCfg):

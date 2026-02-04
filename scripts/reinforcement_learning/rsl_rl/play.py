@@ -47,6 +47,14 @@ parser.add_argument(
     "--no-self-collisions", action="store_true", default=False,
     help="Disable self-collision detection for the robot (faster but less realistic)."
 )
+parser.add_argument(
+    "--create-vla-training-data", type=str, default=None, metavar="FILENAME",
+    help="Capture VLA training data (cube positions and motor commands) to the specified file."
+)
+parser.add_argument(
+    "--vla-max-episodes", type=int, default=100,
+    help="Maximum number of episodes to capture for VLA training data (default: 100)."
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -67,6 +75,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import json
 import os
 import signal
 import threading
@@ -140,7 +149,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print("[INFO] Self-collisions disabled via --no-self-collisions flag")
 
     # create isaac environment
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    # Enable rgb_array render mode for video recording (--video flag or interactive V key recording)
+    # When not headless, always enable render_mode to support interactive video capture
+    use_render_mode = args_cli.video or not args_cli.headless
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if use_render_mode else None)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -212,6 +224,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     reset_requested = [False]
     toggle_markers_requested = [False]
     markers_visible = [True]  # Track marker visibility state
+    toggle_video_requested = [False]  # Video recording toggle
     
     def on_keyboard_event(event, *args, **kwargs):
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -224,6 +237,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             elif event.input == carb.input.KeyboardInput.M:
                 toggle_markers_requested[0] = True
                 return True  # Consume event to prevent Isaac Sim UI from handling it
+            elif event.input == carb.input.KeyboardInput.V or event.input == carb.input.KeyboardInput.KEY_0:
+                toggle_video_requested[0] = True
+                print("[DEBUG] Video key pressed - video toggle requested")
+                return True  # Consume event
+        return False
+    
+    # Also subscribe to KEY_RELEASE to ensure we catch the event
+    def on_keyboard_event_release(event, *args, **kwargs):
+        # Some systems need release event handling
         return False
     
     def toggle_all_markers(env, visible: bool):
@@ -251,9 +273,114 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         
         print(f"[INFO] Markers {'shown' if visible else 'hidden'}")
     
-    # Subscribe to keyboard events (priority subscription to override UI)
-    keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
-    print("[INFO] Press 'L' to reload checkpoint, 'R' to reset environment, 'M' to toggle markers, close window to exit")
+    # Video recording state
+    video_recording = [False]
+    video_frames = []
+    video_start_time = [None]
+    # Save videos to top-level 'video' directory in the repository
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    video_output_dir = os.path.join(repo_root, "video")
+    os.makedirs(video_output_dir, exist_ok=True)
+    
+    def start_video_recording():
+        """Start capturing video frames."""
+        video_frames.clear()
+        video_start_time[0] = time.strftime("%Y%m%d_%H%M%S")
+        video_recording[0] = True
+        print(f"[VIDEO] Recording started...")
+    
+    def stop_video_recording():
+        """Stop recording and save video to MP4."""
+        video_recording[0] = False
+        if len(video_frames) == 0:
+            print("[VIDEO] No frames captured.")
+            return
+        
+        # Save as MP4 using imageio
+        try:
+            import imageio
+            output_path = os.path.join(video_output_dir, f"recording_{video_start_time[0]}.mp4")
+            fps = int(1.0 / dt) if dt > 0 else 30
+            writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=8)
+            for frame in video_frames:
+                writer.append_data(frame)
+            writer.close()
+            print(f"[VIDEO] Saved {len(video_frames)} frames to {output_path}")
+        except ImportError:
+            # Fallback: save as individual frames
+            print("[VIDEO] imageio not available, saving as PNG frames...")
+            frames_dir = os.path.join(video_output_dir, f"frames_{video_start_time[0]}")
+            os.makedirs(frames_dir, exist_ok=True)
+            import numpy as np
+            from PIL import Image
+            for i, frame in enumerate(video_frames):
+                img = Image.fromarray(frame)
+                img.save(os.path.join(frames_dir, f"frame_{i:06d}.png"))
+            print(f"[VIDEO] Saved {len(video_frames)} frames to {frames_dir}/")
+        except Exception as e:
+            print(f"[VIDEO] Error saving video: {e}")
+        finally:
+            video_frames.clear()
+    
+    def capture_frame():
+        """Capture current frame using env.render() - the Isaac Lab way."""
+        try:
+            import numpy as np
+            
+            # Get the underlying gym env (unwrap from RslRlVecEnvWrapper)
+            gym_env = env.unwrapped
+            
+            # Use the render method which returns RGB array
+            frame = gym_env.render()
+            
+            if frame is not None:
+                # Ensure it's a numpy array
+                if hasattr(frame, 'cpu'):
+                    frame = frame.cpu().numpy()
+                elif not isinstance(frame, np.ndarray):
+                    frame = np.array(frame)
+                
+                # Handle different frame formats
+                if len(frame.shape) == 4:
+                    # Batched frames (num_envs, H, W, C) - take first env
+                    frame = frame[0]
+                
+                # Ensure uint8
+                if frame.dtype != np.uint8:
+                    if frame.max() <= 1.0:
+                        frame = (frame * 255).astype(np.uint8)
+                    else:
+                        frame = frame.astype(np.uint8)
+                
+                # Convert RGBA to RGB if needed
+                if len(frame.shape) == 3 and frame.shape[-1] == 4:
+                    frame = frame[:, :, :3]
+                
+                video_frames.append(frame.copy())
+                
+                # Print progress every 100 frames
+                if len(video_frames) % 100 == 0:
+                    print(f"[VIDEO] Captured {len(video_frames)} frames...")
+            elif len(video_frames) == 0:
+                print("[VIDEO] Warning: render() returned None - ensure env was created with render_mode='rgb_array'")
+                
+        except Exception as e:
+            if len(video_frames) == 0:
+                print(f"[VIDEO] Error capturing frame: {e}")
+    
+    # Subscribe to keyboard events with high priority (order=0) to capture before Isaac Sim UI
+    # Lower order values have higher priority
+    try:
+        keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event, order=0)
+    except TypeError:
+        # Fallback if order parameter not supported
+        keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
+    
+    # Track previous key states for edge detection (for keys that might not trigger events)
+    prev_key_v = [False]
+    prev_key_0 = [False]
+    
+    print("[INFO] Press 'L' to reload checkpoint, 'R' to reset environment, 'M' to toggle markers, 'V' or '0' to toggle video recording, close window to exit")
 
     # Background thread to monitor for window close (non-headless mode)
     # This allows graceful exit when the user closes the visualization window
@@ -276,6 +403,72 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     obs = env.get_observations()
     timestep = 0
     
+    # VLA training data capture for Pi 0.5 (LeRobot-compatible format)
+    vla_data = None
+    vla_current_episode = None
+    vla_episode_count = 0
+    vla_prev_episode_lengths = None
+    vla_output_dir = None
+    vla_task_text = "pick up cubes"
+    
+    if args_cli.create_vla_training_data:
+        import h5py
+        import numpy as np
+        
+        vla_output_dir = args_cli.create_vla_training_data
+        os.makedirs(vla_output_dir, exist_ok=True)
+        
+        print(f"[VLA] Pi 0.5 training data capture enabled.")
+        print(f"[VLA] Output directory: {vla_output_dir}")
+        print(f"[VLA] Task text: '{vla_task_text}'")
+        print(f"[VLA] Will capture up to {args_cli.vla_max_episodes} episodes.")
+        print(f"[VLA] Cameras: ego_cam, left_wrist_cam, right_wrist_cam")
+        
+        # Initialize camera access (cameras exist in USD file)
+        unwrapped = env.unwrapped
+        print("[VLA] Cameras will be accessed via Isaac Sim camera API (Ego, LeftArm, RightArm)")
+        
+        vla_data = {
+            "metadata": {
+                "task": args_cli.task,
+                "task_text": vla_task_text,
+                "checkpoint": resume_path,
+                "dt": dt,
+                "fps": int(1.0 / dt) if dt > 0 else 50,
+                "num_envs": env_cfg.scene.num_envs,
+                "robot_type": "openarm_bimanual",
+                "cameras": ["ego_cam", "left_wrist_cam", "right_wrist_cam"],
+            },
+            "episode_count": 0,
+        }
+        
+        # Save metadata
+        with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
+            json.dump(vla_data["metadata"], f, indent=2)
+        
+        # Initialize current episode data with cube starting positions
+        import numpy as np
+        robot = unwrapped.scene["robot"]
+        vla_current_episode = {
+            "left_cube_start_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
+            "right_cube_start_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
+            "left_cube_start_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
+            "right_cube_start_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
+            "robot_start_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
+            "robot_start_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
+            "observations": {
+                "qpos": [],  # Joint positions
+                "qvel": [],  # Joint velocities
+                "images": {
+                    "ego_cam": [],
+                    "left_wrist_cam": [],
+                    "right_wrist_cam": [],
+                },
+            },
+            "actions": [],
+        }
+        vla_prev_episode_lengths = unwrapped.episode_length_buf.clone()
+    
     # simulate environment with proper cleanup on exit
     try:
         while simulation_app.is_running():
@@ -294,6 +487,37 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 markers_visible[0] = not markers_visible[0]
                 toggle_all_markers(env, markers_visible[0])
             
+            # Poll keyboard state directly as backup for keys that might not trigger events
+            try:
+                key_v_down = input_interface.get_keyboard_value(keyboard, carb.input.KeyboardInput.V)
+                key_0_down = input_interface.get_keyboard_value(keyboard, carb.input.KeyboardInput.KEY_0)
+                
+                # Detect rising edge (key just pressed)
+                if key_v_down and not prev_key_v[0]:
+                    toggle_video_requested[0] = True
+                    print("[DEBUG] V key detected via polling")
+                if key_0_down and not prev_key_0[0]:
+                    toggle_video_requested[0] = True
+                    print("[DEBUG] 0 key detected via polling")
+                
+                prev_key_v[0] = key_v_down
+                prev_key_0[0] = key_0_down
+            except Exception:
+                pass  # Polling not supported, rely on event subscription
+            
+            # Check for video recording toggle
+            if toggle_video_requested[0]:
+                print("[DEBUG] Processing video toggle request...")
+                toggle_video_requested[0] = False
+                if video_recording[0]:
+                    stop_video_recording()
+                else:
+                    start_video_recording()
+            
+            # Capture video frame if recording
+            if video_recording[0]:
+                capture_frame()
+            
             # Check for environment reset request (set flag for next step)
             force_reset = reset_requested[0]
             if force_reset:
@@ -308,8 +532,133 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # agent stepping
                 actions = policy(obs)
             
+            # VLA: Capture observations and actions for Pi 0.5 training
+            if vla_data is not None and vla_current_episode is not None:
+                import numpy as np
+                unwrapped = env.unwrapped
+                
+                # Get current joint positions and velocities
+                robot = unwrapped.scene["robot"]
+                joint_pos = robot.data.joint_pos[0].cpu().numpy()
+                joint_vel = robot.data.joint_vel[0].cpu().numpy()
+                
+                # Store proprioceptive state
+                vla_current_episode["observations"]["qpos"].append(joint_pos.copy())
+                vla_current_episode["observations"]["qvel"].append(joint_vel.copy())
+                
+                # Store actions
+                vla_current_episode["actions"].append(actions[0].cpu().numpy().copy())
+                
+                # Capture camera images via Isaac Sim camera API
+                try:
+                    from omni.isaac.sensor import Camera
+                    import omni.isaac.core.utils.prims as prim_utils
+                    
+                    # Camera name mapping: internal name -> USD camera name
+                    camera_mapping = {
+                        "ego_cam": "Ego",
+                        "left_wrist_cam": "LeftArm",
+                        "right_wrist_cam": "RightArm",
+                    }
+                    
+                    for internal_name, usd_cam_name in camera_mapping.items():
+                        try:
+                            # Get camera prim path for env 0
+                            cam_prim_path = f"/World/envs/env_0/Robot/{usd_cam_name}"
+                            
+                            # Get camera and capture frame
+                            camera = Camera(prim_path=cam_prim_path)
+                            camera.initialize()
+                            img = camera.get_rgba()
+                            
+                            if img is not None:
+                                # Convert to (C, H, W) format for LeRobot compatibility
+                                img = img[:, :, :3]  # Remove alpha
+                                img = np.transpose(img, (2, 0, 1))  # (H, W, C) -> (C, H, W)
+                                vla_current_episode["observations"]["images"][internal_name].append(img.astype(np.uint8))
+                        except Exception as cam_err:
+                            if len(vla_current_episode["observations"]["qpos"]) == 1:
+                                print(f"[VLA] Camera {usd_cam_name} error: {cam_err}")
+                except Exception as e:
+                    if len(vla_current_episode["observations"]["qpos"]) == 1:
+                        print(f"[VLA] Camera capture error: {e}")
+            
             # env stepping (outside inference mode to allow reset)
             obs, _, _, _ = env.step(actions)
+            
+            # VLA: Check for episode reset (episode_length_buf goes to 0)
+            if vla_data is not None:
+                import numpy as np
+                unwrapped = env.unwrapped
+                current_episode_lengths = unwrapped.episode_length_buf
+                # Detect reset: current length is less than previous (wrapped around)
+                reset_mask = current_episode_lengths < vla_prev_episode_lengths
+                
+                if reset_mask[0].item():  # Episode 0 reset
+                    # Save completed episode as HDF5 file (LeRobot/Aloha compatible format)
+                    num_steps = len(vla_current_episode["observations"]["qpos"])
+                    if num_steps > 0:
+                        import h5py
+                        ep_path = os.path.join(vla_output_dir, f"episode_{vla_episode_count}.hdf5")
+                        
+                        with h5py.File(ep_path, "w") as f:
+                            # Store initial cube positions
+                            f.create_dataset("left_cube_start_pos", data=vla_current_episode["left_cube_start_pos"])
+                            f.create_dataset("right_cube_start_pos", data=vla_current_episode["right_cube_start_pos"])
+                            f.create_dataset("left_cube_start_quat", data=vla_current_episode["left_cube_start_quat"])
+                            f.create_dataset("right_cube_start_quat", data=vla_current_episode["right_cube_start_quat"])
+                            
+                            # Store initial robot joint positions
+                            f.create_dataset("robot_start_qpos", data=vla_current_episode["robot_start_qpos"])
+                            f.create_dataset("robot_start_qvel", data=vla_current_episode["robot_start_qvel"])
+                            
+                            # Store observations
+                            obs_grp = f.create_group("observations")
+                            obs_grp.create_dataset("qpos", data=np.array(vla_current_episode["observations"]["qpos"]))
+                            obs_grp.create_dataset("qvel", data=np.array(vla_current_episode["observations"]["qvel"]))
+                            
+                            # Store camera images
+                            img_grp = obs_grp.create_group("images")
+                            for cam_name, images in vla_current_episode["observations"]["images"].items():
+                                if len(images) > 0:
+                                    img_grp.create_dataset(cam_name, data=np.array(images), compression="gzip")
+                            
+                            # Store actions
+                            f.create_dataset("action", data=np.array(vla_current_episode["actions"]))
+                            
+                            # Store metadata
+                            f.attrs["task"] = vla_task_text
+                            f.attrs["num_steps"] = num_steps
+                        
+                        vla_episode_count += 1
+                        print(f"[VLA] Episode {vla_episode_count} saved: {ep_path} ({num_steps} steps)")
+                        
+                        # Check if we've captured enough episodes
+                        if vla_episode_count >= args_cli.vla_max_episodes:
+                            print(f"[VLA] Captured {vla_episode_count} episodes. Stopping...")
+                            break
+                    
+                    # Start new episode with cube starting positions
+                    vla_current_episode = {
+                        "left_cube_start_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
+                        "right_cube_start_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
+                        "left_cube_start_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
+                        "right_cube_start_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
+                        "robot_start_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
+                        "robot_start_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
+                        "observations": {
+                            "qpos": [],
+                            "qvel": [],
+                            "images": {
+                                "ego_cam": [],
+                                "left_wrist_cam": [],
+                                "right_wrist_cam": [],
+                            },
+                        },
+                        "actions": [],
+                    }
+                
+                vla_prev_episode_lengths = current_episode_lengths.clone()
             
             if force_reset:
                 obs = env.get_observations()
@@ -357,6 +706,61 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted by user. Closing...")
     finally:
+        # Save video recording if in progress
+        if video_recording[0]:
+            stop_video_recording()
+        
+        # Save VLA training data if capturing
+        if vla_data is not None and vla_output_dir is not None:
+            import numpy as np
+            import h5py
+            
+            # Save any in-progress episode
+            num_steps = len(vla_current_episode["observations"]["qpos"]) if vla_current_episode else 0
+            if num_steps > 0:
+                ep_path = os.path.join(vla_output_dir, f"episode_{vla_episode_count}.hdf5")
+                
+                with h5py.File(ep_path, "w") as f:
+                    # Store initial cube positions
+                    f.create_dataset("left_cube_start_pos", data=vla_current_episode["left_cube_start_pos"])
+                    f.create_dataset("right_cube_start_pos", data=vla_current_episode["right_cube_start_pos"])
+                    f.create_dataset("left_cube_start_quat", data=vla_current_episode["left_cube_start_quat"])
+                    f.create_dataset("right_cube_start_quat", data=vla_current_episode["right_cube_start_quat"])
+                    
+                    # Store initial robot joint positions
+                    f.create_dataset("robot_start_qpos", data=vla_current_episode["robot_start_qpos"])
+                    f.create_dataset("robot_start_qvel", data=vla_current_episode["robot_start_qvel"])
+                    
+                    # Store observations
+                    obs_grp = f.create_group("observations")
+                    obs_grp.create_dataset("qpos", data=np.array(vla_current_episode["observations"]["qpos"]))
+                    obs_grp.create_dataset("qvel", data=np.array(vla_current_episode["observations"]["qvel"]))
+                    
+                    # Store camera images
+                    img_grp = obs_grp.create_group("images")
+                    for cam_name, images in vla_current_episode["observations"]["images"].items():
+                        if len(images) > 0:
+                            img_grp.create_dataset(cam_name, data=np.array(images), compression="gzip")
+                    
+                    # Store actions
+                    f.create_dataset("action", data=np.array(vla_current_episode["actions"]))
+                    
+                    # Store metadata
+                    f.attrs["task"] = vla_task_text
+                    f.attrs["num_steps"] = num_steps
+                
+                vla_episode_count += 1
+                print(f"[VLA] Final episode saved: {ep_path} ({num_steps} steps)")
+            
+            # Update metadata with final episode count
+            if vla_episode_count > 0:
+                vla_data["metadata"]["total_episodes"] = vla_episode_count
+                with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
+                    json.dump(vla_data["metadata"], f, indent=2)
+                print(f"[VLA] Saved {vla_episode_count} episodes to {vla_output_dir}/")
+            else:
+                print("[VLA] No episodes captured.")
+        
         # Signal monitor thread to stop
         stop_requested.set()
         # Unsubscribe from keyboard events
