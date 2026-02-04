@@ -77,13 +77,30 @@ def _get_arm_distances(
     return left_dist, right_dist
 
 
+def left_arm_object_distance_tanh(
+    env: ManagerBasedRLEnv,
+    std: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("left_ee_frame"),
+) -> torch.Tensor:
+    """Tanh-kernel reward for left arm reaching its object."""
+    object: RigidObject = env.scene[object_cfg.name]
+    left_ee_frame: FrameTransformer = env.scene[left_ee_frame_cfg.name]
+
+    object_pos_w = object.data.root_pos_w[:, :3]
+    left_ee_pos_w = left_ee_frame.data.target_pos_w[:, 0, :]
+    dist = torch.norm(object_pos_w - left_ee_pos_w, dim=-1)
+
+    return 1.0 - torch.tanh(dist / std)
+
+
 def right_arm_object_distance_tanh(
     env: ManagerBasedRLEnv,
     std: float,
-    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
     right_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("right_ee_frame"),
 ) -> torch.Tensor:
-    """Tanh-kernel reward for right arm reaching the object (train_lift style)."""
+    """Tanh-kernel reward for right arm reaching its object."""
     object: RigidObject = env.scene[object_cfg.name]
     right_ee_frame: FrameTransformer = env.scene[right_ee_frame_cfg.name]
 

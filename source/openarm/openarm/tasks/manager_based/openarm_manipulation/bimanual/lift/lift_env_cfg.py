@@ -14,7 +14,9 @@
 
 """Configuration for the bimanual lift environment.
 
-Simplified: right arm reaches a cube (train_lift style).
+Two-cube bimanual task: each arm picks up its assigned cube and moves it to a target.
+- Left arm: picks up left cube (spawned on left side), moves to left target
+- Right arm: picks up right cube (spawned on right side), moves to right target
 Scene assets (factory USD, table, pails) remain unchanged.
 """
 
@@ -75,7 +77,7 @@ NUM_MUG_ASSETS = len(MUG_ASSETS)
 class BimanualLiftSceneCfg(InteractiveSceneCfg):
     """Configuration for the bimanual lift scene with robot, pails, and objects.
     
-    Simplified: right arm reaches a cube (train_lift style).
+    Two-cube bimanual task: left cube for left arm, right cube for right arm.
     Note: The factory USD already contains the "Danny" table (surface at z=0.255).
     """
 
@@ -86,8 +88,11 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     left_ee_frame: FrameTransformerCfg = MISSING
     right_ee_frame: FrameTransformerCfg = MISSING
     
-    # Target object: will be populated by agent env cfg (cube or fruit)
-    object: RigidObjectCfg = MISSING
+    # Target objects: will be populated by agent env cfg
+    # Left cube spawns on left side of table (positive Y)
+    object_left: RigidObjectCfg = MISSING
+    # Right cube spawns on right side of table (negative Y)
+    object_right: RigidObjectCfg = MISSING
 
     # Left pail for mugs (on ground beside table)
     left_pail = AssetBaseCfg(
@@ -140,18 +145,37 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command terms for the MDP.
     
-    The goal position for the lifted object (train_lift style).
+    Two goal positions: one for each arm's cube.
+    Left target on left side (positive Y, extends over left pail).
+    Right target on right side (negative Y, extends over right pail).
     """
 
-    object_pose = mdp.UniformPoseCommandCfg(
+    # Left arm target (left side of table, extends over left pail at y=0.45)
+    left_object_pose = mdp.UniformPoseCommandCfg(
         asset_name="robot",
-        body_name=MISSING,  # will be set by agent env cfg
+        body_name=MISSING,  # will be set by agent env cfg (left hand)
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.1, 0.5),   # Match cube spawn range (0.3 + [-0.2, 0.2])
-            pos_y=(-0.2, 0.2),  # Match cube spawn range (0.0 + [-0.2, 0.2])
-            pos_z=(0.45, 0.6),
+            pos_x=(0.2, 0.4),
+            pos_y=(0.05, 0.45),   # Left side, extends over left pail
+            pos_z=(0.35, 0.6),
+            roll=(0.0, 0.0),
+            pitch=(0.0, 0.0),
+            yaw=(0.0, 0.0),
+        ),
+    )
+
+    # Right arm target (right side of table, extends over right pail at y=-0.45)
+    right_object_pose = mdp.UniformPoseCommandCfg(
+        asset_name="robot",
+        body_name=MISSING,  # will be set by agent env cfg (right hand)
+        resampling_time_range=(5.0, 5.0),
+        debug_vis=True,
+        ranges=mdp.UniformPoseCommandCfg.Ranges(
+            pos_x=(0.2, 0.4),
+            pos_y=(-0.45, -0.05),  # Right side, extends over right pail
+            pos_z=(0.35, 0.6),
             roll=(0.0, 0.0),
             pitch=(0.0, 0.0),
             yaw=(0.0, 0.0),
@@ -178,7 +202,48 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+        """Observations for policy group.
+        
+        Both arms observe their joint states, their assigned cube, and their target.
+        """
+
+        # Left arm joint state
+        left_joint_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[
+                    "openarm_left_joint1",
+                    "openarm_left_joint2",
+                    "openarm_left_joint3",
+                    "openarm_left_joint4",
+                    "openarm_left_joint5",
+                    "openarm_left_joint6",
+                    "openarm_left_joint7",
+                ])
+            },
+        )
+        
+        left_joint_vel = ObsTerm(
+            func=mdp.joint_vel_rel,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=[
+                    "openarm_left_joint1",
+                    "openarm_left_joint2",
+                    "openarm_left_joint3",
+                    "openarm_left_joint4",
+                    "openarm_left_joint5",
+                    "openarm_left_joint6",
+                    "openarm_left_joint7",
+                ])
+            },
+        )
+        
+        left_gripper_pos = ObsTerm(
+            func=mdp.joint_pos_rel,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["openarm_left_finger_joint.*"])
+            },
+        )
 
         # Right arm joint state
         right_joint_pos = ObsTerm(
@@ -218,13 +283,33 @@ class ObservationsCfg:
             },
         )
 
-        # Object observations
-        object_position = ObsTerm(func=mdp.object_position_in_robot_root_frame)
-        target_object_position = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "object_pose"}
+        # Left cube observations
+        left_object_position = ObsTerm(
+            func=mdp.object_position_in_robot_root_frame,
+            params={"object_cfg": SceneEntityCfg("object_left")},
         )
+        target_left_object_position = ObsTerm(
+            func=mdp.generated_commands, params={"command_name": "left_object_pose"}
+        )
+
+        # Right cube observations
+        right_object_position = ObsTerm(
+            func=mdp.object_position_in_robot_root_frame,
+            params={"object_cfg": SceneEntityCfg("object_right")},
+        )
+        target_right_object_position = ObsTerm(
+            func=mdp.generated_commands, params={"command_name": "right_object_pose"}
+        )
+
+        # Object assignment flags (for future use - can make arm stand still if no object)
+        # Currently always 1.0 since both arms always have cubes
+        left_arm_has_object = ObsTerm(func=mdp.left_arm_has_object)
+        right_arm_has_object = ObsTerm(func=mdp.right_arm_has_object)
         
         # Previous actions
+        left_arm_actions = ObsTerm(
+            func=mdp.last_action, params={"action_name": "left_arm_action"}
+        )
         right_arm_actions = ObsTerm(
             func=mdp.last_action, params={"action_name": "right_arm_action"}
         )
@@ -243,7 +328,7 @@ class EventCfg:
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
     
-    # Randomize robot joint positions on reset
+    # Randomize robot joint positions on reset (both arms identically)
     # Using reset_joints_by_offset (not scale) because default positions are 0
     # and 0 * scale = 0 (no randomization)
     # Offset adds random values to default positions
@@ -256,6 +341,8 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg(
                 "robot",
                 joint_names=[
+                    "openarm_left_joint.*",
+                    "openarm_left_finger_joint.*",
                     "openarm_right_joint.*",
                     "openarm_right_finger_joint.*",
                 ],
@@ -263,19 +350,37 @@ class EventCfg:
         },
     )
     
-    # Randomize object position on table (wider range for larger table)
-    reset_object_position = EventTerm(
+    # Randomize left cube position on left side of table (positive Y, closer to center)
+    # Init y=0.1, offset (-0.15, 0.15) → actual y = -0.05 to 0.25
+    reset_left_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.2, 0.2),
-                "y": (-0.2, 0.2),
+                "x": (-0.15, 0.15),
+                "y": (-0.15, 0.15),  # Offset from init y=0.1 → actual y = -0.05 to 0.25
                 "z": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
             "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
-            "asset_cfg": SceneEntityCfg("object"),
+            "asset_cfg": SceneEntityCfg("object_left"),
+        },
+    )
+
+    # Randomize right cube position on right side of table (negative Y, closer to center)
+    # Init y=-0.1, offset (-0.15, 0.15) → actual y = -0.25 to 0.05
+    reset_right_object_position = EventTerm(
+        func=mdp.reset_root_state_uniform,
+        mode="reset",
+        params={
+            "pose_range": {
+                "x": (-0.15, 0.15),
+                "y": (-0.15, 0.15),  # Offset from init y=-0.1 → actual y = -0.25 to 0.05
+                "z": (0.0, 0.0),
+                "yaw": (0.0, 0.0),
+            },
+            "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "asset_cfg": SceneEntityCfg("object_right"),
         },
     )
 
@@ -284,39 +389,81 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP.
     
-    Train-lift style: reach, lift, then move toward goal.
+    Bimanual lift: both arms reach, lift, and move their assigned cube to target.
+    Each arm has symmetric reward structure.
     """
 
-    # Right arm reaching toward object (tanh kernel, same as unimanual lift)
-    reaching_object = RewTerm(
-        func=mdp.right_arm_object_distance_tanh,
-        params={"std": 0.2},
+    # === Left arm rewards ===
+    
+    # Left arm reaching toward left object
+    left_reaching_object = RewTerm(
+        func=mdp.left_arm_object_distance_tanh,
+        params={"std": 0.2, "object_cfg": SceneEntityCfg("object_left")},
         weight=3.0,
     )
 
-    # Lifting the object relative to its spawn height
-    lifting_object = RewTerm(
+    # Lifting the left object relative to its spawn height
+    left_lifting_object = RewTerm(
         func=mdp.object_is_lifted_relative,
-        params={"min_delta": 0.015},
+        params={"min_delta": 0.015, "object_cfg": SceneEntityCfg("object_left")},
         weight=30.0,
     )
 
-    # Moving object toward goal (increased weights to overcome bimanual penalties)
-    # Must exceed reaching+lifting (33.0) to incentivize movement
-    object_goal_tracking = RewTerm(
+    # Moving left object toward left goal
+    left_goal_tracking = RewTerm(
         func=mdp.object_goal_distance_relative,
-        params={"std": 0.3, "min_delta": 0.015, "command_name": "object_pose"},
-        weight=25.0,  # was 16.0
+        params={"std": 0.3, "min_delta": 0.015, "command_name": "left_object_pose", "object_cfg": SceneEntityCfg("object_left")},
+        weight=25.0,
     )
 
-    object_goal_tracking_fine_grained = RewTerm(
+    left_goal_tracking_fine_grained = RewTerm(
         func=mdp.object_goal_distance_relative,
-        params={"std": 0.05, "min_delta": 0.015, "command_name": "object_pose"},
-        weight=10.0,  # was 5.0
+        params={"std": 0.05, "min_delta": 0.015, "command_name": "left_object_pose", "object_cfg": SceneEntityCfg("object_left")},
+        weight=10.0,
     )
 
-    # Action penalties
+    # === Right arm rewards ===
+
+    # Right arm reaching toward right object
+    right_reaching_object = RewTerm(
+        func=mdp.right_arm_object_distance_tanh,
+        params={"std": 0.2, "object_cfg": SceneEntityCfg("object_right")},
+        weight=3.0,
+    )
+
+    # Lifting the right object relative to its spawn height
+    right_lifting_object = RewTerm(
+        func=mdp.object_is_lifted_relative,
+        params={"min_delta": 0.015, "object_cfg": SceneEntityCfg("object_right")},
+        weight=30.0,
+    )
+
+    # Moving right object toward right goal
+    right_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance_relative,
+        params={"std": 0.3, "min_delta": 0.015, "command_name": "right_object_pose", "object_cfg": SceneEntityCfg("object_right")},
+        weight=25.0,
+    )
+
+    right_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance_relative,
+        params={"std": 0.05, "min_delta": 0.015, "command_name": "right_object_pose", "object_cfg": SceneEntityCfg("object_right")},
+        weight=10.0,
+    )
+
+    # === Action penalties (both arms) ===
+    
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
+
+    left_joint_vel = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-1e-4,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[
+                "openarm_left_joint.*", "openarm_left_finger_joint.*"
+            ])
+        },
+    )
 
     right_joint_vel = RewTerm(
         func=mdp.joint_vel_l2,
@@ -335,20 +482,34 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Terminate if object falls below minimum height (train_lift style)
-    object_dropping = DoneTerm(
+    # Terminate if left object falls below minimum height
+    left_object_dropping = DoneTerm(
         func=mdp.root_height_below_minimum,
-        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object")},
+        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object_left")},
+    )
+
+    # Terminate if right object falls below minimum height
+    right_object_dropping = DoneTerm(
+        func=mdp.root_height_below_minimum,
+        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object_right")},
     )
 
 
 @configclass
 class CurriculumCfg:
-    """Curriculum terms for the MDP (same as unimanual lift)."""
+    """Curriculum terms for the MDP.
+    
+    Gradually ramp up penalties for both arms over training.
+    """
 
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000},
+    )
+
+    left_joint_vel = CurrTerm(
+        func=mdp.modify_reward_weight,
+        params={"term_name": "left_joint_vel", "weight": -1e-1, "num_steps": 10000},
     )
 
     right_joint_vel = CurrTerm(

@@ -23,7 +23,7 @@ class OpenArmBimanualLiftCubePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """PPO runner configuration for OpenArm bimanual lift task."""
 
     num_steps_per_env = 24
-    max_iterations = 1500
+    max_iterations = 5000
     save_interval = 50
     experiment_name = "openarm_bi_lift"
     run_name = ""

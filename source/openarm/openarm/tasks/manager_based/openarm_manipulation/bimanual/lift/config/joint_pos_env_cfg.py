@@ -14,7 +14,7 @@
 
 """OpenArm-specific configuration for bimanual lift environment.
 
-Simplified: right arm reaches a cube (train_lift style).
+Two-cube bimanual task: each arm picks up its assigned cube and moves it to a target.
 """
 
 import math
@@ -31,6 +31,7 @@ from isaaclab.sim.schemas.schemas_cfg import (
     MassPropertiesCfg,
 )
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -46,11 +47,11 @@ from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.open
 
 @configclass
 class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
-    """OpenArm bimanual cube/fruit lift environment configuration.
+    """OpenArm bimanual cube lift environment configuration.
     
-    Objects are randomly spawned:
-    - Cube (index 0) → Left hand → left_pail
-    - Fruit (indices 1-5) → Right hand → right_pail
+    Two cubes are spawned on opposite sides of the table:
+    - Left cube → Left arm → left target
+    - Right cube → Right arm → right target
     """
 
     def __post_init__(self):
@@ -58,30 +59,27 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
         super().__post_init__()
 
         # Set OpenArm bimanual as robot (factory USD includes Danny table)
-        # Enable gravity for lift task (unlike reach where it's disabled)
-        # Start with arms at default position (hanging down) - reward shaping guides arms up
-        # Set OpenArm bimanual as robot (factory USD includes Danny table)
-        # Start with right arm above the desk: shoulder back + elbow bent
+        # Both arms start in raised pose above the desk
         self.scene.robot = OPEN_ARM_FACTORY_HIGH_PD_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=ArticulationCfg.InitialStateCfg(
                 joint_pos={
-                    # Right arm raised pose
-                    "openarm_right_joint1": 0.0,   # shoulder pitch (backwards, within limits)
-                    "openarm_right_joint2": 1.0,  # shoulder outward to the sides
-                    "openarm_right_joint3": 0.0,  # shoulder twist
-                    "openarm_right_joint4": 1.6,  # elbow bent more
-                    "openarm_right_joint5": 0.0,
-                    "openarm_right_joint6": 0.0,
-                    "openarm_right_joint7": 0.0,
-                    # Left arm stays at default (all zeros)
-                    "openarm_left_joint1": 0.0,
-                    "openarm_left_joint2": 0.0,
-                    "openarm_left_joint3": 0.0,
-                    "openarm_left_joint4": 0.0,
+                    # Left arm raised pose (mirrored from right)
+                    "openarm_left_joint1": 0.0,    # shoulder pitch
+                    "openarm_left_joint2": -1.0,   # shoulder outward (mirrored direction)
+                    "openarm_left_joint3": 0.0,    # shoulder twist
+                    "openarm_left_joint4": 1.6,    # elbow bent
                     "openarm_left_joint5": 0.0,
                     "openarm_left_joint6": 0.0,
                     "openarm_left_joint7": 0.0,
+                    # Right arm raised pose
+                    "openarm_right_joint1": 0.0,   # shoulder pitch
+                    "openarm_right_joint2": 1.0,   # shoulder outward
+                    "openarm_right_joint3": 0.0,   # shoulder twist
+                    "openarm_right_joint4": 1.6,   # elbow bent
+                    "openarm_right_joint5": 0.0,
+                    "openarm_right_joint6": 0.0,
+                    "openarm_right_joint7": 0.0,
                     # Grippers open
                     "openarm_left_finger_joint.*": 0.044,
                     "openarm_right_finger_joint.*": 0.044,
@@ -138,9 +136,11 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             close_command_expr={"openarm_right_finger_joint.*": 0.0},
         )
 
-        # Set the body name for the command (right hand, train_lift style)
-        self.commands.object_pose.body_name = "openarm_right_hand"
-        self.commands.object_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
+        # Set the body names for the commands
+        self.commands.left_object_pose.body_name = "openarm_left_hand"
+        self.commands.left_object_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
+        self.commands.right_object_pose.body_name = "openarm_right_hand"
+        self.commands.right_object_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
 
         # Left end-effector frame
         self.scene.left_ee_frame = FrameTransformerCfg(
@@ -172,15 +172,47 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             ],
         )
 
-        # Spawn a cube on the table (train_lift style)
-        self.scene.object = RigidObjectCfg(
-            prim_path="{ENV_REGEX_NS}/Object",
+        # Spawn left cube on left side of table (positive Y) - BLUE
+        self.scene.object_left = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/ObjectLeft",
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=[0.3, 0.0, 0.36], rot=[1, 0, 0, 0]  # Centered above table
+                pos=[0.3, 0.1, 0.36], rot=[1, 0, 0, 0]  # Left side of table, closer to center
             ),
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
                 scale=(0.8, 0.8, 0.8),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.2, 0.4, 0.9),  # Blue
+                ),
+                rigid_props=RigidBodyPropertiesCfg(
+                    solver_position_iteration_count=16,
+                    solver_velocity_iteration_count=1,
+                    max_angular_velocity=1000.0,
+                    max_linear_velocity=1000.0,
+                    max_depenetration_velocity=5.0,
+                    disable_gravity=False,
+                ),
+                collision_props=CollisionPropertiesCfg(
+                    collision_enabled=True,
+                ),
+                mass_props=MassPropertiesCfg(
+                    mass=0.1,  # 100g - light enough to grasp
+                ),
+            ),
+        )
+
+        # Spawn right cube on right side of table (negative Y) - RED
+        self.scene.object_right = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/ObjectRight",
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=[0.3, -0.1, 0.36], rot=[1, 0, 0, 0]  # Right side of table, closer to center
+            ),
+            spawn=UsdFileCfg(
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+                scale=(0.8, 0.8, 0.8),
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.9, 0.2, 0.2),  # Red
+                ),
                 rigid_props=RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
                     solver_velocity_iteration_count=1,

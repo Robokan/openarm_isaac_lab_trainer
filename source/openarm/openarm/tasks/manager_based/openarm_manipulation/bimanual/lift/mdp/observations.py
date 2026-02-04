@@ -204,3 +204,33 @@ def right_ee_to_lift_target(
     target = torch.tensor(lift_target, device=env.device)
     
     return target - right_ee_pos_w
+
+
+# ===== Object Assignment Observations =====
+
+def left_arm_has_object(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Returns 1.0 if the left arm has an assigned object to pick up.
+    
+    Currently always returns 1.0 since both arms always have cubes.
+    This observation is a placeholder for future scenarios where
+    an arm might not have an object assigned (e.g., single cube tasks).
+    
+    Returns: (num_envs, 1)
+    """
+    return torch.ones(env.num_envs, 1, device=env.device)
+
+
+def right_arm_has_object(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Returns 1.0 if the right arm has an assigned object to pick up.
+    
+    Currently always returns 1.0 since both arms always have cubes.
+    This observation is a placeholder for future scenarios where
+    an arm might not have an object assigned (e.g., single cube tasks).
+    
+    Returns: (num_envs, 1)
+    """
+    return torch.ones(env.num_envs, 1, device=env.device)
