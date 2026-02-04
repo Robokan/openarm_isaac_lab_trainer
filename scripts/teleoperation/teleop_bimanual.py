@@ -136,10 +136,13 @@ class KeyboardDevice:
         print("  2: Select RIGHT hand")
         print("")
         print("Other:")
+        print("  C: Spawn cube")
         print("  M: Toggle marker visibility")
         print("  R: Reset poses to default")
         print("  Ctrl+C: Quit")
         print("="*60 + "\n")
+        
+        self.spawn_cube_requested = False  # Flag for cube spawning
     
     def _on_keyboard_event(self, event, *args, **kwargs):
         """Handle keyboard events from Isaac Sim.
@@ -180,6 +183,9 @@ class KeyboardDevice:
             elif key == self._carb_input.KeyboardInput.M:
                 self.markers_visible = not self.markers_visible
                 print(f"[Keyboard] Markers {'visible' if self.markers_visible else 'hidden'}")
+                return False
+            elif key == self._carb_input.KeyboardInput.C:
+                self.spawn_cube_requested = True
                 return False
         
         # Check if it's a movement/rotation/gripper key we handle
@@ -871,6 +877,44 @@ class XRDevice:
             pass
         
         return None
+    
+    def get_button_states(self):
+        """Get button states (A, B, X, Y) from controllers.
+        
+        Returns dict with button states: {'right_a': bool, 'right_b': bool, 'left_x': bool, 'left_y': bool}
+        """
+        states = {'right_a': False, 'right_b': False, 'left_x': False, 'left_y': False}
+        
+        if self._xr_core is None:
+            return states
+        
+        try:
+            from omni.kit.xr.core import XRCore
+            xr = XRCore.get_singleton()
+            if xr is None:
+                return states
+            
+            if hasattr(xr, 'get_input_device'):
+                right_dev = xr.get_input_device("/user/hand/right")
+                left_dev = xr.get_input_device("/user/hand/left")
+                
+                # Right controller: A and B buttons
+                if right_dev and hasattr(right_dev, 'has_input_gesture'):
+                    if right_dev.has_input_gesture("a", "click"):
+                        states['right_a'] = bool(right_dev.get_input_gesture_value("a", "click"))
+                    if right_dev.has_input_gesture("b", "click"):
+                        states['right_b'] = bool(right_dev.get_input_gesture_value("b", "click"))
+                
+                # Left controller: X and Y buttons
+                if left_dev and hasattr(left_dev, 'has_input_gesture'):
+                    if left_dev.has_input_gesture("x", "click"):
+                        states['left_x'] = bool(left_dev.get_input_gesture_value("x", "click"))
+                    if left_dev.has_input_gesture("y", "click"):
+                        states['left_y'] = bool(left_dev.get_input_gesture_value("y", "click"))
+        except Exception:
+            pass
+        
+        return states
 
     def __del__(self):
         if self._input and self._keyboard and self._sub_keyboard:
@@ -1132,6 +1176,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("[INFO] Environment closed")
 
 
+def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=(0.2, 0.6, 1.0), cube_counter=[0]):
+    """Spawn a physics-enabled cube at the given position.
+    
+    Args:
+        stage: USD stage
+        position: (x, y, z) spawn position in meters
+        size: cube size in meters
+        color: (r, g, b) color values 0-1
+        cube_counter: mutable counter for unique naming
+    
+    Returns:
+        Path to the spawned cube prim
+    """
+    from pxr import UsdGeom, UsdPhysics, Gf, Sdf
+    
+    cube_counter[0] += 1
+    cube_path = f"/World/spawned_cube_{cube_counter[0]}"
+    
+    # Create the cube
+    cube_prim = UsdGeom.Cube.Define(stage, cube_path)
+    cube_prim.GetSizeAttr().Set(size * 2)  # USD cube size is full width
+    
+    # Set position
+    xform = UsdGeom.Xformable(cube_prim.GetPrim())
+    xform.ClearXformOpOrder()
+    translate_op = xform.AddTranslateOp()
+    translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
+    
+    # Set color
+    cube_prim.GetDisplayColorAttr().Set([Gf.Vec3f(color[0], color[1], color[2])])
+    
+    # Add rigid body physics
+    prim = cube_prim.GetPrim()
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    UsdPhysics.CollisionAPI.Apply(prim)
+    
+    # Set mass
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    mass_api.GetMassAttr().Set(0.1)  # 100 grams
+    
+    print(f"[Cube] Spawned cube at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+    return cube_path
+
+
 def run_teleop(env, args):
     """Run IK-based teleoperation with manual input devices."""
     
@@ -1212,7 +1300,12 @@ def run_teleop(env, args):
     
     print(f"[INFO] Left arm joints: {left_joint_names}")
     print(f"[INFO] Right arm joints: {right_joint_names}")
+    print(f"[INFO] Left arm joint IDs: {left_arm_joint_ids}")
+    print(f"[INFO] Right arm joint IDs: {right_arm_joint_ids}")
     print(f"[INFO] Left EE body index: {left_body_idx}, Right EE body index: {right_body_idx}")
+    print(f"[INFO] Left Jacobi body idx: {left_jacobi_body_idx}, Right Jacobi body idx: {right_jacobi_body_idx}")
+    print(f"[INFO] Left Jacobi joint IDs: {left_jacobi_joint_ids}")
+    print(f"[INFO] Right Jacobi joint IDs: {right_jacobi_joint_ids}")
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -1243,6 +1336,15 @@ def run_teleop(env, args):
     
     step_count = 0
     prev_markers_visible = True  # Track previous visibility state
+    prev_a_button = False  # Track A button for edge detection
+    
+    # Get USD stage for cube spawning
+    try:
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+    except Exception:
+        stage = None
+        print("[WARN] Could not get USD stage for cube spawning")
     
     try:
         while simulation_app.is_running() and step_count < 100000:
@@ -1321,6 +1423,32 @@ def run_teleop(env, args):
                     device=sim_device,
                 )
                 robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
+            
+            # Check for A button press (VR) or C key (keyboard) to spawn cube
+            spawn_requested = False
+            
+            # VR: Check A button on right controller
+            if hasattr(input_device, "get_button_states"):
+                button_states = input_device.get_button_states()
+                a_pressed = button_states.get('right_a', False)
+                
+                # Edge detection: spawn only on button press (not hold)
+                if a_pressed and not prev_a_button:
+                    spawn_requested = True
+                prev_a_button = a_pressed
+            
+            # Keyboard: Check C key flag
+            if hasattr(input_device, "spawn_cube_requested") and input_device.spawn_cube_requested:
+                spawn_requested = True
+                input_device.spawn_cube_requested = False  # Reset flag
+            
+            # Spawn cube if requested
+            if spawn_requested and stage is not None:
+                # Spawn cube in front of robot arms (center, slightly forward and up)
+                spawn_x = 0.4  # Forward
+                spawn_y = 0.0  # Center
+                spawn_z = 0.6  # Height to drop from
+                spawn_cube(stage, position=(spawn_x, spawn_y, spawn_z))
             
             # ===== FULL POSE IK =====
             # Convert poses to tensors (pose format: x, y, z, qw, qx, qy, qz)
