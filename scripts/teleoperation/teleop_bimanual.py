@@ -1258,9 +1258,12 @@ def run_teleop(env, args):
     # IK setup - Full pose IK for all 7 joints
     print("[INFO] Setting up full-pose IK controllers...")
     
-    # Create IK controllers for full pose control (position + orientation)
+    # ===== SPLIT IK: Position (joints 1-4) + Direct wrist control (joints 5-7) =====
+    print("[INFO] Setting up split IK: Position (joints 1-4) + Wrist (joints 5-7)...")
+    
+    # Position-only IK for joints 1-4
     ik_cfg = DifferentialIKControllerCfg(
-        command_type="pose",  # Full 6-DOF pose control
+        command_type="position",  # Position-only control
         use_relative_mode=False,
         ik_method="dls",
         ik_params={"lambda_val": 0.1},
@@ -1268,44 +1271,58 @@ def run_teleop(env, args):
     left_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     right_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     
-    # Get joint IDs for all 7 joints per arm
-    left_arm_joint_ids, left_joint_names = robot.find_joints([
-        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
-        "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6",
-        "openarm_left_joint7"
+    # Get joint IDs for position control (joints 1-4)
+    left_pos_joint_ids, left_pos_joint_names = robot.find_joints([
+        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3", "openarm_left_joint4"
     ])
-    right_arm_joint_ids, right_joint_names = robot.find_joints([
-        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
-        "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
-        "openarm_right_joint7"
+    right_pos_joint_ids, right_pos_joint_names = robot.find_joints([
+        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3", "openarm_right_joint4"
     ])
     
-    # Get body IDs for end-effectors
+    # Get joint IDs for wrist control (joints 5-7)
+    left_wrist_joint_ids, left_wrist_joint_names = robot.find_joints([
+        "openarm_left_joint5", "openarm_left_joint6", "openarm_left_joint7"
+    ])
+    right_wrist_joint_ids, right_wrist_joint_names = robot.find_joints([
+        "openarm_right_joint5", "openarm_right_joint6", "openarm_right_joint7"
+    ])
+    
+    # Combined joint IDs for reference
+    left_arm_joint_ids = list(left_pos_joint_ids) + list(left_wrist_joint_ids)
+    right_arm_joint_ids = list(right_pos_joint_ids) + list(right_wrist_joint_ids)
+    
+    # Get body IDs for end-effectors (hand for position target)
     left_body_ids, _ = robot.find_bodies("openarm_left_hand")
     right_body_ids, _ = robot.find_bodies("openarm_right_hand")
     left_body_idx = left_body_ids[0]
     right_body_idx = right_body_ids[0]
     
+    # Get body IDs for link4 (forearm - for wrist relative orientation)
+    left_link4_ids, _ = robot.find_bodies("openarm_left_link4")
+    right_link4_ids, _ = robot.find_bodies("openarm_right_link4")
+    left_link4_idx = left_link4_ids[0]
+    right_link4_idx = right_link4_ids[0]
+    print(f"[INFO] Link4 body idx: L={left_link4_idx}, R={right_link4_idx}")
+    
     # For fixed-base robots, jacobian body index is offset by 1
+    # Only use joints 1-4 for position IK Jacobian
     if robot.is_fixed_base:
         left_jacobi_body_idx = left_body_idx - 1
         right_jacobi_body_idx = right_body_idx - 1
-        left_jacobi_joint_ids = left_arm_joint_ids
-        right_jacobi_joint_ids = right_arm_joint_ids
+        left_jacobi_joint_ids = list(left_pos_joint_ids)  # Only joints 1-4
+        right_jacobi_joint_ids = list(right_pos_joint_ids)  # Only joints 1-4
     else:
         left_jacobi_body_idx = left_body_idx
         right_jacobi_body_idx = right_body_idx
-        left_jacobi_joint_ids = [i + 6 for i in left_arm_joint_ids]
-        right_jacobi_joint_ids = [i + 6 for i in right_arm_joint_ids]
+        left_jacobi_joint_ids = [i + 6 for i in left_pos_joint_ids]
+        right_jacobi_joint_ids = [i + 6 for i in right_pos_joint_ids]
     
-    print(f"[INFO] Left arm joints: {left_joint_names}")
-    print(f"[INFO] Right arm joints: {right_joint_names}")
-    print(f"[INFO] Left arm joint IDs: {left_arm_joint_ids}")
-    print(f"[INFO] Right arm joint IDs: {right_arm_joint_ids}")
-    print(f"[INFO] Left EE body index: {left_body_idx}, Right EE body index: {right_body_idx}")
-    print(f"[INFO] Left Jacobi body idx: {left_jacobi_body_idx}, Right Jacobi body idx: {right_jacobi_body_idx}")
-    print(f"[INFO] Left Jacobi joint IDs: {left_jacobi_joint_ids}")
-    print(f"[INFO] Right Jacobi joint IDs: {right_jacobi_joint_ids}")
+    print(f"[INFO] Position joints (1-4): L={left_pos_joint_names}, R={right_pos_joint_names}")
+    print(f"[INFO] Wrist joints (5-7): L={left_wrist_joint_names}, R={right_wrist_joint_names}")
+    print(f"[INFO] Position joint IDs: L={left_pos_joint_ids}, R={right_pos_joint_ids}")
+    print(f"[INFO] Wrist joint IDs: L={left_wrist_joint_ids}, R={right_wrist_joint_ids}")
+    print(f"[INFO] EE body index: L={left_body_idx}, R={right_body_idx}")
+    print(f"[INFO] Jacobi body idx: L={left_jacobi_body_idx}, R={right_jacobi_body_idx}")
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -1475,44 +1492,102 @@ def run_teleop(env, args):
                 root_pos_w, root_quat_w, right_ee_pos_w, right_ee_quat_w
             )
             
-            # Get Jacobians for all 7 joints
+            # Get Jacobians for position IK (only joints 1-4)
             jacobians = robot.root_physx_view.get_jacobians()
             
-            # Left arm Jacobian
+            # Left arm Jacobian (only for joints 1-4)
             left_jacobian_w = jacobians[:, left_jacobi_body_idx, :, left_jacobi_joint_ids]
             base_rot_matrix = math_utils.matrix_from_quat(math_utils.quat_inv(root_quat_w))
             left_jacobian_b = left_jacobian_w.clone()
             left_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, :3, :])
             left_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, 3:, :])
             
-            # Right arm Jacobian
+            # Right arm Jacobian (only for joints 1-4)
             right_jacobian_w = jacobians[:, right_jacobi_body_idx, :, right_jacobi_joint_ids]
             right_jacobian_b = right_jacobian_w.clone()
             right_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, :3, :])
             right_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, 3:, :])
             
-            # Get current joint positions (all 7 joints)
-            left_joint_pos = robot.data.joint_pos[:, left_arm_joint_ids]
-            right_joint_pos = robot.data.joint_pos[:, right_arm_joint_ids]
+            # Get current joint positions for position IK (joints 1-4 only)
+            left_pos_joint_pos = robot.data.joint_pos[:, left_pos_joint_ids]
+            right_pos_joint_pos = robot.data.joint_pos[:, right_pos_joint_ids]
             
-            # Set target poses in IK controllers (position + orientation)
-            left_target_cmd = torch.cat([left_target_pos, left_target_quat], dim=1)
-            right_target_cmd = torch.cat([right_target_pos, right_target_quat], dim=1)
+            # ===== POSITION IK (joints 1-4) =====
+            # Set position target (position-only IK needs ee_quat for reference)
+            left_ik_controller.set_command(left_target_pos, ee_quat=left_ee_quat_b)
+            right_ik_controller.set_command(right_target_pos, ee_quat=right_ee_quat_b)
             
-            left_ik_controller.set_command(left_target_cmd)
-            right_ik_controller.set_command(right_target_cmd)
-            
-            # Compute IK to get desired joint positions for all 7 joints
-            left_joint_pos_des = left_ik_controller.compute(
-                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
+            # Compute position IK for joints 1-4
+            left_pos_des = left_ik_controller.compute(
+                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_pos_joint_pos
             )
-            right_joint_pos_des = right_ik_controller.compute(
-                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
+            right_pos_des = right_ik_controller.compute(
+                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_pos_joint_pos
             )
+            
+            # ===== WRIST DIRECT CONTROL (joints 5-7) =====
+            # Joint 5: Z-axis (forearm twist/yaw)
+            # Joint 6: X-axis (wrist flex/roll)
+            # Joint 7: Y-axis (wrist deviation/pitch)
+            
+            # Extract Euler angles from VR target quaternion
+            left_q = left_target_quat[0].cpu().numpy()
+            right_q = right_target_quat[0].cpu().numpy()
+            
+            def extract_euler(q):
+                """Extract roll (X), pitch (Y), yaw (Z) from quaternion (w,x,y,z)."""
+                w, x, y, z = q[0], q[1], q[2], q[3]
+                # Roll (X-axis)
+                sinr_cosp = 2.0 * (w * x + y * z)
+                cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+                roll = np.arctan2(sinr_cosp, cosr_cosp)
+                # Pitch (Y-axis)
+                sinp = 2.0 * (w * y - z * x)
+                pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
+                # Yaw (Z-axis)
+                siny_cosp = 2.0 * (w * z + x * y)
+                cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+                yaw = np.arctan2(siny_cosp, cosy_cosp)
+                return roll, pitch, yaw
+            
+            left_roll, left_pitch, left_yaw = extract_euler(left_q)
+            right_roll, right_pitch, right_yaw = extract_euler(right_q)
+            
+            # Track initial Euler offsets (set on first frame or reset)
+            if not hasattr(run_teleop, '_init_left_euler'):
+                run_teleop._init_left_euler = (left_roll, left_pitch, left_yaw)
+                run_teleop._init_right_euler = (right_roll, right_pitch, right_yaw)
+            
+            # Compute deltas from initial orientation
+            left_j5 = left_yaw - run_teleop._init_left_euler[2]  # Z-axis
+            left_j6 = left_roll - run_teleop._init_left_euler[0]  # X-axis
+            left_j7 = left_pitch - run_teleop._init_left_euler[1]  # Y-axis
+            
+            # Right arm is mirrored, negate rotations
+            right_j5 = -(right_yaw - run_teleop._init_right_euler[2])
+            right_j6 = -(right_roll - run_teleop._init_right_euler[0])
+            right_j7 = -(right_pitch - run_teleop._init_right_euler[1])
+            
+            # Wrap to [-π, π]
+            def wrap_angle(a):
+                return np.arctan2(np.sin(a), np.cos(a))
+            left_j5, left_j6, left_j7 = wrap_angle(left_j5), wrap_angle(left_j6), wrap_angle(left_j7)
+            right_j5, right_j6, right_j7 = wrap_angle(right_j5), wrap_angle(right_j6), wrap_angle(right_j7)
+            
+            # Debug print occasionally
+            if step_count % 60 == 0:
+                print(f"[WRIST] L: j5={np.degrees(left_j5):.1f} j6={np.degrees(left_j6):.1f} j7={np.degrees(left_j7):.1f} deg")
+                print(f"        R: j5={np.degrees(right_j5):.1f} j6={np.degrees(right_j6):.1f} j7={np.degrees(right_j7):.1f} deg")
+            
+            # Apply to joints 5, 6, 7
+            left_wrist_des = torch.tensor([[left_j5, left_j6, left_j7]], dtype=torch.float32, device=sim_device)
+            right_wrist_des = torch.tensor([[right_j5, right_j6, right_j7]], dtype=torch.float32, device=sim_device)
             
             # Apply joint position targets
-            robot.set_joint_position_target(left_joint_pos_des, joint_ids=left_arm_joint_ids)
-            robot.set_joint_position_target(right_joint_pos_des, joint_ids=right_arm_joint_ids)
+            robot.set_joint_position_target(left_pos_des, joint_ids=left_pos_joint_ids)
+            robot.set_joint_position_target(left_wrist_des, joint_ids=left_wrist_joint_ids)
+            robot.set_joint_position_target(right_pos_des, joint_ids=right_pos_joint_ids)
+            robot.set_joint_position_target(right_wrist_des, joint_ids=right_wrist_joint_ids)
             
             # Write the articulation data to simulation
             robot.write_data_to_sim()
