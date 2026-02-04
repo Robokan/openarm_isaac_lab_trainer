@@ -14,14 +14,13 @@
 
 """OpenArm-specific configuration for bimanual lift environment.
 
-Object types:
-- Index 0: Cube → Left hand picks up → left_pail
-- Index 1-5: Fruit → Right hand picks up → right_pail
+Simplified: right arm reaches a cube (train_lift style).
 """
 
 import math
 
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
+from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sensors import FrameTransformerCfg
@@ -38,7 +37,6 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from source.openarm.openarm.tasks.manager_based.openarm_manipulation.bimanual.lift.lift_env_cfg import (
     BimanualLiftEnvCfg,
-    MUG_ASSETS,
 )
 from source.openarm.openarm.tasks.manager_based.openarm_manipulation.bimanual.lift import mdp
 from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
@@ -61,7 +59,35 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
 
         # Set OpenArm bimanual as robot (factory USD includes Danny table)
         # Enable gravity for lift task (unlike reach where it's disabled)
-        self.scene.robot = OPEN_ARM_FACTORY_HIGH_PD_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        # Start with arms at default position (hanging down) - reward shaping guides arms up
+        # Set OpenArm bimanual as robot (factory USD includes Danny table)
+        # Start with right arm above the desk: shoulder back + elbow bent
+        self.scene.robot = OPEN_ARM_FACTORY_HIGH_PD_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/Robot",
+            init_state=ArticulationCfg.InitialStateCfg(
+                joint_pos={
+                    # Right arm raised pose
+                    "openarm_right_joint1": 0.0,   # shoulder pitch (backwards, within limits)
+                    "openarm_right_joint2": 1.0,  # shoulder outward to the sides
+                    "openarm_right_joint3": 0.0,  # shoulder twist
+                    "openarm_right_joint4": 1.6,  # elbow bent more
+                    "openarm_right_joint5": 0.0,
+                    "openarm_right_joint6": 0.0,
+                    "openarm_right_joint7": 0.0,
+                    # Left arm stays at default (all zeros)
+                    "openarm_left_joint1": 0.0,
+                    "openarm_left_joint2": 0.0,
+                    "openarm_left_joint3": 0.0,
+                    "openarm_left_joint4": 0.0,
+                    "openarm_left_joint5": 0.0,
+                    "openarm_left_joint6": 0.0,
+                    "openarm_left_joint7": 0.0,
+                    # Grippers open
+                    "openarm_left_finger_joint.*": 0.044,
+                    "openarm_right_finger_joint.*": 0.044,
+                },
+            ),
+        )
         self.scene.robot.spawn.rigid_props.disable_gravity = False
 
         # Left arm action
@@ -112,8 +138,8 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             close_command_expr={"openarm_right_finger_joint.*": 0.0},
         )
 
-        # Set the body name for the command (using left hand as reference)
-        self.commands.object_pose.body_name = "openarm_left_hand"
+        # Set the body name for the command (right hand, train_lift style)
+        self.commands.object_pose.body_name = "openarm_right_hand"
         self.commands.object_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
 
         # Left end-effector frame
@@ -146,21 +172,21 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             ],
         )
 
-        # Spawn a mug on the table
-        # Using single mug type for now - all mugs go to left hand/left pail
+        # Spawn a cube on the table (train_lift style)
         self.scene.object = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Object",
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=[0.35, 0, 0.3], rot=[1, 0, 0, 0]  # Above table surface (table at z=0.255)
+                pos=[0.3, 0.0, 0.36], rot=[1, 0, 0, 0]  # Centered above table
             ),
             spawn=UsdFileCfg(
-                usd_path=MUG_ASSETS[0],  # Use first mug for all environments
+                usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+                scale=(0.8, 0.8, 0.8),
                 rigid_props=RigidBodyPropertiesCfg(
                     solver_position_iteration_count=16,
-                    solver_velocity_iteration_count=8,
-                    max_angular_velocity=100.0,  # Reduced to prevent spinning out
-                    max_linear_velocity=10.0,    # Reduced to prevent shooting away
-                    max_depenetration_velocity=2.0,  # Balanced: prevents ejection but allows collision response
+                    solver_velocity_iteration_count=1,
+                    max_angular_velocity=1000.0,
+                    max_linear_velocity=1000.0,
+                    max_depenetration_velocity=5.0,
                     disable_gravity=False,
                 ),
                 collision_props=CollisionPropertiesCfg(
@@ -182,7 +208,7 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
 
 @configclass
 class OpenArmBimanualCubeLiftEnvCfg_PLAY(OpenArmBimanualCubeLiftEnvCfg):
-    """Play configuration with single environment and warehouse for visualization."""
+    """Play configuration with single environment for visualization."""
 
     def __post_init__(self):
         # Post init of parent
@@ -195,12 +221,4 @@ class OpenArmBimanualCubeLiftEnvCfg_PLAY(OpenArmBimanualCubeLiftEnvCfg):
         # Disable randomization for cleaner visualization
         self.observations.policy.enable_corruption = False
         
-        # Add warehouse environment for visualization (not used in headless training)
-        self.scene.warehouse = AssetBaseCfg(
-            prim_path="/World/Warehouse",
-            init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
-            spawn=UsdFileCfg(
-                usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
-                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-            ),
-        )
+        # Warehouse is now in base scene config (BimanualLiftSceneCfg)

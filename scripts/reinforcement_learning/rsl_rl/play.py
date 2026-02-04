@@ -267,8 +267,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if force_reset:
                 obs = env.get_observations()
                 print("[INFO] Environment reset!")
+            
+            # Debug: Print phase and distance to lift targets (every 50 steps to avoid spam)
+            if timestep % 50 == 0:
+                import sys
+                print(f"[DEBUG] Step {timestep}, headless={args_cli.headless}", flush=True)
+                unwrapped = env.unwrapped
+                # Get lift target distances and phase info
+                left_target = torch.tensor([0.0, 0.2, 0.355], device=unwrapped.device)
+                right_target = torch.tensor([0.0, -0.2, 0.355], device=unwrapped.device)
+                
+                try:
+                    left_ee = unwrapped.scene["left_ee_frame"].data.target_pos_w[:, 0, :]
+                    right_ee = unwrapped.scene["right_ee_frame"].data.target_pos_w[:, 0, :]
+                    
+                    left_dist = torch.norm(left_ee - left_target, dim=-1)[0].item()
+                    right_dist = torch.norm(right_ee - right_target, dim=-1)[0].item()
+                    
+                    # Check phase (one-way gate)
+                    if hasattr(unwrapped, '_arm_reached_lift_target'):
+                        left_phase2 = unwrapped._arm_reached_lift_target[0, 0].item()
+                        right_phase2 = unwrapped._arm_reached_lift_target[0, 1].item()
+                    else:
+                        left_phase2 = False
+                        right_phase2 = False
+                    
+                    phase = "PHASE 2 (reaching)" if (left_phase2 and right_phase2) else "PHASE 1 (lifting)"
+                    print(f"[DEBUG] {phase} | Left dist: {left_dist:.3f}m ({'✓' if left_phase2 else '○'}) | Right dist: {right_dist:.3f}m ({'✓' if right_phase2 else '○'})", flush=True)
+                except Exception as e:
+                    print(f"[DEBUG ERROR] {type(e).__name__}: {e}", flush=True)
+            
+            timestep += 1
             if args_cli.video:
-                timestep += 1
                 # Exit the play loop after recording one video
                 if timestep == args_cli.video_length:
                     break

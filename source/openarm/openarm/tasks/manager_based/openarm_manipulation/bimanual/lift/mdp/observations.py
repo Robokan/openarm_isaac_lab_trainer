@@ -164,3 +164,43 @@ def closest_arm_indicator(
     return object_type_indicator(env, object_cfg)
 
 
+# ===== Lift Target Observations (Phase 1) =====
+
+def left_ee_to_lift_target(
+    env: ManagerBasedRLEnv,
+    lift_target: tuple = (0.0, 0.2, 0.355),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("left_ee_frame"),
+) -> torch.Tensor:
+    """Vector from left end-effector to its lift target position.
+    
+    The lift target is the position where the arm should go before reaching for the object.
+    This is the Phase 1 target for the left arm.
+    
+    Returns: (num_envs, 3)
+    """
+    left_ee_frame: FrameTransformer = env.scene[left_ee_frame_cfg.name]
+    left_ee_pos_w = left_ee_frame.data.target_pos_w[:, 0, :]
+    
+    target = torch.tensor(lift_target, device=env.device)
+    
+    return target - left_ee_pos_w
+
+
+def right_ee_to_lift_target(
+    env: ManagerBasedRLEnv,
+    lift_target: tuple = (0.0, -0.2, 0.355),
+    right_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("right_ee_frame"),
+) -> torch.Tensor:
+    """Vector from right end-effector to its lift target position.
+    
+    The lift target is the position where the arm should go before reaching for the object.
+    This is the Phase 1 target for the right arm.
+    
+    Returns: (num_envs, 3)
+    """
+    right_ee_frame: FrameTransformer = env.scene[right_ee_frame_cfg.name]
+    right_ee_pos_w = right_ee_frame.data.target_pos_w[:, 0, :]
+    
+    target = torch.tensor(lift_target, device=env.device)
+    
+    return target - right_ee_pos_w

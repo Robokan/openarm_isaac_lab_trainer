@@ -14,9 +14,8 @@
 
 """Configuration for the bimanual lift environment.
 
-Objects (cube or fruit) are dropped randomly on the table:
-- Cube → Left hand picks up → Drop in left_square_pail
-- Fruit → Right hand picks up → Drop in right_square_pail
+Simplified: right arm reaches a cube (train_lift style).
+Scene assets (factory USD, table, pails) remain unchanged.
 """
 
 from dataclasses import MISSING
@@ -76,10 +75,7 @@ NUM_MUG_ASSETS = len(MUG_ASSETS)
 class BimanualLiftSceneCfg(InteractiveSceneCfg):
     """Configuration for the bimanual lift scene with robot, pails, and objects.
     
-    Objects spawn randomly (cube or fruit):
-    - Cube → Left hand picks up → Drop in left_square_pail
-    - Fruit → Right hand picks up → Drop in right_square_pail
-    
+    Simplified: right arm reaches a cube (train_lift style).
     Note: The factory USD already contains the "Danny" table (surface at z=0.255).
     """
 
@@ -97,7 +93,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     left_pail = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/LeftPail",
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=[0.3, 0.35, 0.0], rot=[1, 0, 0, 0]
+            pos=[0.3, 0.45, 0.0], rot=[1, 0, 0, 0]
         ),
         spawn=UsdFileCfg(
             usd_path="https://omniverse-content-staging.s3.us-west-2.amazonaws.com/Assets/simready_content/common_assets/props/squarepail_a01/squarepail_a01.usd",
@@ -108,7 +104,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     right_pail = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/RightPail",
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=[0.3, -0.35, 0.0], rot=[1, 0, 0, 0]
+            pos=[0.3, -0.45, 0.0], rot=[1, 0, 0, 0]
         ),
         spawn=UsdFileCfg(
             usd_path="https://omniverse-content-staging.s3.us-west-2.amazonaws.com/Assets/simready_content/common_assets/props/squarepail_a01/squarepail_a01.usd",
@@ -116,7 +112,16 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
     )
 
     # Note: Table "Danny" and lighting are part of the factory USD
-    # Note: Warehouse is only added in PLAY config (not needed for headless training)
+    
+    # Warehouse environment for visualization (visual-only, no collision)
+    warehouse = AssetBaseCfg(
+        prim_path="/World/Warehouse",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
+        spawn=UsdFileCfg(
+            usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        ),
+    )
     
     # Ground plane for physics (invisible, just for collisions)
     plane = AssetBaseCfg(
@@ -135,7 +140,7 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
 class CommandsCfg:
     """Command terms for the MDP.
     
-    The goal position for the lifted object - above the left pail for mugs.
+    The goal position for the lifted object (train_lift style).
     """
 
     object_pose = mdp.UniformPoseCommandCfg(
@@ -144,9 +149,9 @@ class CommandsCfg:
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.3, 0.3),    # Left pail x position
-            pos_y=(0.35, 0.35),  # Left pail y position
-            pos_z=(0.255, 0.255),  # At table height
+            pos_x=(0.2, 0.4),
+            pos_y=(-0.2, 0.2),
+            pos_z=(0.45, 0.6),
             roll=(0.0, 0.0),
             pitch=(0.0, 0.0),
             yaw=(0.0, 0.0),
@@ -174,44 +179,6 @@ class ObservationsCfg:
     @configclass
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
-
-        # Left arm joint state
-        left_joint_pos = ObsTerm(
-            func=mdp.joint_pos_rel,
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=[
-                    "openarm_left_joint1",
-                    "openarm_left_joint2",
-                    "openarm_left_joint3",
-                    "openarm_left_joint4",
-                    "openarm_left_joint5",
-                    "openarm_left_joint6",
-                    "openarm_left_joint7",
-                ])
-            },
-        )
-        
-        left_joint_vel = ObsTerm(
-            func=mdp.joint_vel_rel,
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=[
-                    "openarm_left_joint1",
-                    "openarm_left_joint2",
-                    "openarm_left_joint3",
-                    "openarm_left_joint4",
-                    "openarm_left_joint5",
-                    "openarm_left_joint6",
-                    "openarm_left_joint7",
-                ])
-            },
-        )
-        
-        left_gripper_pos = ObsTerm(
-            func=mdp.joint_pos_rel,
-            params={
-                "asset_cfg": SceneEntityCfg("robot", joint_names=["openarm_left_finger_joint.*"])
-            },
-        )
 
         # Right arm joint state
         right_joint_pos = ObsTerm(
@@ -253,20 +220,11 @@ class ObservationsCfg:
 
         # Object observations
         object_position = ObsTerm(func=mdp.object_position_in_robot_root_frame)
-        
-        left_ee_to_object = ObsTerm(func=mdp.left_ee_to_object_distance)
-        right_ee_to_object = ObsTerm(func=mdp.right_ee_to_object_distance)
-        
-        # Object type: 1=cube (left hand), 0=fruit (right hand)
-        object_type = ObsTerm(func=mdp.object_type_indicator)
-        
-        # Target pail position based on object type
-        target_pail = ObsTerm(func=mdp.target_pail_position)
+        target_object_position = ObsTerm(
+            func=mdp.generated_commands, params={"command_name": "object_pose"}
+        )
         
         # Previous actions
-        left_arm_actions = ObsTerm(
-            func=mdp.last_action, params={"action_name": "left_arm_action"}
-        )
         right_arm_actions = ObsTerm(
             func=mdp.last_action, params={"action_name": "right_arm_action"}
         )
@@ -284,26 +242,40 @@ class EventCfg:
     """Configuration for events."""
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
-
-    # Randomize object position and orientation on table (Danny table surface at z=0.255)
-    # Object spawns in front of robot, biased left or right so one arm is closer
-    # Random yaw rotation so mugs/fruit face different directions
+    
+    # Randomize robot joint positions on reset
+    # Using reset_joints_by_offset (not scale) because default positions are 0
+    # and 0 * scale = 0 (no randomization)
+    # Offset adds random values to default positions
+    reset_robot_joints = EventTerm(
+        func=mdp.reset_joints_by_offset,
+        mode="reset",
+        params={
+            "position_range": (-0.25, 0.25),  # Random offset in radians
+            "velocity_range": (0.0, 0.0),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    "openarm_right_joint.*",
+                    "openarm_right_finger_joint.*",
+                ],
+            ),
+        },
+    )
+    
+    # Randomize object position on table (wider range for larger table)
     reset_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.1, 0.1),   # Tighter range to keep mug on table
-                "y": (-0.15, 0.15), # Tighter range to keep mug on table
-                "z": (0.0, 0.0),    # No offset - use init_state z position (0.3)
-                "yaw": (-3.14159, 3.14159),  # Full 360° rotation around Z
-            },
-            "velocity_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
+                "x": (-0.2, 0.2),
+                "y": (-0.2, 0.2),
                 "z": (0.0, 0.0),
-            },  # Explicitly zero velocity
-            "asset_cfg": SceneEntityCfg("object"),  # No body_names - use root
+                "yaw": (0.0, 0.0),
+            },
+            "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0)},
+            "asset_cfg": SceneEntityCfg("object"),
         },
     )
 
@@ -312,72 +284,39 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP.
     
-    Object type determines correct arm:
-    - Cube → Left arm → left_pail
-    - Fruit → Right arm → right_pail
+    Train-lift style: reach, lift, then move toward goal.
     """
 
-    # Correct arm reaching toward object (based on object type)
+    # Right arm reaching toward object (tanh kernel, same as unimanual lift)
     reaching_object = RewTerm(
-        func=mdp.correct_arm_reaching_object,
-        params={"std": 0.1},
-        weight=1.5,
-    )
-    
-    # Fine-grained reaching reward
-    reaching_object_fine = RewTerm(
-        func=mdp.closest_arm_object_ee_distance,
-        params={"std": 0.05},
-        weight=0.5,
-    )
-    
-    # Penalize wrong arm for approaching
-    wrong_arm = RewTerm(
-        func=mdp.wrong_arm_penalty,
-        params={"std": 0.1},
-        weight=-0.5,
+        func=mdp.right_arm_object_distance_tanh,
+        params={"std": 0.2},
+        weight=3.0,
     )
 
-    # Lifting the object (table surface at z=0.255, so lifted = z > 0.32)
+    # Lifting the object relative to its spawn height
     lifting_object = RewTerm(
-        func=mdp.object_is_lifted,
-        params={"minimal_height": 0.32},
-        weight=15.0,
+        func=mdp.object_is_lifted_relative,
+        params={"min_delta": 0.015},
+        weight=30.0,
     )
 
-    # Moving object toward correct pail (once lifted)
-    object_to_pail = RewTerm(
-        func=mdp.object_to_correct_pail,
-        params={"std": 0.3, "minimal_height": 0.32},
+    # Moving object toward goal (unimanual lift style)
+    object_goal_tracking = RewTerm(
+        func=mdp.object_goal_distance_relative,
+        params={"std": 0.3, "min_delta": 0.015, "command_name": "object_pose"},
         weight=16.0,
     )
 
-    object_to_pail_fine = RewTerm(
-        func=mdp.object_to_correct_pail,
-        params={"std": 0.05, "minimal_height": 0.32},
+    object_goal_tracking_fine_grained = RewTerm(
+        func=mdp.object_goal_distance_relative,
+        params={"std": 0.05, "min_delta": 0.015, "command_name": "object_pose"},
         weight=5.0,
-    )
-    
-    # Big reward for successfully placing in correct pail
-    success = RewTerm(
-        func=mdp.object_in_correct_pail,
-        params={"threshold": 0.1},
-        weight=50.0,
     )
 
     # Action penalties
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
 
-    left_joint_vel = RewTerm(
-        func=mdp.joint_vel_l2,
-        weight=-1e-4,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[
-                "openarm_left_joint.*", "openarm_left_finger_joint.*"
-            ])
-        },
-    )
-    
     right_joint_vel = RewTerm(
         func=mdp.joint_vel_l2,
         weight=-1e-4,
@@ -395,27 +334,22 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Terminate if object falls off table (table at z=0.255, so fallen = z < 0.2)
+    # Terminate if object falls below minimum height (train_lift style)
     object_dropping = DoneTerm(
         func=mdp.root_height_below_minimum,
-        params={"minimum_height": 0.2, "asset_cfg": SceneEntityCfg("object")},
+        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object")},
     )
 
 
 @configclass
 class CurriculumCfg:
-    """Curriculum terms for the MDP."""
+    """Curriculum terms for the MDP (same as unimanual lift)."""
 
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000},
     )
 
-    left_joint_vel = CurrTerm(
-        func=mdp.modify_reward_weight,
-        params={"term_name": "left_joint_vel", "weight": -1e-1, "num_steps": 10000},
-    )
-    
     right_joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
         params={"term_name": "right_joint_vel", "weight": -1e-1, "num_steps": 10000},
@@ -449,7 +383,7 @@ class BimanualLiftEnvCfg(ManagerBasedRLEnvCfg):
         """Post initialization."""
         # General settings
         self.decimation = 2
-        self.episode_length_s = 8.0
+        self.episode_length_s = 5.0
         
         # Simulation settings
         self.sim.dt = 0.01  # 100Hz
@@ -457,5 +391,5 @@ class BimanualLiftEnvCfg(ManagerBasedRLEnvCfg):
 
         self.sim.physx.bounce_threshold_velocity = 0.01
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
-        self.sim.physx.gpu_total_aggregate_pairs_capacity = 64 * 1024  # Increased for bimanual robot + objects
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 128 * 1024  # Increased for bimanual robot + objects
         self.sim.physx.friction_correlation_distance = 0.00625

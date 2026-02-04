@@ -42,3 +42,16 @@ def is_mug_object(env: ManagerBasedEnv, num_mug_assets: int = 4) -> torch.Tensor
         Boolean tensor, always True (all mugs → use left hand).
     """
     return torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+
+def reset_lift_target_gate(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+) -> None:
+    """Reset the one-way gate tracking for velocity toward lift target.
+    
+    Called on episode reset to clear the "arm has reached lift target" flags
+    for the environments being reset.
+    """
+    if hasattr(env, '_arm_reached_lift_target'):
+        env._arm_reached_lift_target[env_ids] = False
