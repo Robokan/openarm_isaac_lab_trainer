@@ -40,6 +40,10 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--no-self-collisions", action="store_true", default=False, 
+    help="Disable self-collision detection for the robot (faster but less realistic)."
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -164,6 +168,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    # Disable self-collisions if requested
+    if args_cli.no_self_collisions:
+        if hasattr(env_cfg, 'scene') and hasattr(env_cfg.scene, 'robot'):
+            if hasattr(env_cfg.scene.robot, 'spawn') and hasattr(env_cfg.scene.robot.spawn, 'articulation_props'):
+                env_cfg.scene.robot.spawn.articulation_props.enabled_self_collisions = False
+                print("[INFO] Self-collisions disabled via --no-self-collisions flag")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)

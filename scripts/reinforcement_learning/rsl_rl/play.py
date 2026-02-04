@@ -43,6 +43,10 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--no-self-collisions", action="store_true", default=False,
+    help="Disable self-collision detection for the robot (faster but less realistic)."
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -128,6 +132,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
 
+    # Disable self-collisions if requested
+    if args_cli.no_self_collisions:
+        if hasattr(env_cfg, 'scene') and hasattr(env_cfg.scene, 'robot'):
+            if hasattr(env_cfg.scene.robot, 'spawn') and hasattr(env_cfg.scene.robot.spawn, 'articulation_props'):
+                env_cfg.scene.robot.spawn.articulation_props.enabled_self_collisions = False
+                print("[INFO] Self-collisions disabled via --no-self-collisions flag")
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -199,6 +210,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     keyboard = app_window.get_keyboard()
     reload_requested = [False]  # Use list to allow modification in callback
     reset_requested = [False]
+    toggle_markers_requested = [False]
+    markers_visible = [True]  # Track marker visibility state
     
     def on_keyboard_event(event, *args, **kwargs):
         if event.type == carb.input.KeyboardEventType.KEY_PRESS:
@@ -208,11 +221,39 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             elif event.input == carb.input.KeyboardInput.R:
                 reset_requested[0] = True
                 return True  # Consume event to prevent UI from handling it
+            elif event.input == carb.input.KeyboardInput.M:
+                toggle_markers_requested[0] = True
+                return True  # Consume event to prevent Isaac Sim UI from handling it
         return False
+    
+    def toggle_all_markers(env, visible: bool):
+        """Toggle visibility of all debug markers in the environment."""
+        unwrapped = env.unwrapped
+        
+        # Toggle command visualizers (e.g., object_pose target marker)
+        if hasattr(unwrapped, 'command_manager'):
+            for term_name, term in unwrapped.command_manager._terms.items():
+                if hasattr(term, 'cfg') and hasattr(term.cfg, 'debug_vis'):
+                    if hasattr(term, 'set_debug_vis'):
+                        term.set_debug_vis(visible)
+                    elif hasattr(term, '_debug_vis_handle'):
+                        term._debug_vis_handle.set_visibility(visible)
+        
+        # Toggle frame transformer visualizers (EE frames)
+        if hasattr(unwrapped, 'scene'):
+            for name in ['left_ee_frame', 'right_ee_frame', 'ee_frame']:
+                if name in unwrapped.scene._sensors:
+                    sensor = unwrapped.scene._sensors[name]
+                    if hasattr(sensor, 'set_debug_vis'):
+                        sensor.set_debug_vis(visible)
+                    elif hasattr(sensor, 'visualizer') and sensor.visualizer is not None:
+                        sensor.visualizer.set_visibility(visible)
+        
+        print(f"[INFO] Markers {'shown' if visible else 'hidden'}")
     
     # Subscribe to keyboard events (priority subscription to override UI)
     keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
-    print("[INFO] Press 'L' to reload checkpoint, 'R' to reset environment, close window to exit")
+    print("[INFO] Press 'L' to reload checkpoint, 'R' to reset environment, 'M' to toggle markers, close window to exit")
 
     # Background thread to monitor for window close (non-headless mode)
     # This allows graceful exit when the user closes the visualization window
@@ -246,6 +287,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print("\n[INFO] Reloading checkpoint...")
                 runner, policy = load_checkpoint(resume_path)
                 print("[INFO] Checkpoint reloaded successfully!")
+            
+            # Check for marker toggle request
+            if toggle_markers_requested[0]:
+                toggle_markers_requested[0] = False
+                markers_visible[0] = not markers_visible[0]
+                toggle_all_markers(env, markers_visible[0])
             
             # Check for environment reset request (set flag for next step)
             force_reset = reset_requested[0]

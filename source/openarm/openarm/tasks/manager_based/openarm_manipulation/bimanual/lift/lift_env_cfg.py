@@ -149,8 +149,8 @@ class CommandsCfg:
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
         ranges=mdp.UniformPoseCommandCfg.Ranges(
-            pos_x=(0.2, 0.4),
-            pos_y=(-0.2, 0.2),
+            pos_x=(0.1, 0.5),   # Match cube spawn range (0.3 + [-0.2, 0.2])
+            pos_y=(-0.2, 0.2),  # Match cube spawn range (0.0 + [-0.2, 0.2])
             pos_z=(0.45, 0.6),
             roll=(0.0, 0.0),
             pitch=(0.0, 0.0),
@@ -301,17 +301,18 @@ class RewardsCfg:
         weight=30.0,
     )
 
-    # Moving object toward goal (unimanual lift style)
+    # Moving object toward goal (increased weights to overcome bimanual penalties)
+    # Must exceed reaching+lifting (33.0) to incentivize movement
     object_goal_tracking = RewTerm(
         func=mdp.object_goal_distance_relative,
         params={"std": 0.3, "min_delta": 0.015, "command_name": "object_pose"},
-        weight=16.0,
+        weight=25.0,  # was 16.0
     )
 
     object_goal_tracking_fine_grained = RewTerm(
         func=mdp.object_goal_distance_relative,
         params={"std": 0.05, "min_delta": 0.015, "command_name": "object_pose"},
-        weight=5.0,
+        weight=10.0,  # was 5.0
     )
 
     # Action penalties
