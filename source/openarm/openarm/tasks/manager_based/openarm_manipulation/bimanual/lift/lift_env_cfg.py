@@ -283,22 +283,26 @@ class ObservationsCfg:
             },
         )
 
-        # Left cube observations
+        # Left cube observations (returns zeros when left arm inactive)
         left_object_position = ObsTerm(
-            func=mdp.object_position_in_robot_root_frame,
+            func=mdp.left_object_position_conditional,
             params={"object_cfg": SceneEntityCfg("object_left")},
         )
+        # Target position also zeros when left arm inactive
         target_left_object_position = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "left_object_pose"}
+            func=mdp.left_target_position_conditional,
+            params={"command_name": "left_object_pose"},
         )
 
-        # Right cube observations
+        # Right cube observations (returns zeros when right arm inactive)
         right_object_position = ObsTerm(
-            func=mdp.object_position_in_robot_root_frame,
+            func=mdp.right_object_position_conditional,
             params={"object_cfg": SceneEntityCfg("object_right")},
         )
+        # Target position also zeros when right arm inactive
         target_right_object_position = ObsTerm(
-            func=mdp.generated_commands, params={"command_name": "right_object_pose"}
+            func=mdp.right_target_position_conditional,
+            params={"command_name": "right_object_pose"},
         )
 
         # Object assignment flags (for future use - can make arm stand still if no object)
@@ -324,14 +328,33 @@ class ObservationsCfg:
 
 @configclass
 class EventCfg:
-    """Configuration for events."""
+    """Configuration for events.
+    
+    Event order matters! Events run in the order defined here.
+    For curriculum learning:
+    1. randomize_active_arms - sets which arms are active (FIRST)
+    2. reset_all, reset_robot_joints - standard resets
+    3. store_initial_joint_positions - capture initial poses for stay-at-pose reward
+    4. reset_left/right_object_position - randomize cube positions
+    5. hide_inactive_cubes - move inactive cubes out of scene (LAST)
+    """
 
+    # STEP 1: Curriculum Learning - decide which arms are active FIRST
+    # 45% left only, 45% right only, 10% both
+    randomize_active_arms = EventTerm(
+        func=mdp.randomize_active_arms,
+        mode="reset",
+        params={
+            "left_only_prob": 0.45,
+            "right_only_prob": 0.45,
+            "both_prob": 0.10,
+        },
+    )
+
+    # STEP 2: Standard scene reset
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
     
-    # Randomize robot joint positions on reset (both arms identically)
-    # Using reset_joints_by_offset (not scale) because default positions are 0
-    # and 0 * scale = 0 (no randomization)
-    # Offset adds random values to default positions
+    # STEP 3: Randomize robot joint positions on reset (both arms identically)
     reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
@@ -349,16 +372,27 @@ class EventCfg:
             ),
         },
     )
+
+    # STEP 4: Store initial joint positions for stay-at-pose reward (after joint randomization)
+    store_initial_positions = EventTerm(
+        func=mdp.store_initial_joint_positions,
+        mode="reset",
+    )
+
+    # Reset the one-way gate for lift target tracking
+    reset_lift_gate = EventTerm(
+        func=mdp.reset_lift_target_gate,
+        mode="reset",
+    )
     
-    # Randomize left cube position on left side of table (positive Y, closer to center)
-    # Init y=0.1, offset (-0.15, 0.15) → actual y = -0.05 to 0.25
+    # STEP 5: Randomize left cube position on left side of table
     reset_left_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
                 "x": (-0.15, 0.15),
-                "y": (-0.15, 0.15),  # Offset from init y=0.1 → actual y = -0.05 to 0.25
+                "y": (-0.15, 0.15),
                 "z": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
@@ -367,15 +401,14 @@ class EventCfg:
         },
     )
 
-    # Randomize right cube position on right side of table (negative Y, closer to center)
-    # Init y=-0.1, offset (-0.15, 0.15) → actual y = -0.25 to 0.05
+    # STEP 6: Randomize right cube position on right side of table
     reset_right_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
                 "x": (-0.15, 0.15),
-                "y": (-0.15, 0.15),  # Offset from init y=-0.1 → actual y = -0.25 to 0.05
+                "y": (-0.15, 0.15),
                 "z": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
@@ -384,71 +417,101 @@ class EventCfg:
         },
     )
 
+    # STEP 7: Hide inactive cubes (move below table) - MUST BE LAST
+    hide_inactive_cubes = EventTerm(
+        func=mdp.hide_inactive_cubes,
+        mode="reset",
+        params={
+            "hidden_position": (0.0, 0.0, -5.0),
+        },
+    )
+
 
 @configclass
 class RewardsCfg:
     """Reward terms for the MDP.
     
-    Bimanual lift: both arms reach, lift, and move their assigned cube to target.
-    Each arm has symmetric reward structure.
+    Bimanual lift with curriculum learning:
+    - 45% episodes: only left arm active (left cube on table, right cube hidden)
+    - 45% episodes: only right arm active (right cube on table, left cube hidden)
+    - 10% episodes: both arms active (standard bimanual task)
+    
+    Gated rewards only apply when the arm is active.
+    Stay-at-pose rewards encourage inactive arms to remain still.
     """
 
-    # === Left arm rewards ===
+    # === Left arm rewards (gated by active flag) ===
     
-    # Left arm reaching toward left object
+    # Left arm reaching toward left object (only when active)
     left_reaching_object = RewTerm(
-        func=mdp.left_arm_object_distance_tanh,
+        func=mdp.left_arm_object_distance_tanh_gated,
         params={"std": 0.2, "object_cfg": SceneEntityCfg("object_left")},
         weight=3.0,
     )
 
-    # Lifting the left object relative to its spawn height
+    # Lifting the left object (only when active)
     left_lifting_object = RewTerm(
-        func=mdp.object_is_lifted_relative,
+        func=mdp.left_object_is_lifted_relative_gated,
         params={"min_delta": 0.015, "object_cfg": SceneEntityCfg("object_left")},
         weight=30.0,
     )
 
-    # Moving left object toward left goal
+    # Moving left object toward left goal (only when active)
     left_goal_tracking = RewTerm(
-        func=mdp.object_goal_distance_relative,
+        func=mdp.left_object_goal_distance_relative_gated,
         params={"std": 0.3, "min_delta": 0.015, "command_name": "left_object_pose", "object_cfg": SceneEntityCfg("object_left")},
         weight=25.0,
     )
 
     left_goal_tracking_fine_grained = RewTerm(
-        func=mdp.object_goal_distance_relative,
+        func=mdp.left_object_goal_distance_relative_gated,
         params={"std": 0.05, "min_delta": 0.015, "command_name": "left_object_pose", "object_cfg": SceneEntityCfg("object_left")},
         weight=10.0,
     )
 
-    # === Right arm rewards ===
+    # Left arm penalty for drifting from default pose (only when INACTIVE)
+    # Uses default_joint_pos (home pose) - negative weight = penalty for distance
+    left_stay_at_pose = RewTerm(
+        func=mdp.left_arm_distance_from_default,
+        params={},
+        weight=-0.5,  # Gentle penalty for distance from default
+    )
 
-    # Right arm reaching toward right object
+    # === Right arm rewards (gated by active flag) ===
+
+    # Right arm reaching toward right object (only when active)
     right_reaching_object = RewTerm(
-        func=mdp.right_arm_object_distance_tanh,
+        func=mdp.right_arm_object_distance_tanh_gated,
         params={"std": 0.2, "object_cfg": SceneEntityCfg("object_right")},
         weight=3.0,
     )
 
-    # Lifting the right object relative to its spawn height
+    # Lifting the right object (only when active)
     right_lifting_object = RewTerm(
-        func=mdp.object_is_lifted_relative,
+        func=mdp.right_object_is_lifted_relative_gated,
         params={"min_delta": 0.015, "object_cfg": SceneEntityCfg("object_right")},
         weight=30.0,
     )
 
-    # Moving right object toward right goal
+    # Moving right object toward right goal (only when active)
     right_goal_tracking = RewTerm(
-        func=mdp.object_goal_distance_relative,
+        func=mdp.right_object_goal_distance_relative_gated,
         params={"std": 0.3, "min_delta": 0.015, "command_name": "right_object_pose", "object_cfg": SceneEntityCfg("object_right")},
         weight=25.0,
     )
 
     right_goal_tracking_fine_grained = RewTerm(
-        func=mdp.object_goal_distance_relative,
+        func=mdp.right_object_goal_distance_relative_gated,
         params={"std": 0.05, "min_delta": 0.015, "command_name": "right_object_pose", "object_cfg": SceneEntityCfg("object_right")},
         weight=10.0,
+    )
+
+    # Right arm penalty for drifting from default pose (only when INACTIVE)
+    # Uses default_joint_pos (home pose) - negative weight = penalty for distance
+    right_stay_at_pose = RewTerm(
+        func=mdp.right_arm_distance_from_default,
+        params={},
+        weight=-0.5,  # Gentle penalty for distance from default
     )
 
     # === Action penalties (both arms) ===
@@ -478,20 +541,24 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    """Termination terms for the MDP."""
+    """Termination terms for the MDP.
+    
+    Uses gated terminations for curriculum learning - only terminate if
+    an ACTIVE arm's cube drops. Inactive cubes are intentionally hidden.
+    """
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Terminate if left object falls below minimum height
+    # Terminate if left object falls below minimum height (only when left arm active)
     left_object_dropping = DoneTerm(
-        func=mdp.root_height_below_minimum,
-        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object_left")},
+        func=mdp.left_object_dropped_gated,
+        params={"minimum_height": -0.05, "object_cfg": SceneEntityCfg("object_left")},
     )
 
-    # Terminate if right object falls below minimum height
+    # Terminate if right object falls below minimum height (only when right arm active)
     right_object_dropping = DoneTerm(
-        func=mdp.root_height_below_minimum,
-        params={"minimum_height": -0.05, "asset_cfg": SceneEntityCfg("object_right")},
+        func=mdp.right_object_dropped_gated,
+        params={"minimum_height": -0.05, "object_cfg": SceneEntityCfg("object_right")},
     )
 
 
@@ -504,17 +571,17 @@ class CurriculumCfg:
 
     action_rate = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "action_rate", "weight": -1e-1, "num_steps": 10000},
+        params={"term_name": "action_rate", "weight": -1e-2, "num_steps": 50000},
     )
 
     left_joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "left_joint_vel", "weight": -1e-1, "num_steps": 10000},
+        params={"term_name": "left_joint_vel", "weight": -1e-2, "num_steps": 50000},
     )
 
     right_joint_vel = CurrTerm(
         func=mdp.modify_reward_weight,
-        params={"term_name": "right_joint_vel", "weight": -1e-1, "num_steps": 10000},
+        params={"term_name": "right_joint_vel", "weight": -1e-2, "num_steps": 50000},
     )
 
 

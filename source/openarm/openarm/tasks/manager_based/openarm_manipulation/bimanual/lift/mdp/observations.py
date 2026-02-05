@@ -213,13 +213,14 @@ def left_arm_has_object(
 ) -> torch.Tensor:
     """Returns 1.0 if the left arm has an assigned object to pick up.
     
-    Currently always returns 1.0 since both arms always have cubes.
-    This observation is a placeholder for future scenarios where
-    an arm might not have an object assigned (e.g., single cube tasks).
+    Uses the _arm_active flag set by randomize_active_arms event.
+    When left arm is inactive (flag=0), the policy should keep it still.
     
     Returns: (num_envs, 1)
     """
-    return torch.ones(env.num_envs, 1, device=env.device)
+    from .events import get_arm_active_flags
+    left_active, _ = get_arm_active_flags(env)
+    return left_active.float().unsqueeze(-1)
 
 
 def right_arm_has_object(
@@ -227,10 +228,99 @@ def right_arm_has_object(
 ) -> torch.Tensor:
     """Returns 1.0 if the right arm has an assigned object to pick up.
     
-    Currently always returns 1.0 since both arms always have cubes.
-    This observation is a placeholder for future scenarios where
-    an arm might not have an object assigned (e.g., single cube tasks).
+    Uses the _arm_active flag set by randomize_active_arms event.
+    When right arm is inactive (flag=0), the policy should keep it still.
     
     Returns: (num_envs, 1)
     """
-    return torch.ones(env.num_envs, 1, device=env.device)
+    from .events import get_arm_active_flags
+    _, right_active = get_arm_active_flags(env)
+    return right_active.float().unsqueeze(-1)
+
+
+# ===== Conditional Object Position Observations =====
+
+def left_object_position_conditional(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+) -> torch.Tensor:
+    """Position of left object, returns zeros when left arm is inactive.
+    
+    When left arm is inactive, the cube is moved far away and we return
+    zeros to avoid confusing the policy with invalid positions.
+    
+    Returns: (num_envs, 3)
+    """
+    from .events import get_arm_active_flags
+    left_active, _ = get_arm_active_flags(env)
+    
+    # Get actual object position
+    real_pos = object_position_in_robot_root_frame(env, robot_cfg, object_cfg)
+    
+    # Return zeros for inactive arms
+    return torch.where(left_active.unsqueeze(-1), real_pos, torch.zeros_like(real_pos))
+
+
+def right_object_position_conditional(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
+) -> torch.Tensor:
+    """Position of right object, returns zeros when right arm is inactive.
+    
+    When right arm is inactive, the cube is moved far away and we return
+    zeros to avoid confusing the policy with invalid positions.
+    
+    Returns: (num_envs, 3)
+    """
+    from .events import get_arm_active_flags
+    _, right_active = get_arm_active_flags(env)
+    
+    # Get actual object position
+    real_pos = object_position_in_robot_root_frame(env, robot_cfg, object_cfg)
+    
+    # Return zeros for inactive arms
+    return torch.where(right_active.unsqueeze(-1), real_pos, torch.zeros_like(real_pos))
+
+
+# ===== Conditional Target Position Observations =====
+
+def left_target_position_conditional(
+    env: ManagerBasedRLEnv,
+    command_name: str = "left_object_pose",
+) -> torch.Tensor:
+    """Target position for left arm, returns zeros when left arm is inactive.
+    
+    Prevents the policy from seeing a valid target when the arm should stay still.
+    
+    Returns: (num_envs, 6) - position (3) + orientation (3)
+    """
+    from .events import get_arm_active_flags
+    left_active, _ = get_arm_active_flags(env)
+    
+    # Get the command (target pose)
+    command = env.command_manager.get_command(command_name)
+    
+    # Return zeros for inactive arms
+    return torch.where(left_active.unsqueeze(-1), command, torch.zeros_like(command))
+
+
+def right_target_position_conditional(
+    env: ManagerBasedRLEnv,
+    command_name: str = "right_object_pose",
+) -> torch.Tensor:
+    """Target position for right arm, returns zeros when right arm is inactive.
+    
+    Prevents the policy from seeing a valid target when the arm should stay still.
+    
+    Returns: (num_envs, 6) - position (3) + orientation (3)
+    """
+    from .events import get_arm_active_flags
+    _, right_active = get_arm_active_flags(env)
+    
+    # Get the command (target pose)
+    command = env.command_manager.get_command(command_name)
+    
+    # Return zeros for inactive arms
+    return torch.where(right_active.unsqueeze(-1), command, torch.zeros_like(command))

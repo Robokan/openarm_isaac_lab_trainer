@@ -412,60 +412,108 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     vla_task_text = "pick up cubes"
     
     if args_cli.create_vla_training_data:
-        import h5py
         import numpy as np
+        from PIL import Image
+        
+        # Try to import LeRobot for native format support
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            HAS_LEROBOT = True
+            print("[VLA] LeRobot found - will save in native LeRobot v3.0 format")
+        except ImportError:
+            HAS_LEROBOT = False
+            print("[VLA] LeRobot not found - will save in LeRobot-compatible format")
+            print("[VLA] Install LeRobot to enable native format: pip install lerobot")
         
         vla_output_dir = args_cli.create_vla_training_data
         os.makedirs(vla_output_dir, exist_ok=True)
+        
+        # Get robot info for feature definitions
+        unwrapped = env.unwrapped
+        robot = unwrapped.scene["robot"]
+        num_joints = robot.data.joint_pos.shape[1]
+        fps = int(1.0 / dt) if dt > 0 else 50
         
         print(f"[VLA] Pi 0.5 training data capture enabled.")
         print(f"[VLA] Output directory: {vla_output_dir}")
         print(f"[VLA] Task text: '{vla_task_text}'")
         print(f"[VLA] Will capture up to {args_cli.vla_max_episodes} episodes.")
-        print(f"[VLA] Cameras: ego_cam, left_wrist_cam, right_wrist_cam")
+        print(f"[VLA] Robot joints: {num_joints}, FPS: {fps}")
+        print(f"[VLA] Cameras: observation.images.ego, observation.images.left_wrist, observation.images.right_wrist")
         
-        # Initialize camera access (cameras exist in USD file)
-        unwrapped = env.unwrapped
-        print("[VLA] Cameras will be accessed via Isaac Sim camera API (Ego, LeftArm, RightArm)")
+        if HAS_LEROBOT:
+            # Create LeRobot dataset with proper feature definitions
+            vla_dataset = LeRobotDataset.create(
+                repo_id=f"local/{os.path.basename(vla_output_dir)}",
+                root=vla_output_dir,
+                robot_type="openarm_bimanual",
+                fps=fps,
+                features={
+                    "observation.state": {
+                        "dtype": "float32",
+                        "shape": (num_joints,),
+                        "names": None,
+                    },
+                    "action": {
+                        "dtype": "float32",
+                        "shape": (num_joints,),
+                        "names": None,
+                    },
+                    "observation.images.ego": {
+                        "dtype": "video",
+                        "shape": (3, 480, 640),  # Will be determined from actual images
+                        "names": ["channel", "height", "width"],
+                    },
+                    "observation.images.left_wrist": {
+                        "dtype": "video",
+                        "shape": (3, 480, 640),
+                        "names": ["channel", "height", "width"],
+                    },
+                    "observation.images.right_wrist": {
+                        "dtype": "video",
+                        "shape": (3, 480, 640),
+                        "names": ["channel", "height", "width"],
+                    },
+                },
+            )
+            vla_data = {"dataset": vla_dataset, "episode_count": 0}
+        else:
+            # Fallback: Save in a format that can be converted later
+            vla_data = {
+                "metadata": {
+                    "task": args_cli.task,
+                    "task_text": vla_task_text,
+                    "checkpoint": resume_path,
+                    "dt": dt,
+                    "fps": fps,
+                    "num_envs": env_cfg.scene.num_envs,
+                    "robot_type": "openarm_bimanual",
+                    "num_joints": num_joints,
+                    "cameras": ["ego", "left_wrist", "right_wrist"],
+                },
+                "episode_count": 0,
+            }
+            # Save metadata
+            with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
+                json.dump(vla_data["metadata"], f, indent=2)
+            
+            # Create directories for episode data
+            os.makedirs(os.path.join(vla_output_dir, "episodes"), exist_ok=True)
         
-        vla_data = {
-            "metadata": {
-                "task": args_cli.task,
-                "task_text": vla_task_text,
-                "checkpoint": resume_path,
-                "dt": dt,
-                "fps": int(1.0 / dt) if dt > 0 else 50,
-                "num_envs": env_cfg.scene.num_envs,
-                "robot_type": "openarm_bimanual",
-                "cameras": ["ego_cam", "left_wrist_cam", "right_wrist_cam"],
-            },
-            "episode_count": 0,
-        }
-        
-        # Save metadata
-        with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
-            json.dump(vla_data["metadata"], f, indent=2)
-        
-        # Initialize current episode data with cube starting positions
-        import numpy as np
+        # Initialize current episode frame buffer
+        # Capture initial conditions for this episode
         robot = unwrapped.scene["robot"]
         vla_current_episode = {
-            "left_cube_start_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
-            "right_cube_start_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
-            "left_cube_start_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
-            "right_cube_start_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
-            "robot_start_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
-            "robot_start_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
-            "observations": {
-                "qpos": [],  # Joint positions
-                "qvel": [],  # Joint velocities
-                "images": {
-                    "ego_cam": [],
-                    "left_wrist_cam": [],
-                    "right_wrist_cam": [],
-                },
+            "frames": [],  # List of frame dicts for LeRobot
+            # Initial conditions for replay
+            "initial_conditions": {
+                "left_cube_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
+                "right_cube_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
+                "left_cube_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
+                "right_cube_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
+                "robot_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
+                "robot_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
             },
-            "actions": [],
         }
         vla_prev_episode_lengths = unwrapped.episode_length_buf.clone()
     
@@ -535,53 +583,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # VLA: Capture observations and actions for Pi 0.5 training
             if vla_data is not None and vla_current_episode is not None:
                 import numpy as np
+                from PIL import Image
                 unwrapped = env.unwrapped
                 
-                # Get current joint positions and velocities
+                # Get current joint positions (state)
                 robot = unwrapped.scene["robot"]
-                joint_pos = robot.data.joint_pos[0].cpu().numpy()
-                joint_vel = robot.data.joint_vel[0].cpu().numpy()
+                joint_pos = robot.data.joint_pos[0].cpu().numpy().astype(np.float32)
+                action_np = actions[0].cpu().numpy().astype(np.float32)
                 
-                # Store proprioceptive state
-                vla_current_episode["observations"]["qpos"].append(joint_pos.copy())
-                vla_current_episode["observations"]["qvel"].append(joint_vel.copy())
-                
-                # Store actions
-                vla_current_episode["actions"].append(actions[0].cpu().numpy().copy())
+                # Build frame dict for LeRobot format
+                frame = {
+                    "observation.state": joint_pos.copy(),
+                    "action": action_np.copy(),
+                }
                 
                 # Capture camera images via Isaac Sim camera API
                 try:
                     from omni.isaac.sensor import Camera
-                    import omni.isaac.core.utils.prims as prim_utils
                     
-                    # Camera name mapping: internal name -> USD camera name
+                    # Camera name mapping: LeRobot name -> USD camera name
                     camera_mapping = {
-                        "ego_cam": "Ego",
-                        "left_wrist_cam": "LeftArm",
-                        "right_wrist_cam": "RightArm",
+                        "observation.images.ego": "Ego",
+                        "observation.images.left_wrist": "LeftArm",
+                        "observation.images.right_wrist": "RightArm",
                     }
                     
-                    for internal_name, usd_cam_name in camera_mapping.items():
+                    for lerobot_name, usd_cam_name in camera_mapping.items():
                         try:
-                            # Get camera prim path for env 0
                             cam_prim_path = f"/World/envs/env_0/Robot/{usd_cam_name}"
-                            
-                            # Get camera and capture frame
                             camera = Camera(prim_path=cam_prim_path)
                             camera.initialize()
                             img = camera.get_rgba()
                             
                             if img is not None:
-                                # Convert to (C, H, W) format for LeRobot compatibility
-                                img = img[:, :, :3]  # Remove alpha
-                                img = np.transpose(img, (2, 0, 1))  # (H, W, C) -> (C, H, W)
-                                vla_current_episode["observations"]["images"][internal_name].append(img.astype(np.uint8))
+                                # Convert to PIL Image for LeRobot (expects PIL or path)
+                                img_rgb = img[:, :, :3].astype(np.uint8)
+                                frame[lerobot_name] = Image.fromarray(img_rgb)
                         except Exception as cam_err:
-                            if len(vla_current_episode["observations"]["qpos"]) == 1:
+                            if len(vla_current_episode["frames"]) == 0:
                                 print(f"[VLA] Camera {usd_cam_name} error: {cam_err}")
                 except Exception as e:
-                    if len(vla_current_episode["observations"]["qpos"]) == 1:
+                    if len(vla_current_episode["frames"]) == 0:
                         print(f"[VLA] Camera capture error: {e}")
+                
+                # Add frame to current episode buffer
+                vla_current_episode["frames"].append(frame)
             
             # env stepping (outside inference mode to allow reset)
             obs, _, _, _ = env.step(actions)
@@ -595,67 +641,80 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 reset_mask = current_episode_lengths < vla_prev_episode_lengths
                 
                 if reset_mask[0].item():  # Episode 0 reset
-                    # Save completed episode as HDF5 file (LeRobot/Aloha compatible format)
-                    num_steps = len(vla_current_episode["observations"]["qpos"])
+                    # Save completed episode
+                    num_steps = len(vla_current_episode["frames"])
                     if num_steps > 0:
-                        import h5py
-                        ep_path = os.path.join(vla_output_dir, f"episode_{vla_episode_count}.hdf5")
-                        
-                        with h5py.File(ep_path, "w") as f:
-                            # Store initial cube positions
-                            f.create_dataset("left_cube_start_pos", data=vla_current_episode["left_cube_start_pos"])
-                            f.create_dataset("right_cube_start_pos", data=vla_current_episode["right_cube_start_pos"])
-                            f.create_dataset("left_cube_start_quat", data=vla_current_episode["left_cube_start_quat"])
-                            f.create_dataset("right_cube_start_quat", data=vla_current_episode["right_cube_start_quat"])
+                        if "dataset" in vla_data:
+                            # LeRobot native format
+                            dataset = vla_data["dataset"]
+                            for frame in vla_current_episode["frames"]:
+                                dataset.add_frame(frame)
+                            dataset.save_episode(task=vla_task_text)
+                        else:
+                            # Fallback format: save as individual parquet + images
+                            import pandas as pd
+                            ep_dir = os.path.join(vla_output_dir, "episodes", f"episode_{vla_episode_count}")
+                            os.makedirs(ep_dir, exist_ok=True)
                             
-                            # Store initial robot joint positions
-                            f.create_dataset("robot_start_qpos", data=vla_current_episode["robot_start_qpos"])
-                            f.create_dataset("robot_start_qvel", data=vla_current_episode["robot_start_qvel"])
+                            # Extract tabular data
+                            states = np.array([f["observation.state"] for f in vla_current_episode["frames"]])
+                            actions = np.array([f["action"] for f in vla_current_episode["frames"]])
+                            timestamps = np.arange(num_steps) / fps
                             
-                            # Store observations
-                            obs_grp = f.create_group("observations")
-                            obs_grp.create_dataset("qpos", data=np.array(vla_current_episode["observations"]["qpos"]))
-                            obs_grp.create_dataset("qvel", data=np.array(vla_current_episode["observations"]["qvel"]))
+                            # Save tabular data as parquet
+                            df = pd.DataFrame({
+                                "timestamp": timestamps,
+                                "task": [vla_task_text] * num_steps,
+                            })
+                            # Add state columns
+                            for i in range(states.shape[1]):
+                                df[f"observation.state.{i}"] = states[:, i]
+                            # Add action columns
+                            for i in range(actions.shape[1]):
+                                df[f"action.{i}"] = actions[:, i]
                             
-                            # Store camera images
-                            img_grp = obs_grp.create_group("images")
-                            for cam_name, images in vla_current_episode["observations"]["images"].items():
-                                if len(images) > 0:
-                                    img_grp.create_dataset(cam_name, data=np.array(images), compression="gzip")
+                            df.to_parquet(os.path.join(ep_dir, "data.parquet"))
                             
-                            # Store actions
-                            f.create_dataset("action", data=np.array(vla_current_episode["actions"]))
+                            # Save images as video frames (MP4) or individual files
+                            for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                                cam_name = cam_key.split(".")[-1]
+                                cam_dir = os.path.join(ep_dir, cam_name)
+                                os.makedirs(cam_dir, exist_ok=True)
+                                
+                                for idx, frame in enumerate(vla_current_episode["frames"]):
+                                    if cam_key in frame and frame[cam_key] is not None:
+                                        img = frame[cam_key]
+                                        img.save(os.path.join(cam_dir, f"frame_{idx:06d}.png"))
                             
-                            # Store metadata
-                            f.attrs["task"] = vla_task_text
-                            f.attrs["num_steps"] = num_steps
+                            # Save initial conditions for replay
+                            if "initial_conditions" in vla_current_episode:
+                                init_cond = vla_current_episode["initial_conditions"]
+                                init_cond_serializable = {
+                                    k: v.tolist() for k, v in init_cond.items()
+                                }
+                                with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
+                                    json.dump(init_cond_serializable, f, indent=2)
                         
                         vla_episode_count += 1
-                        print(f"[VLA] Episode {vla_episode_count} saved: {ep_path} ({num_steps} steps)")
+                        print(f"[VLA] Episode {vla_episode_count} saved ({num_steps} steps)")
                         
                         # Check if we've captured enough episodes
                         if vla_episode_count >= args_cli.vla_max_episodes:
                             print(f"[VLA] Captured {vla_episode_count} episodes. Stopping...")
                             break
                     
-                    # Start new episode with cube starting positions
+                    # Start new episode with initial conditions
+                    robot = unwrapped.scene["robot"]
                     vla_current_episode = {
-                        "left_cube_start_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
-                        "right_cube_start_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
-                        "left_cube_start_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
-                        "right_cube_start_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
-                        "robot_start_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
-                        "robot_start_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
-                        "observations": {
-                            "qpos": [],
-                            "qvel": [],
-                            "images": {
-                                "ego_cam": [],
-                                "left_wrist_cam": [],
-                                "right_wrist_cam": [],
-                            },
+                        "frames": [],
+                        "initial_conditions": {
+                            "left_cube_pos": unwrapped.scene["object_left"].data.root_pos_w[0].cpu().numpy().copy(),
+                            "right_cube_pos": unwrapped.scene["object_right"].data.root_pos_w[0].cpu().numpy().copy(),
+                            "left_cube_quat": unwrapped.scene["object_left"].data.root_quat_w[0].cpu().numpy().copy(),
+                            "right_cube_quat": unwrapped.scene["object_right"].data.root_quat_w[0].cpu().numpy().copy(),
+                            "robot_qpos": robot.data.joint_pos[0].cpu().numpy().copy(),
+                            "robot_qvel": robot.data.joint_vel[0].cpu().numpy().copy(),
                         },
-                        "actions": [],
                     }
                 
                 vla_prev_episode_lengths = current_episode_lengths.clone()
@@ -713,53 +772,73 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Save VLA training data if capturing
         if vla_data is not None and vla_output_dir is not None:
             import numpy as np
-            import h5py
             
             # Save any in-progress episode
-            num_steps = len(vla_current_episode["observations"]["qpos"]) if vla_current_episode else 0
+            num_steps = len(vla_current_episode.get("frames", [])) if vla_current_episode else 0
             if num_steps > 0:
-                ep_path = os.path.join(vla_output_dir, f"episode_{vla_episode_count}.hdf5")
-                
-                with h5py.File(ep_path, "w") as f:
-                    # Store initial cube positions
-                    f.create_dataset("left_cube_start_pos", data=vla_current_episode["left_cube_start_pos"])
-                    f.create_dataset("right_cube_start_pos", data=vla_current_episode["right_cube_start_pos"])
-                    f.create_dataset("left_cube_start_quat", data=vla_current_episode["left_cube_start_quat"])
-                    f.create_dataset("right_cube_start_quat", data=vla_current_episode["right_cube_start_quat"])
+                if "dataset" in vla_data:
+                    # LeRobot native format
+                    dataset = vla_data["dataset"]
+                    for frame in vla_current_episode["frames"]:
+                        dataset.add_frame(frame)
+                    dataset.save_episode(task=vla_task_text)
+                    vla_episode_count += 1
+                    print(f"[VLA] Final episode saved ({num_steps} steps)")
+                else:
+                    # Fallback format
+                    import pandas as pd
+                    ep_dir = os.path.join(vla_output_dir, "episodes", f"episode_{vla_episode_count}")
+                    os.makedirs(ep_dir, exist_ok=True)
                     
-                    # Store initial robot joint positions
-                    f.create_dataset("robot_start_qpos", data=vla_current_episode["robot_start_qpos"])
-                    f.create_dataset("robot_start_qvel", data=vla_current_episode["robot_start_qvel"])
+                    states = np.array([f["observation.state"] for f in vla_current_episode["frames"]])
+                    actions = np.array([f["action"] for f in vla_current_episode["frames"]])
+                    timestamps = np.arange(num_steps) / fps
                     
-                    # Store observations
-                    obs_grp = f.create_group("observations")
-                    obs_grp.create_dataset("qpos", data=np.array(vla_current_episode["observations"]["qpos"]))
-                    obs_grp.create_dataset("qvel", data=np.array(vla_current_episode["observations"]["qvel"]))
+                    df = pd.DataFrame({"timestamp": timestamps, "task": [vla_task_text] * num_steps})
+                    for i in range(states.shape[1]):
+                        df[f"observation.state.{i}"] = states[:, i]
+                    for i in range(actions.shape[1]):
+                        df[f"action.{i}"] = actions[:, i]
+                    df.to_parquet(os.path.join(ep_dir, "data.parquet"))
                     
-                    # Store camera images
-                    img_grp = obs_grp.create_group("images")
-                    for cam_name, images in vla_current_episode["observations"]["images"].items():
-                        if len(images) > 0:
-                            img_grp.create_dataset(cam_name, data=np.array(images), compression="gzip")
+                    for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                        cam_name = cam_key.split(".")[-1]
+                        cam_dir = os.path.join(ep_dir, cam_name)
+                        os.makedirs(cam_dir, exist_ok=True)
+                        for idx, frame in enumerate(vla_current_episode["frames"]):
+                            if cam_key in frame and frame[cam_key] is not None:
+                                frame[cam_key].save(os.path.join(cam_dir, f"frame_{idx:06d}.png"))
                     
-                    # Store actions
-                    f.create_dataset("action", data=np.array(vla_current_episode["actions"]))
+                    # Save initial conditions for replay
+                    if "initial_conditions" in vla_current_episode:
+                        init_cond = vla_current_episode["initial_conditions"]
+                        init_cond_serializable = {
+                            k: v.tolist() for k, v in init_cond.items()
+                        }
+                        with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
+                            json.dump(init_cond_serializable, f, indent=2)
                     
-                    # Store metadata
-                    f.attrs["task"] = vla_task_text
-                    f.attrs["num_steps"] = num_steps
-                
-                vla_episode_count += 1
-                print(f"[VLA] Final episode saved: {ep_path} ({num_steps} steps)")
+                    vla_episode_count += 1
+                    print(f"[VLA] Final episode saved ({num_steps} steps)")
             
-            # Update metadata with final episode count
-            if vla_episode_count > 0:
-                vla_data["metadata"]["total_episodes"] = vla_episode_count
-                with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
-                    json.dump(vla_data["metadata"], f, indent=2)
-                print(f"[VLA] Saved {vla_episode_count} episodes to {vla_output_dir}/")
+            # Finalize dataset
+            if "dataset" in vla_data:
+                dataset = vla_data["dataset"]
+                dataset.finalize()
+                print(f"[VLA] LeRobot dataset finalized: {vla_episode_count} episodes")
+                print(f"[VLA] Dataset location: {vla_output_dir}")
+                print(f"[VLA] To train Pi 0.5, run:")
+                print(f"      lerobot-train --dataset.repo_id=local/{os.path.basename(vla_output_dir)} --policy.type=pi05")
             else:
-                print("[VLA] No episodes captured.")
+                # Update metadata for fallback format
+                if vla_episode_count > 0:
+                    vla_data["metadata"]["total_episodes"] = vla_episode_count
+                    with open(os.path.join(vla_output_dir, "metadata.json"), "w") as f:
+                        json.dump(vla_data["metadata"], f, indent=2)
+                    print(f"[VLA] Saved {vla_episode_count} episodes to {vla_output_dir}/")
+                    print(f"[VLA] Note: Install LeRobot for native format support")
+                else:
+                    print("[VLA] No episodes captured.")
         
         # Signal monitor thread to stop
         stop_requested.set()

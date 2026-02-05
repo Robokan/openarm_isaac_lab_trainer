@@ -586,7 +586,251 @@ def at_lift_target(
     return both_at_target.float()
 
 
+# ===== Curriculum Learning: Gated Rewards =====
+
+def _get_arm_active_flags(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
+    """Get active flags for both arms from the curriculum system."""
+    from .events import get_arm_active_flags
+    return get_arm_active_flags(env)
+
+
+def left_arm_object_distance_tanh_gated(
+    env: ManagerBasedRLEnv,
+    std: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+    left_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("left_ee_frame"),
+) -> torch.Tensor:
+    """Tanh-kernel reward for left arm reaching its object - only when active.
+    
+    Returns 0 when left arm is inactive (curriculum learning).
+    """
+    left_active, _ = _get_arm_active_flags(env)
+    
+    # Get base reward
+    reward = left_arm_object_distance_tanh(env, std, object_cfg, left_ee_frame_cfg)
+    
+    # Gate by active flag
+    return reward * left_active.float()
+
+
+def right_arm_object_distance_tanh_gated(
+    env: ManagerBasedRLEnv,
+    std: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
+    right_ee_frame_cfg: SceneEntityCfg = SceneEntityCfg("right_ee_frame"),
+) -> torch.Tensor:
+    """Tanh-kernel reward for right arm reaching its object - only when active.
+    
+    Returns 0 when right arm is inactive (curriculum learning).
+    """
+    _, right_active = _get_arm_active_flags(env)
+    
+    # Get base reward
+    reward = right_arm_object_distance_tanh(env, std, object_cfg, right_ee_frame_cfg)
+    
+    # Gate by active flag
+    return reward * right_active.float()
+
+
+def left_object_is_lifted_relative_gated(
+    env: ManagerBasedRLEnv,
+    min_delta: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+) -> torch.Tensor:
+    """Reward when left object is lifted - only when left arm active."""
+    left_active, _ = _get_arm_active_flags(env)
+    
+    reward = object_is_lifted_relative(env, min_delta, object_cfg)
+    return reward * left_active.float()
+
+
+def right_object_is_lifted_relative_gated(
+    env: ManagerBasedRLEnv,
+    min_delta: float,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
+) -> torch.Tensor:
+    """Reward when right object is lifted - only when right arm active."""
+    _, right_active = _get_arm_active_flags(env)
+    
+    reward = object_is_lifted_relative(env, min_delta, object_cfg)
+    return reward * right_active.float()
+
+
+def left_object_goal_distance_relative_gated(
+    env: ManagerBasedRLEnv,
+    std: float,
+    min_delta: float,
+    command_name: str,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+) -> torch.Tensor:
+    """Goal tracking for left object - only when left arm active."""
+    left_active, _ = _get_arm_active_flags(env)
+    
+    reward = object_goal_distance_relative(env, std, min_delta, command_name, robot_cfg, object_cfg)
+    return reward * left_active.float()
+
+
+def right_object_goal_distance_relative_gated(
+    env: ManagerBasedRLEnv,
+    std: float,
+    min_delta: float,
+    command_name: str,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
+) -> torch.Tensor:
+    """Goal tracking for right object - only when right arm active."""
+    _, right_active = _get_arm_active_flags(env)
+    
+    reward = object_goal_distance_relative(env, std, min_delta, command_name, robot_cfg, object_cfg)
+    return reward * right_active.float()
+
+
+# ===== Stay-at-Pose Rewards for Inactive Arms =====
+
+def left_arm_distance_from_default(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Distance penalty for left arm when inactive.
+    
+    Returns the L2 distance from default pose when arm is INACTIVE.
+    Returns 0 when arm is ACTIVE (no penalty for active arm).
+    
+    Use with NEGATIVE weight to penalize drifting from default pose.
+    """
+    left_active, _ = _get_arm_active_flags(env)
+    
+    robot = env.scene["robot"]
+    
+    # Get left arm joint indices
+    left_joint_names = [
+        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
+        "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6", 
+        "openarm_left_joint7"
+    ]
+    left_joint_ids = [robot.find_joints(name)[0][0] for name in left_joint_names]
+    
+    # Current positions
+    current_pos = robot.data.joint_pos[:, left_joint_ids]
+    
+    # Default positions from robot config (typically zeros)
+    default_pos = robot.data.default_joint_pos[:, left_joint_ids]
+    
+    # Distance from default pose
+    dist = torch.norm(current_pos - default_pos, dim=-1)
+    
+    # Only apply penalty when arm is INACTIVE
+    return dist * (~left_active).float()
+
+
+# Keep old name for backwards compatibility
+def left_arm_stay_at_default_pose(
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """Deprecated: Use left_arm_distance_from_default with negative weight."""
+    return left_arm_distance_from_default(env)
+
+
+def left_arm_stay_at_initial_pose(
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """Deprecated: Use left_arm_distance_from_default with negative weight."""
+    return left_arm_distance_from_default(env)
+
+
+def right_arm_distance_from_default(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Distance penalty for right arm when inactive.
+    
+    Returns the L2 distance from default pose when arm is INACTIVE.
+    Returns 0 when arm is ACTIVE (no penalty for active arm).
+    
+    Use with NEGATIVE weight to penalize drifting from default pose.
+    """
+    _, right_active = _get_arm_active_flags(env)
+    
+    robot = env.scene["robot"]
+    
+    # Get right arm joint indices
+    right_joint_names = [
+        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
+        "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
+        "openarm_right_joint7"
+    ]
+    right_joint_ids = [robot.find_joints(name)[0][0] for name in right_joint_names]
+    
+    # Current positions
+    current_pos = robot.data.joint_pos[:, right_joint_ids]
+    
+    # Default positions from robot config (typically zeros)
+    default_pos = robot.data.default_joint_pos[:, right_joint_ids]
+    
+    # Distance from default pose
+    dist = torch.norm(current_pos - default_pos, dim=-1)
+    
+    # Only apply penalty when arm is INACTIVE
+    return dist * (~right_active).float()
+
+
+# Keep old name for backwards compatibility
+def right_arm_stay_at_default_pose(
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """Deprecated: Use right_arm_distance_from_default with negative weight."""
+    return right_arm_distance_from_default(env)
+
+
+def right_arm_stay_at_initial_pose(
+    env: ManagerBasedRLEnv,
+    std: float = 0.1,
+) -> torch.Tensor:
+    """Deprecated: Use right_arm_distance_from_default with negative weight."""
+    return right_arm_distance_from_default(env)
+
+
 # ===== Termination Functions =====
+
+def left_object_dropped_gated(
+    env: ManagerBasedRLEnv,
+    minimum_height: float = -0.05,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_left"),
+) -> torch.Tensor:
+    """Terminate if left object drops below minimum height - only when left arm is active.
+    
+    If left arm is inactive, the cube is intentionally moved below the table,
+    so we don't want to terminate for that.
+    """
+    left_active, _ = _get_arm_active_flags(env)
+    
+    object: RigidObject = env.scene[object_cfg.name]
+    is_below = object.data.root_pos_w[:, 2] < minimum_height
+    
+    # Only terminate if arm is active AND cube dropped
+    return is_below & left_active
+
+
+def right_object_dropped_gated(
+    env: ManagerBasedRLEnv,
+    minimum_height: float = -0.05,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object_right"),
+) -> torch.Tensor:
+    """Terminate if right object drops below minimum height - only when right arm is active.
+    
+    If right arm is inactive, the cube is intentionally moved below the table,
+    so we don't want to terminate for that.
+    """
+    _, right_active = _get_arm_active_flags(env)
+    
+    object: RigidObject = env.scene[object_cfg.name]
+    is_below = object.data.root_pos_w[:, 2] < minimum_height
+    
+    # Only terminate if arm is active AND cube dropped
+    return is_below & right_active
+
 
 def phase2_not_reached_timeout(
     env: ManagerBasedRLEnv,

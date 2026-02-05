@@ -14,10 +14,9 @@
 
 """Script to verify and playback VLA training data captured for Pi 0.5.
 
-This script reads the HDF5 episode files created by --create-vla-training-data
-and can either:
+This script reads VLA training data (LeRobot v3.0 format or legacy HDF5) and can:
 1. Display camera images and stats (--verify mode, no simulation required)
-2. Replay joint positions in simulation (--replay mode)
+2. Replay actions in simulation (--replay mode)
 
 Usage:
     # Verify data (show images and stats, no simulation):
@@ -32,8 +31,143 @@ import os
 import sys
 
 
+def detect_format(data_dir: str) -> str:
+    """Detect the dataset format (lerobot, lerobot_fallback, or hdf5)."""
+    # Check for LeRobot native format (meta/info.json)
+    if os.path.exists(os.path.join(data_dir, "meta", "info.json")):
+        return "lerobot"
+    # Check for fallback format (episodes/ directory with parquet files)
+    if os.path.exists(os.path.join(data_dir, "episodes")):
+        return "lerobot_fallback"
+    # Check for legacy HDF5 format
+    hdf5_files = [f for f in os.listdir(data_dir) if f.endswith(".hdf5")]
+    if hdf5_files:
+        return "hdf5"
+    return "unknown"
+
+
 def verify_data(data_dir: str, episode_idx: int = None):
     """Verify VLA training data by displaying images and stats."""
+    format_type = detect_format(data_dir)
+    print(f"[INFO] Detected format: {format_type}")
+    
+    if format_type == "lerobot":
+        verify_lerobot_data(data_dir, episode_idx)
+        return
+    elif format_type == "lerobot_fallback":
+        verify_lerobot_fallback_data(data_dir, episode_idx)
+        return
+    elif format_type == "hdf5":
+        verify_hdf5_data(data_dir, episode_idx)
+        return
+    else:
+        print(f"[ERROR] Unknown data format in {data_dir}")
+        return
+
+
+def verify_lerobot_data(data_dir: str, episode_idx: int = None):
+    """Verify LeRobot v3.0 native format data."""
+    import json
+    
+    # Load LeRobot metadata
+    info_path = os.path.join(data_dir, "meta", "info.json")
+    with open(info_path, "r") as f:
+        info = json.load(f)
+    
+    print(f"[INFO] LeRobot Dataset:")
+    print(f"  Robot type: {info.get('robot_type', 'N/A')}")
+    print(f"  FPS: {info.get('fps', 'N/A')}")
+    print(f"  Features: {list(info.get('features', {}).keys())}")
+    
+    # Load tasks
+    tasks_path = os.path.join(data_dir, "meta", "tasks.jsonl")
+    if os.path.exists(tasks_path):
+        with open(tasks_path, "r") as f:
+            tasks = [json.loads(line) for line in f]
+        print(f"  Tasks: {[t.get('task', 'N/A') for t in tasks]}")
+    
+    # Try to use LeRobot to load and inspect
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        dataset = LeRobotDataset(repo_id=f"local/{os.path.basename(data_dir)}", root=os.path.dirname(data_dir))
+        print(f"  Total frames: {len(dataset)}")
+        print(f"  Episodes: {dataset.meta.total_episodes}")
+        
+        # Show sample
+        if len(dataset) > 0:
+            sample = dataset[0]
+            print(f"\n[INFO] Sample frame keys: {list(sample.keys())}")
+            for key, value in sample.items():
+                if hasattr(value, 'shape'):
+                    print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
+                else:
+                    print(f"  {key}: {type(value).__name__}")
+    except Exception as e:
+        print(f"[WARNING] Could not load with LeRobot API: {e}")
+        print("[INFO] Install LeRobot for full dataset inspection: pip install lerobot")
+
+
+def verify_lerobot_fallback_data(data_dir: str, episode_idx: int = None):
+    """Verify LeRobot fallback format (parquet + images)."""
+    import json
+    import numpy as np
+    
+    # Load metadata
+    metadata_path = os.path.join(data_dir, "metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        print(f"[INFO] Dataset metadata:")
+        print(f"  Task: {metadata.get('task_text', 'N/A')}")
+        print(f"  Robot: {metadata.get('robot_type', 'N/A')}")
+        print(f"  FPS: {metadata.get('fps', 'N/A')}")
+        print(f"  Joints: {metadata.get('num_joints', 'N/A')}")
+    
+    # Find episodes
+    episodes_dir = os.path.join(data_dir, "episodes")
+    episode_dirs = sorted([d for d in os.listdir(episodes_dir) if d.startswith("episode_")])
+    print(f"[INFO] Found {len(episode_dirs)} episodes")
+    
+    if episode_idx is not None:
+        episode_dirs = [episode_dirs[episode_idx]]
+    
+    try:
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        has_plt = True
+    except ImportError:
+        has_plt = False
+    
+    for ep_dir in episode_dirs[:3]:  # Show first 3
+        ep_path = os.path.join(episodes_dir, ep_dir)
+        parquet_path = os.path.join(ep_path, "data.parquet")
+        
+        if os.path.exists(parquet_path):
+            import pandas as pd
+            df = pd.read_parquet(parquet_path)
+            print(f"\n[INFO] {ep_dir}:")
+            print(f"  Frames: {len(df)}")
+            print(f"  Columns: {list(df.columns)[:10]}...")
+            
+            # Show images if available
+            for cam_name in ["ego", "left_wrist", "right_wrist"]:
+                cam_dir = os.path.join(ep_path, cam_name)
+                if os.path.exists(cam_dir):
+                    frames = sorted(os.listdir(cam_dir))
+                    print(f"  {cam_name}: {len(frames)} frames")
+                    
+                    if has_plt and len(frames) > 0:
+                        from PIL import Image
+                        img = Image.open(os.path.join(cam_dir, frames[0]))
+                        plt.figure(figsize=(6, 6))
+                        plt.imshow(img)
+                        plt.title(f"{ep_dir} - {cam_name} (frame 0)")
+                        plt.axis('off')
+                        plt.show()
+
+
+def verify_hdf5_data(data_dir: str, episode_idx: int = None):
+    """Verify legacy HDF5 format data."""
     import h5py
     import json
     import numpy as np
@@ -140,10 +274,230 @@ def verify_data(data_dir: str, episode_idx: int = None):
 
 def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False):
     """Replay VLA training data in simulation."""
+    # Detect format
+    format_type = detect_format(data_dir)
+    print(f"[INFO] Detected format: {format_type}")
+    
+    if format_type == "lerobot":
+        print("[INFO] LeRobot native format detected.")
+        print("[INFO] For LeRobot datasets, use the built-in visualization:")
+        print(f"       python -m lerobot.scripts.visualize_dataset --repo-id local/{os.path.basename(data_dir)}")
+        print("[INFO] Or to replay in Isaac Sim, convert using the fallback format.")
+        return
+    elif format_type == "lerobot_fallback":
+        replay_lerobot_fallback_data(data_dir, episode_idx, loop, real_time)
+        return
+    elif format_type == "hdf5":
+        replay_hdf5_data(data_dir, episode_idx, loop, real_time)
+        return
+    else:
+        print(f"[ERROR] Unknown data format in {data_dir}")
+        return
+
+
+def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False):
+    """Replay LeRobot fallback format data in simulation."""
     # Delayed imports for simulation
     from isaaclab.app import AppLauncher
     
-    # Create a minimal arg namespace for AppLauncher
+    class Args:
+        headless = False
+        enable_cameras = False
+        device = "cuda:0"
+    
+    app_launcher = AppLauncher(Args())
+    simulation_app = app_launcher.app
+    
+    import gymnasium as gym
+    import json
+    import numpy as np
+    import pandas as pd
+    import signal
+    import threading
+    import time
+    import torch
+    
+    import isaaclab_tasks  # noqa: F401
+    import openarm.tasks  # noqa: F401
+    
+    # Load metadata
+    metadata_path = os.path.join(data_dir, "metadata.json")
+    with open(metadata_path, "r") as f:
+        metadata = json.load(f)
+    
+    task_name = metadata.get("task", "Isaac-Lift-Cube-OpenArm-Bi-Play-v0")
+    if "-Play" not in task_name:
+        task_name = task_name.replace("-v0", "-Play-v0")
+    
+    fps = metadata.get("fps", 50)
+    dt = 1.0 / fps
+    
+    print(f"[INFO] Task: {task_name}")
+    print(f"[INFO] FPS: {fps}, dt: {dt}")
+    
+    # Find episode directories
+    episodes_dir = os.path.join(data_dir, "episodes")
+    episode_dirs = sorted([d for d in os.listdir(episodes_dir) if d.startswith("episode_")])
+    
+    if episode_idx is not None:
+        episode_dirs = [episode_dirs[episode_idx]]
+    
+    # Create environment
+    env = gym.make(task_name)
+    unwrapped = env.unwrapped
+    
+    # Keyboard controls
+    import carb.input
+    import omni.appwindow
+    
+    input_interface = carb.input.acquire_input_interface()
+    app_window = omni.appwindow.get_default_app_window()
+    keyboard = app_window.get_keyboard()
+    
+    stop_playback = [False]
+    skip_episode = [False]
+    pause_playback = [False]
+    
+    def on_keyboard_event(event, *args, **kwargs):
+        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+            if event.input == carb.input.KeyboardInput.Q:
+                stop_playback[0] = True
+                return True
+            elif event.input == carb.input.KeyboardInput.N:
+                skip_episode[0] = True
+                return True
+            elif event.input == carb.input.KeyboardInput.SPACE:
+                pause_playback[0] = not pause_playback[0]
+                print(f"[INFO] {'Paused' if pause_playback[0] else 'Resumed'}")
+                return True
+        return False
+    
+    keyboard_sub = input_interface.subscribe_to_keyboard_events(keyboard, on_keyboard_event)
+    print("[INFO] Controls: Q=quit, N=next episode, SPACE=pause/resume")
+    
+    stop_requested = threading.Event()
+    
+    def monitor_app():
+        while not stop_requested.is_set():
+            if not simulation_app.is_running():
+                os.kill(os.getpid(), signal.SIGINT)
+                break
+            time.sleep(0.5)
+    
+    monitor_thread = threading.Thread(target=monitor_app, daemon=True)
+    monitor_thread.start()
+    
+    try:
+        while True:
+            for ep_dir_name in episode_dirs:
+                if stop_playback[0]:
+                    break
+                
+                ep_path = os.path.join(episodes_dir, ep_dir_name)
+                parquet_path = os.path.join(ep_path, "data.parquet")
+                
+                if not os.path.exists(parquet_path):
+                    print(f"[WARNING] No data.parquet in {ep_dir_name}, skipping")
+                    continue
+                
+                df = pd.read_parquet(parquet_path)
+                
+                # Extract actions from columns
+                action_cols = sorted([c for c in df.columns if c.startswith("action.")])
+                actions = df[action_cols].values
+                
+                # Load initial conditions if available
+                init_cond_path = os.path.join(ep_path, "initial_conditions.json")
+                init_cond = None
+                if os.path.exists(init_cond_path):
+                    with open(init_cond_path, "r") as f:
+                        init_cond = json.load(f)
+                
+                print(f"\n[INFO] Playing: {ep_dir_name} ({len(actions)} steps)")
+                
+                # Reset environment
+                obs, _ = env.reset()
+                skip_episode[0] = False
+                
+                # Apply initial conditions if available
+                if init_cond is not None:
+                    num_envs = unwrapped.num_envs
+                    device = unwrapped.device
+                    
+                    # Set cube positions
+                    if "left_cube_pos" in init_cond and "right_cube_pos" in init_cond:
+                        left_obj = unwrapped.scene["object_left"]
+                        right_obj = unwrapped.scene["object_right"]
+                        
+                        left_pos = torch.tensor(init_cond["left_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        left_quat = torch.tensor(init_cond.get("left_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        right_pos = torch.tensor(init_cond["right_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        right_quat = torch.tensor(init_cond.get("right_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        
+                        left_obj.write_root_pose_to_sim(torch.cat([left_pos, left_quat], dim=-1))
+                        right_obj.write_root_pose_to_sim(torch.cat([right_pos, right_quat], dim=-1))
+                        
+                        zeros_vel = torch.zeros((num_envs, 6), device=device, dtype=torch.float32)
+                        left_obj.write_root_velocity_to_sim(zeros_vel)
+                        right_obj.write_root_velocity_to_sim(zeros_vel)
+                        print("  [INFO] Cube positions set")
+                    
+                    # Set robot positions
+                    if "robot_qpos" in init_cond:
+                        robot = unwrapped.scene["robot"]
+                        qpos = torch.tensor(init_cond["robot_qpos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        qvel = torch.tensor(init_cond.get("robot_qvel", [0] * len(init_cond["robot_qpos"])), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        robot.write_joint_state_to_sim(qpos, qvel)
+                        print("  [INFO] Robot positions set")
+                
+                for step_idx, action in enumerate(actions):
+                    if stop_playback[0] or skip_episode[0]:
+                        break
+                    
+                    while pause_playback[0] and simulation_app.is_running():
+                        time.sleep(0.1)
+                    
+                    if not simulation_app.is_running():
+                        break
+                    
+                    start_time = time.time()
+                    
+                    action_tensor = torch.tensor(
+                        [action] * unwrapped.num_envs,
+                        device=unwrapped.device,
+                        dtype=torch.float32
+                    )
+                    
+                    obs, _, _, _, _ = env.step(action_tensor)
+                    
+                    if step_idx % 50 == 0:
+                        print(f"  Step {step_idx}/{len(actions)}", end="\r")
+                    
+                    if real_time:
+                        sleep_time = dt - (time.time() - start_time)
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                
+                print(f"  {ep_dir_name} complete.          ")
+            
+            if not loop or stop_playback[0]:
+                break
+            print("\n[INFO] Looping...")
+    
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted.")
+    finally:
+        stop_requested.set()
+        input_interface.unsubscribe_to_keyboard_events(keyboard, keyboard_sub)
+        env.close()
+        simulation_app.close()
+
+
+def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False):
+    """Replay legacy HDF5 format data in simulation."""
+    # Delayed imports for simulation
+    from isaaclab.app import AppLauncher
+    
     class Args:
         headless = False
         enable_cameras = False
