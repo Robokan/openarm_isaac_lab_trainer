@@ -33,15 +33,18 @@ if [[ -z "$CHECKPOINT_ARG" ]]; then
         LATEST_MODEL=$(ls -t "${LATEST_DIR}"model_*.pt 2>/dev/null | head -1)
         if [[ -n "$LATEST_MODEL" ]]; then
             # Convert to container path
-            CONTAINER_PATH="${LATEST_MODEL/${REPO_ROOT}/\/workspace\/openarm_isaac_lab}"
+            CONTAINER_PATH="${LATEST_MODEL/${REPO_ROOT}/\/workspace\/sparkpack\/openarm_isaac_lab_trainer}"
             echo "Using latest checkpoint: ${CONTAINER_PATH}"
             EXTRA_ARGS="--checkpoint ${CONTAINER_PATH}"
         fi
     fi
 fi
 
+# Ensure openarm package is installed
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
+
 echo "Playing: ${TASK}"
 echo "Args: $@ ${EXTRA_ARGS}"
 echo ""
 
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/openarm_isaac_lab && /workspace/isaaclab/isaaclab.sh -p ./scripts/reinforcement_learning/rsl_rl/play.py --task ${TASK} $* ${EXTRA_ARGS}"
+docker exec ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/reinforcement_learning/rsl_rl/play.py --task ${TASK} $* ${EXTRA_ARGS}"

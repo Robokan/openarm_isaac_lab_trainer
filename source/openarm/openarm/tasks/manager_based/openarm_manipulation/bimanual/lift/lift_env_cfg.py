@@ -207,9 +207,9 @@ class ObservationsCfg:
         Both arms observe their joint states, their assigned cube, and their target.
         """
 
-        # Left arm joint state
+        # Left arm joint state (joints 1, 2, 7 mirrored to match right arm convention)
         left_joint_pos = ObsTerm(
-            func=mdp.joint_pos_rel,
+            func=mdp.left_joint_pos_rel_mirrored,
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=[
                     "openarm_left_joint1",
@@ -224,7 +224,7 @@ class ObservationsCfg:
         )
         
         left_joint_vel = ObsTerm(
-            func=mdp.joint_vel_rel,
+            func=mdp.left_joint_vel_rel_mirrored,
             params={
                 "asset_cfg": SceneEntityCfg("robot", joint_names=[
                     "openarm_left_joint1",
@@ -340,7 +340,6 @@ class EventCfg:
     """
 
     # STEP 1: Curriculum Learning - decide which arms are active FIRST
-    # 45% left only, 45% right only, 10% both
     randomize_active_arms = EventTerm(
         func=mdp.randomize_active_arms,
         mode="reset",
@@ -385,14 +384,14 @@ class EventCfg:
         mode="reset",
     )
     
-    # STEP 5: Randomize left cube position on left side of table
+    # STEP 5: Randomize left cube position anywhere on table
     reset_left_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.15, 0.15),
-                "y": (-0.15, 0.15),
+                "x": (-0.10, 0.20),  # Reduced X range to keep cubes closer
+                "y": (-0.25, 0.25),  # Full table width - can spawn on either side
                 "z": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },
@@ -401,14 +400,14 @@ class EventCfg:
         },
     )
 
-    # STEP 6: Randomize right cube position on right side of table
+    # STEP 6: Randomize right cube position anywhere on table
     reset_right_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
             "pose_range": {
-                "x": (-0.15, 0.15),
-                "y": (-0.15, 0.15),
+                "x": (-0.10, 0.15),  # Reduced X range to keep cubes closer
+                "y": (-0.25, 0.25),  # Full table width - can spawn on either side
                 "z": (0.0, 0.0),
                 "yaw": (0.0, 0.0),
             },

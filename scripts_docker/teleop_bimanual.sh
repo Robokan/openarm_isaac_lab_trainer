@@ -32,7 +32,7 @@ done
 
 if [[ -z "$CHECKPOINT" ]]; then
     # Try to find the latest bimanual checkpoint
-    LATEST=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/openarm_isaac_lab/logs/rsl_rl -name 'model_*.pt' 2>/dev/null | grep -E '(bimanual|bi_reach|openarm_bi)' | sort -V | tail -1" 2>/dev/null)
+    LATEST=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/sparkpack/openarm_isaac_lab_trainer/logs/rsl_rl -name 'model_*.pt' 2>/dev/null | grep -E '(bimanual|bi_reach|openarm_bi)' | sort -V | tail -1" 2>/dev/null)
     
     if [[ -n "$LATEST" ]]; then
         echo "Using latest bimanual checkpoint: $LATEST"
@@ -69,8 +69,11 @@ echo ""
 echo "Starting..."
 echo ""
 
+# Ensure openarm package is installed
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
+
 # Install dependencies (pygame for gamepad, openvr for Vive)
 docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/isaaclab.sh -p -m pip install pygame openvr 2>/dev/null || true"
 
 # Run teleoperation script
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/openarm_isaac_lab && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 ${EXTRA_ARGS} $*"
+docker exec ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 ${EXTRA_ARGS} $*"

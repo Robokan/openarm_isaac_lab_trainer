@@ -4,13 +4,14 @@ set -e
 # OpenArm Isaac Lab Container Launcher
 # Starts the Isaac Lab container with X11 forwarding for GUI support
 
-IMAGE="nvcr.io/nvidia/isaac-lab:2.3.0"
+IMAGE="openarm-isaac-lab:latest"
 CONTAINER_NAME="isaac-lab"
 DISPLAY_NUM="${DISPLAY:-:1}"
 
-# Get repo root (parent of scripts_docker)
+# Get repo root and sparkpack root (parent of repo)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+SPARKPACK_ROOT="$(dirname "$REPO_ROOT")"
 
 # Check if container already exists
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -58,15 +59,14 @@ docker run --name ${CONTAINER_NAME} -d --gpus all \
    -v ~/docker/isaac-sim/logs:/root/.nvidia-omniverse/logs:rw \
    -v ~/docker/isaac-sim/data:/root/.local/share/ov/data:rw \
    -v ~/docker/isaac-sim/documents:/root/Documents:rw \
-   -v "${REPO_ROOT}":/workspace/openarm_isaac_lab:rw \
+   -v "${SPARKPACK_ROOT}":/workspace/sparkpack:rw \
    --entrypoint bash \
    ${IMAGE} \
    -c "tail -f /dev/null"
 
-echo "Container started. Installing OpenArm package..."
-
-# Install OpenArm package
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/openarm_isaac_lab && /workspace/isaaclab/isaaclab.sh -p -m pip install -e source/openarm" 2>&1 | tail -5
+# Install OpenArm package (editable) so training/play scripts can import it
+echo "Installing OpenArm package..."
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm" 2>&1 | tail -1
 
 echo ""
 echo "=========================================="

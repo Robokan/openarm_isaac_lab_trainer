@@ -64,17 +64,17 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             prim_path="{ENV_REGEX_NS}/Robot",
             init_state=ArticulationCfg.InitialStateCfg(
                 joint_pos={
-                    # Left arm raised pose (mirrored from right)
-                    "openarm_left_joint1": 0.0,    # shoulder pitch
-                    "openarm_left_joint2": -1.0,   # shoulder outward (mirrored direction)
+                    # Left arm raised pose (joints 1,2,7 have opposite conventions)
+                    "openarm_left_joint1": -0.0,   # shoulder pitch (negated)
+                    "openarm_left_joint2": -0.5,   # shoulder outward (negated)
                     "openarm_left_joint3": 0.0,    # shoulder twist
                     "openarm_left_joint4": 1.6,    # elbow bent
                     "openarm_left_joint5": 0.0,
                     "openarm_left_joint6": 0.0,
-                    "openarm_left_joint7": 0.0,
+                    "openarm_left_joint7": -0.0,   # wrist (negated)
                     # Right arm raised pose
                     "openarm_right_joint1": 0.0,   # shoulder pitch
-                    "openarm_right_joint2": 1.0,   # shoulder outward
+                    "openarm_right_joint2": 0.5,   # shoulder outward
                     "openarm_right_joint3": 0.0,   # shoulder twist
                     "openarm_right_joint4": 1.6,   # elbow bent
                     "openarm_right_joint5": 0.0,
@@ -89,6 +89,11 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
         self.scene.robot.spawn.rigid_props.disable_gravity = False
 
         # Left arm action
+        # The left arm is the right arm rotated 180° around Z. Joints with
+        # different localRot0 or asymmetric limits need negated scale so that
+        # the same policy action produces the same physical motion on both arms.
+        # Joints 1, 2, 7: different frames/limits in USD → negate
+        # Joints 3, 4, 5, 6: identical frames/limits → no negation
         self.actions.left_arm_action = mdp.JointPositionActionCfg(
             asset_name="robot",
             joint_names=[
@@ -100,7 +105,15 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
                 "openarm_left_joint6",
                 "openarm_left_joint7",
             ],
-            scale=0.5,
+            scale={
+                "openarm_left_joint1": -1.57,  # Different localRot0 & limits
+                "openarm_left_joint2": -1.57,  # Different localRot0 & limits
+                "openarm_left_joint3": 1.57,
+                "openarm_left_joint4": 1.57,
+                "openarm_left_joint5": 1.57,
+                "openarm_left_joint6": 1.57,
+                "openarm_left_joint7": -1.57,  # Different localRot0
+            },
             use_default_offset=True,
         )
 
@@ -116,7 +129,7 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
                 "openarm_right_joint6",
                 "openarm_right_joint7",
             ],
-            scale=0.5,
+            scale=1.57,
             use_default_offset=True,
         )
 
@@ -143,15 +156,18 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
         self.commands.right_object_pose.ranges.pitch = (math.pi / 2, math.pi / 2)
 
         # Left end-effector frame
+        # Use the ee_tcp link directly — its position is defined correctly
+        # in the USD for both arms, avoiding local frame orientation issues
+        # (left hand localRot0 is identity, right is 180° Z rotated)
         self.scene.left_ee_frame = FrameTransformerCfg(
             prim_path="{ENV_REGEX_NS}/Robot/openarm_body_link",
             debug_vis=False,
             target_frames=[
                 FrameTransformerCfg.FrameCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/openarm_left_hand",
+                    prim_path="{ENV_REGEX_NS}/Robot/openarm_left_ee_tcp",
                     name="left_ee",
                     offset=OffsetCfg(
-                        pos=[0.0, 0.0, 0.1],
+                        pos=[0.0, 0.0, 0.0],
                     ),
                 ),
             ],
@@ -163,20 +179,20 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             debug_vis=False,
             target_frames=[
                 FrameTransformerCfg.FrameCfg(
-                    prim_path="{ENV_REGEX_NS}/Robot/openarm_right_hand",
+                    prim_path="{ENV_REGEX_NS}/Robot/openarm_right_ee_tcp",
                     name="right_ee",
                     offset=OffsetCfg(
-                        pos=[0.0, 0.0, 0.1],
+                        pos=[0.0, 0.0, 0.0],
                     ),
                 ),
             ],
         )
 
-        # Spawn left cube on left side of table (positive Y) - BLUE
+        # Spawn left cube anywhere on table - BLUE
         self.scene.object_left = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/ObjectLeft",
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=[0.3, 0.1, 0.36], rot=[1, 0, 0, 0]  # Left side of table, closer to center
+                pos=[0.3, 0.0, 0.36], rot=[1, 0, 0, 0]  # Center of table, randomized from here
             ),
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
@@ -201,11 +217,11 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
             ),
         )
 
-        # Spawn right cube on right side of table (negative Y) - RED
+        # Spawn right cube anywhere on table - RED
         self.scene.object_right = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/ObjectRight",
             init_state=RigidObjectCfg.InitialStateCfg(
-                pos=[0.3, -0.1, 0.36], rot=[1, 0, 0, 0]  # Right side of table, closer to center
+                pos=[0.3, 0.0, 0.36], rot=[1, 0, 0, 0]  # Center of table, randomized from here
             ),
             spawn=UsdFileCfg(
                 usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",

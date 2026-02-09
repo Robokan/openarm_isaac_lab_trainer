@@ -18,6 +18,7 @@
 
 import argparse
 import sys
+import time
 
 from isaaclab.app import AppLauncher
 
@@ -35,6 +36,7 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument("--random-seed", action="store_true", default=False, help="Use current time as random seed")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
@@ -131,6 +133,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # handle random seed flag - use current time as seed
+    if args_cli.random_seed:
+        time_seed = int(time.time() * 1000) % 100000
+        agent_cfg.seed = time_seed
+        print(f"[INFO] Using time-based random seed: {time_seed}")
+    
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed

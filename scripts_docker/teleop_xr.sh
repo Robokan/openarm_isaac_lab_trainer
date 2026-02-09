@@ -45,7 +45,7 @@ TASK="Isaac-Reach-OpenArm-Bi-v0"
 LOG_PATH="openarm_bi_reach"
 
 # Find latest checkpoint
-CHECKPOINT=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/openarm_isaac_lab/logs/rsl_rl/${LOG_PATH} -name 'model_*.pt' 2>/dev/null | sort -V | tail -1" 2>/dev/null)
+CHECKPOINT=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/sparkpack/openarm_isaac_lab_trainer/logs/rsl_rl/${LOG_PATH} -name 'model_*.pt' 2>/dev/null | sort -V | tail -1" 2>/dev/null)
 
 if [[ -z "$CHECKPOINT" ]]; then
     echo "Error: No trained model found."
@@ -72,10 +72,13 @@ fi
 echo "=========================================="
 echo ""
 
+# Ensure openarm package is installed
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
+
 # Run OpenArm teleop with XR
 docker exec -it ${CONTAINER_NAME} bash -c "
     export XR_RUNTIME_JSON=/root/.config/openxr/1/active_runtime.json
-    cd /workspace/openarm_isaac_lab
+    cd /workspace/sparkpack/openarm_isaac_lab_trainer
     /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py \
         --task ${TASK} \
         --checkpoint ${CHECKPOINT} \

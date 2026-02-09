@@ -31,7 +31,7 @@ done
 
 # Find latest checkpoint if not specified
 if [[ "$HAS_CHECKPOINT" == "false" ]]; then
-    LATEST=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/openarm_isaac_lab/logs/rsl_rl -name 'model_*.pt' 2>/dev/null | grep -E '(bimanual|bi_reach|openarm_bi)' | sort -V | tail -1")
+    LATEST=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/sparkpack/openarm_isaac_lab_trainer/logs/rsl_rl -name 'model_*.pt' 2>/dev/null | grep -E '(bimanual|bi_reach|openarm_bi)' | sort -V | tail -1")
     
     if [[ -n "$LATEST" ]]; then
         echo "Using latest bimanual checkpoint: $LATEST"
@@ -51,6 +51,9 @@ if [[ "$HAS_CHECKPOINT" == "false" ]]; then
     fi
 fi
 
+# Ensure openarm package is installed
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
+
 echo ""
 echo "=========================================="
 echo "SYNTHETIC DATA GENERATION - BIMANUAL"
@@ -64,4 +67,4 @@ echo ""
 echo "Args: $@"
 echo ""
 
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/openarm_isaac_lab && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/create_synthetic_data_bimanual.py --task ${TASK} ${CHECKPOINT_ARG} $*"
+docker exec ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/create_synthetic_data_bimanual.py --task ${TASK} ${CHECKPOINT_ARG} $*"

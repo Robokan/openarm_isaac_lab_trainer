@@ -19,7 +19,7 @@ EXTRA_ARGS="--num_envs 16"
 
 # If no checkpoint specified, try to find the latest one
 if [[ ! "$*" =~ "--checkpoint" ]]; then
-    LATEST_CHECKPOINT=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/openarm_isaac_lab/logs/rsl_rl -name 'model_*.pt' -path '*bimanual*' -o -name 'model_*.pt' -path '*bi_reach*' 2>/dev/null | sort -V | tail -1")
+    LATEST_CHECKPOINT=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/sparkpack/openarm_isaac_lab_trainer/logs/rsl_rl -name 'model_*.pt' -path '*bimanual*' -o -name 'model_*.pt' -path '*bi_reach*' 2>/dev/null | sort -V | tail -1")
     if [ -n "${LATEST_CHECKPOINT}" ]; then
         echo "Using latest checkpoint: ${LATEST_CHECKPOINT}"
         EXTRA_ARGS="${EXTRA_ARGS} --checkpoint ${LATEST_CHECKPOINT}"
@@ -29,7 +29,10 @@ if [[ ! "$*" =~ "--checkpoint" ]]; then
     fi
 fi
 
+# Ensure openarm package is installed
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
+
 echo "Playing: ${TASK}"
 echo ""
 
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/openarm_isaac_lab && /workspace/isaaclab/isaaclab.sh -p ./scripts/reinforcement_learning/rsl_rl/play.py --task ${TASK} ${EXTRA_ARGS} $*"
+docker exec ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/reinforcement_learning/rsl_rl/play.py --task ${TASK} ${EXTRA_ARGS} $*"

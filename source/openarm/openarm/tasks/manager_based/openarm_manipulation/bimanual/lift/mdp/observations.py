@@ -238,6 +238,63 @@ def right_arm_has_object(
     return right_active.float().unsqueeze(-1)
 
 
+# ===== Mirrored Joint Observations =====
+# The left arm is the right arm rotated 180° around Z. Joints with
+# different localRot0 or asymmetric limits in the USD have opposite
+# angle conventions. We negate their observations so the policy sees
+# identical values for the same physical pose on both arms.
+# Joints 1, 2, 7: different frames/limits → negate
+# Joints 3, 4, 5, 6: identical frames/limits → no negation
+
+# Indices within the 7-joint observation vector:
+# joint1=0, joint2=1, joint7=6
+_MIRRORED_JOINT_INDICES = [0, 1, 6]
+
+
+def left_joint_pos_rel_mirrored(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Left arm joint positions relative to default, with mirrored joints negated.
+    
+    Joints 1, 2, 7 have opposite angle conventions due to the 180° Z rotation
+    of the left arm. Negating them ensures the policy sees identical values
+    for the same physical pose on both arms.
+    
+    Returns: (num_envs, 7)
+    """
+    asset = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    default_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    pos_rel = joint_pos - default_pos
+    
+    # Negate mirrored joints
+    pos_rel[:, _MIRRORED_JOINT_INDICES] = -pos_rel[:, _MIRRORED_JOINT_INDICES]
+    return pos_rel
+
+
+def left_joint_vel_rel_mirrored(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Left arm joint velocities relative to default, with mirrored joints negated.
+    
+    Joints 1, 2, 7 have opposite angle conventions due to the 180° Z rotation
+    of the left arm. Negating them ensures the policy sees identical values
+    for the same physical motion on both arms.
+    
+    Returns: (num_envs, 7)
+    """
+    asset = env.scene[asset_cfg.name]
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    default_vel = asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+    vel_rel = joint_vel - default_vel
+    
+    # Negate mirrored joints
+    vel_rel[:, _MIRRORED_JOINT_INDICES] = -vel_rel[:, _MIRRORED_JOINT_INDICES]
+    return vel_rel
+
+
 # ===== Conditional Object Position Observations =====
 
 def left_object_position_conditional(

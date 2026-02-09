@@ -28,7 +28,7 @@ OPEN_ARM_CFG = ArticulationCfg(
             max_depenetration_velocity=5.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True,  # Prevent arms from passing through each other
+            enabled_self_collisions=False,  # Disabled to test if self-collision limits left arm reach
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=0,
         ),
