@@ -41,6 +41,7 @@ from isaaclab.sensors.frame_transformer.frame_transformer_cfg import FrameTransf
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
+from isaaclab.markers import VisualizationMarkersCfg
 
 from . import mdp
 
@@ -141,6 +142,34 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
 ##
 
 
+# Goal marker: small frame with connecting line to show goal target
+_GOAL_MARKER_CFG = VisualizationMarkersCfg(
+    prim_path="/Visuals/Command/goal_pose",
+    markers={
+        "frame": sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+            scale=(0.05, 0.05, 0.05),
+        ),
+        "connecting_line": sim_utils.CylinderCfg(
+            radius=0.002,
+            height=1.0,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0), roughness=1.0),
+        ),
+    }
+)
+
+# Hidden marker for current body pose (we only want goal markers visible)
+_HIDDEN_MARKER_CFG = VisualizationMarkersCfg(
+    prim_path="/Visuals/Command/body_pose",
+    markers={
+        "frame": sim_utils.UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/UIElements/frame_prim.usd",
+            scale=(0.001, 0.001, 0.001),
+        ),
+    }
+)
+
+
 @configclass
 class CommandsCfg:
     """Command terms for the MDP.
@@ -156,6 +185,8 @@ class CommandsCfg:
         body_name=MISSING,  # will be set by agent env cfg (left hand)
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
+        goal_pose_visualizer_cfg=_GOAL_MARKER_CFG.replace(prim_path="/Visuals/Command/left_goal_pose"),
+        current_pose_visualizer_cfg=_HIDDEN_MARKER_CFG.replace(prim_path="/Visuals/Command/left_body_pose"),
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.2, 0.4),
             pos_y=(0.05, 0.45),   # Left side, extends over left pail
@@ -172,6 +203,8 @@ class CommandsCfg:
         body_name=MISSING,  # will be set by agent env cfg (right hand)
         resampling_time_range=(5.0, 5.0),
         debug_vis=True,
+        goal_pose_visualizer_cfg=_GOAL_MARKER_CFG.replace(prim_path="/Visuals/Command/right_goal_pose"),
+        current_pose_visualizer_cfg=_HIDDEN_MARKER_CFG.replace(prim_path="/Visuals/Command/right_body_pose"),
         ranges=mdp.UniformPoseCommandCfg.Ranges(
             pos_x=(0.2, 0.4),
             pos_y=(-0.45, -0.05),  # Right side, extends over right pail
@@ -473,7 +506,7 @@ class RewardsCfg:
     left_stay_at_pose = RewTerm(
         func=mdp.left_arm_distance_from_default,
         params={},
-        weight=-0.5,  # Gentle penalty for distance from default
+        weight=-10.0,  # Strong penalty for distance from default when inactive
     )
 
     # === Right arm rewards (gated by active flag) ===
@@ -510,7 +543,7 @@ class RewardsCfg:
     right_stay_at_pose = RewTerm(
         func=mdp.right_arm_distance_from_default,
         params={},
-        weight=-0.5,  # Gentle penalty for distance from default
+        weight=-10.0,  # Strong penalty for distance from default when inactive
     )
 
     # === Action penalties (both arms) ===

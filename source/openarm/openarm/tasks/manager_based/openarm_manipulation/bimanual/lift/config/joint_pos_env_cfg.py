@@ -106,13 +106,13 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
                 "openarm_left_joint7",
             ],
             scale={
-                "openarm_left_joint1": -1.57,  # Different localRot0 & limits
-                "openarm_left_joint2": -1.57,  # Different localRot0 & limits
-                "openarm_left_joint3": 1.57,
-                "openarm_left_joint4": 1.57,
-                "openarm_left_joint5": 1.57,
-                "openarm_left_joint6": 1.57,
-                "openarm_left_joint7": -1.57,  # Different localRot0
+                "openarm_left_joint1": -0.5,  # Different localRot0 & limits
+                "openarm_left_joint2": -0.5,  # Different localRot0 & limits
+                "openarm_left_joint3": 0.5,
+                "openarm_left_joint4": 0.5,
+                "openarm_left_joint5": 0.5,
+                "openarm_left_joint6": 0.5,
+                "openarm_left_joint7": -0.5,  # Different localRot0
             },
             use_default_offset=True,
         )
@@ -129,7 +129,7 @@ class OpenArmBimanualCubeLiftEnvCfg(BimanualLiftEnvCfg):
                 "openarm_right_joint6",
                 "openarm_right_joint7",
             ],
-            scale=1.57,
+            scale=0.5,
             use_default_offset=True,
         )
 
