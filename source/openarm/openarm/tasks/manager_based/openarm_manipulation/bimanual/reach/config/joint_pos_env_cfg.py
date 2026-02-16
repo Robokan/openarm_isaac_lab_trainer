@@ -14,9 +14,13 @@
 
 import math
 
+from isaaclab.assets import AssetBaseCfg
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 
-from isaaclab.managers import EventTermCfg as EventTerm
 from .. import mdp
 from ..reach_env_cfg import (
     ReachEnvCfg,
@@ -116,7 +120,109 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
         # post init of parent
         super().__post_init__()
         # make a smaller scene for play
-        self.scene.num_envs = 50
+        self.scene.num_envs = 4096
         self.scene.env_spacing = 2.5
         # disable randomization for play
         self.observations.policy.enable_corruption = False
+
+        # add warehouse environment for visualization
+        self.scene.warehouse = AssetBaseCfg(
+            prim_path="/World/Warehouse",
+            init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
+            spawn=UsdFileCfg(
+                usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            ),
+        )
+
+
+@configclass
+class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
+    """Reach configuration with reachability-aware sampling for teleoperation.
+    
+    Uses sphere + box intersection for target positions:
+    - Sphere: centered at shoulder, radius = arm length (0.40m)
+    - Box: practical workspace limits
+    
+    This ensures all targets are within physical arm reach.
+    Orientations are ±45° around gripper-down pose.
+    """
+
+    def __post_init__(self):
+        # post init of parent
+        super().__post_init__()
+
+        # Create marker configs with unique paths for each arm
+        left_goal_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/left_goal_pose"
+        )
+        left_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+        left_body_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/left_body_pose"
+        )
+        left_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+
+        right_goal_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/right_goal_pose"
+        )
+        right_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+        right_body_marker = FRAME_MARKER_CFG.replace(
+            prim_path="/Visuals/Command/right_body_pose"
+        )
+        right_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
+
+        # Left arm: sphere (arm reach) + box (workspace) intersection
+        # Sphere: shoulder at (0, -0.15, 0.7), radius 0.40m
+        # Box: x [0, 0.5], y [-0.5, 0.2], z [0.3, 1.0]
+        self.commands.left_ee_pose = mdp.SphericalPoseCommandCfg(
+            asset_name="robot",
+            body_name="openarm_left_hand",
+            resampling_time_range=(4.0, 4.0),
+            debug_vis=True,
+            sphere_center=(0.0, -0.15, 0.7),
+            sphere_radius=0.45,
+            box_x=(0.115, 0.565),
+            box_y=(-0.315, 0.315),
+            box_z=(0.24, 0.48),
+            ranges=mdp.SphericalPoseCommandCfg.Ranges(
+                roll=(-math.pi / 4, math.pi / 4),
+                pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
+                yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
+            ),
+            goal_pose_visualizer_cfg=left_goal_marker,
+            current_pose_visualizer_cfg=left_body_marker,
+        )
+
+        # Right arm: sphere (arm reach) + box (workspace) intersection
+        # Sphere: shoulder at (0, 0.15, 0.7), radius 0.40m
+        # Box: x [0, 0.5], y [-0.2, 0.5], z [0.3, 1.0]
+        self.commands.right_ee_pose = mdp.SphericalPoseCommandCfg(
+            asset_name="robot",
+            body_name="openarm_right_hand",
+            resampling_time_range=(4.0, 4.0),
+            debug_vis=True,
+            sphere_center=(0.0, 0.15, 0.7),
+            sphere_radius=0.56,
+            box_x=(0.115, 0.565),
+            box_y=(-0.315, 0.315),
+            box_z=(0.24, 0.48),
+            ranges=mdp.SphericalPoseCommandCfg.Ranges(
+                roll=(-math.pi / 4, math.pi / 4),
+                pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
+                yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
+            ),
+            goal_pose_visualizer_cfg=right_goal_marker,
+            current_pose_visualizer_cfg=right_body_marker,
+        )
+
+        # Randomize starting joint pose (arms only, smaller offsets)
+        self.events.reset_robot_joints.func = mdp.reset_joints_by_offset
+        self.events.reset_robot_joints.params["position_range"] = (-0.5, 0.5)
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+        self.events.reset_robot_joints.params["asset_cfg"] = SceneEntityCfg(
+            "robot",
+            joint_names=[
+                "openarm_left_joint[1-7]",
+                "openarm_right_joint[1-7]",
+            ],
+        )
