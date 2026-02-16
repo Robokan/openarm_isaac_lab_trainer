@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
-# Bimanual Teleoperation for OpenArm
-# Controls both robot arms using Vive controllers or keyboard
+# Bimanual IK Teleoperation for OpenArm (Docker)
+# Controls both robot arms using keyboard or VR controllers with inverse kinematics
 #
 # Usage:
-#   ./teleop_bimanual.sh                    # Use Vive controllers (requires SteamVR)
-#   ./teleop_bimanual.sh --input keyboard  # Use keyboard for testing
-#   ./teleop_bimanual.sh --checkpoint /path/to/model.pt  # Specify checkpoint
+#   ./teleop_bimanual.sh --input keyboard    # Keyboard control
+#   ./teleop_bimanual.sh --input xr           # VR handtracking (requires WiVRn)
+#   ./teleop_bimanual.sh --input vive          # Vive controllers (requires SteamVR)
+#   ./teleop_bimanual.sh --input gamepad       # Xbox gamepad
 
 CONTAINER_NAME="isaac-lab"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
@@ -19,52 +20,40 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     exit 1
 fi
 
-# Find the latest bimanual checkpoint if not specified
-CHECKPOINT=""
-EXTRA_ARGS=""
-
-for arg in "$@"; do
-    if [[ "$arg" == "--checkpoint" ]]; then
-        # User is specifying checkpoint, don't auto-find
-        CHECKPOINT="user_specified"
+# Detect input mode from arguments
+INPUT_MODE="keyboard"
+prev_arg=""
+for i in "$@"; do
+    if [[ "$prev_arg" == "--input" ]]; then
+        INPUT_MODE="$i"
     fi
+    prev_arg="$i"
 done
 
-if [[ -z "$CHECKPOINT" ]]; then
-    # Try to find the latest bimanual checkpoint
-    LATEST=$(docker exec ${CONTAINER_NAME} bash -c "find /workspace/sparkpack/openarm_isaac_lab_trainer/logs/rsl_rl -name 'model_*.pt' 2>/dev/null | grep -E '(bimanual|bi_reach|openarm_bi)' | sort -V | tail -1" 2>/dev/null)
-    
-    if [[ -n "$LATEST" ]]; then
-        echo "Using latest bimanual checkpoint: $LATEST"
-        EXTRA_ARGS="--checkpoint $LATEST"
-    else
-        echo "=========================================="
-        echo "WARNING: No trained bimanual model found!"
-        echo "=========================================="
-        echo ""
-        echo "Please train a bimanual reach model first:"
-        echo "  ./train_bimanual_reach.sh --headless"
-        echo ""
-        echo "Or specify a checkpoint manually:"
-        echo "  ./teleop_bimanual.sh --checkpoint /path/to/model.pt"
-        echo ""
-        exit 1
-    fi
-fi
+echo ""
+echo "=========================================="
+echo "OPENARM BIMANUAL IK TELEOPERATION"
+echo "=========================================="
+echo ""
+echo "Input mode: ${INPUT_MODE}"
+echo ""
 
-echo ""
-echo "=========================================="
-echo "OPENARM BIMANUAL TELEOPERATION"
-echo "=========================================="
-echo ""
-echo "Controls:"
-echo "  - Vive Controllers: Move arms in real-time"
-echo "  - Triggers: Control grippers"
-echo ""
-echo "Keyboard fallback (--input keyboard):"
-echo "  - WASD/QE: Move active hand"
-echo "  - TAB: Switch between left/right hand"
-echo "  - R: Reset poses"
+if [[ "$INPUT_MODE" == "keyboard" ]]; then
+    echo "Keyboard Controls:"
+    echo "  Position:  W/S (X), A/D (Y), Q/E (Z)"
+    echo "  Rotation:  I/K (pitch), J/L (yaw), U/O (roll)"
+    echo "  Gripper:   ; (close), ' (open)"
+    echo "  Hand:      1 (left), 2 (right)"
+    echo "  Other:     C (spawn cube), M (toggle markers), R (reset)"
+elif [[ "$INPUT_MODE" == "xr" ]]; then
+    echo "Using VR handtracking (XR)"
+    echo "Make sure WiVRn server is running"
+elif [[ "$INPUT_MODE" == "vive" ]]; then
+    echo "Using Vive controllers"
+    echo "Make sure SteamVR is running"
+elif [[ "$INPUT_MODE" == "gamepad" ]]; then
+    echo "Using Xbox/gamepad controller"
+fi
 echo ""
 echo "Starting..."
 echo ""
@@ -72,8 +61,12 @@ echo ""
 # Ensure openarm package is installed
 docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import openarm' 2>/dev/null || { echo '[INFO] Installing OpenArm package...'; /workspace/isaaclab/_isaac_sim/python.sh -m pip install -e /workspace/sparkpack/openarm_isaac_lab_trainer/source/openarm; }"
 
-# Install dependencies (pygame for gamepad, openvr for Vive)
-docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/isaaclab.sh -p -m pip install pygame openvr 2>/dev/null || true"
+# Install optional dependencies based on input mode
+if [[ "$INPUT_MODE" == "gamepad" ]]; then
+    docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/isaaclab.sh -p -m pip install pygame 2>/dev/null || true"
+elif [[ "$INPUT_MODE" == "vive" ]]; then
+    docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/isaaclab.sh -p -m pip install openvr 2>/dev/null || true"
+fi
 
-# Run teleoperation script
-docker exec ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 ${EXTRA_ARGS} $*"
+# Run IK teleoperation script
+docker exec -it ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 $*"

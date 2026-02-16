@@ -377,9 +377,9 @@ class EventCfg:
         func=mdp.randomize_active_arms,
         mode="reset",
         params={
-            "left_only_prob": 0.45,
-            "right_only_prob": 0.45,
-            "both_prob": 0.10,
+            "left_only_prob": 0.50,
+            "right_only_prob": 0.50,
+            "both_prob": 0.0,
         },
     )
 
