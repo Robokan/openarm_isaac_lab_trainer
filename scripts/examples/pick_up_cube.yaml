@@ -19,10 +19,12 @@
 
 # Step 1: Lift arms above table (keep current orientation)
 - print: "Preparing arms - lifting above table"
-- parallel:
-  - move_to: {arm: left, position: [0.0, 0.25, 0.45], duration: 0.5}
-  - move_to: {arm: right, position: [0.0, -0.25, 0.45], duration: 0.5}
-- wait_until_reached: {arm: both}
+# - parallel:
+#   - move_to: {arm: left, position: [0.0, 0.25, 0.45], duration: 0.5}
+#   - move_to: {arm: right, position: [0.0, -0.25, 0.45], duration: 0.5}
+- move_to: {arm: left, position: [0.0, 0.25, 0.45], duration: 0.5}
+#- wait_until_reached: {arm: both}
+- wait_until_reached: {arm: left}
 
 # # Step 3: Move left arm above the cube (auto-orients toward cube)
 - print: "Moving above block1"
