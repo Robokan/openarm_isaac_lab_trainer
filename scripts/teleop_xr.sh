@@ -67,7 +67,7 @@ if [[ "$INPUT_MODE" == "xr" ]] && ! pgrep -f "wivrn" > /dev/null; then
     fi
 fi
 
-TASK="Isaac-Reach-OpenArm-Bi-Play-v0"
+TASK="Isaac-Reach-OpenArm-Bi-Teleop-v0"
 
 echo ""
 echo "=========================================="
