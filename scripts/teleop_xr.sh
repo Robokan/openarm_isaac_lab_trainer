@@ -31,6 +31,9 @@ done
 
 cd "${REPO_ROOT}"
 
+# Activate Isaac Lab environment
+source "${REPO_ROOT}/scripts/activate_env.sh"
+
 # Avoid system CUDA libs overriding Isaac Sim bundled libs
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     _clean_ld=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | grep -v '^/usr/local/cuda' | paste -sd: -)
