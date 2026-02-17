@@ -9,6 +9,7 @@ set -e
 #   ./teleop_bimanual.sh --input xr           # VR handtracking (requires WiVRn)
 #   ./teleop_bimanual.sh --input vive          # Vive controllers (requires SteamVR)
 #   ./teleop_bimanual.sh --input gamepad       # Xbox gamepad
+#   ./teleop_bimanual.sh --input keyboard --script scripts/examples/pick_up_cube.yaml  # Scripted mode
 
 CONTAINER_NAME="isaac-lab"
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
@@ -68,5 +69,8 @@ elif [[ "$INPUT_MODE" == "vive" ]]; then
     docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/isaaclab.sh -p -m pip install openvr 2>/dev/null || true"
 fi
 
+# Ensure pyyaml is available for script mode
+docker exec ${CONTAINER_NAME} bash -c "/workspace/isaaclab/_isaac_sim/python.sh -c 'import yaml' 2>/dev/null || /workspace/isaaclab/_isaac_sim/python.sh -m pip install pyyaml 2>/dev/null || true"
+
 # Run IK teleoperation script
-docker exec -it ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 $*"
+docker exec -it ${CONTAINER_NAME} bash -c "cd /workspace/sparkpack/openarm_isaac_lab_trainer && /workspace/isaaclab/isaaclab.sh -p ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 $*"

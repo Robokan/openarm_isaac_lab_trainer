@@ -29,7 +29,7 @@ from isaaclab.app import AppLauncher
 
 # Parse arguments
 parser = argparse.ArgumentParser(description="Bimanual IK Teleoperation for OpenArm")
-parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-v0", help="Task name")
+parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-Teleop-v0", help="Task name")
 parser.add_argument("--input", type=str, default="keyboard", choices=["vive", "keyboard", "gamepad", "xr"],
                     help="Input device for teleoperation (xr = VR handtracking)")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
@@ -40,6 +40,8 @@ parser.add_argument("--viewer-lookat", type=float, nargs=3, default=None,
                     help="Initial viewer look-at position (x y z)")
 parser.add_argument("--viewport-camera", type=str, default=None,
                     help="Viewport camera prim path to render from (overrides auto selection)")
+parser.add_argument("--script", type=str, default=None,
+                    help="Path to YAML script file for automated command sequences")
 
 # Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
@@ -66,6 +68,8 @@ import time
 import torch
 import numpy as np
 import math
+import yaml
+import random
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
@@ -117,12 +121,12 @@ class KeyboardDevice:
         print("\n" + "="*60)
         print("KEYBOARD TELEOPERATION CONTROLS")
         print("="*60)
-        print("Position (active hand):")
+        print("Position (active hand, world coords):")
         print("  W/S: Forward/Backward (X)")
         print("  A/D: Left/Right (Y)")  
         print("  Q/E: Up/Down (Z)")
         print("")
-        print("Rotation (active hand):")
+        print("Orientation (active hand, world coords):")
         print("  I/K: Pitch up/down")
         print("  J/L: Yaw left/right")
         print("  U/O: Roll left/right")
@@ -137,12 +141,15 @@ class KeyboardDevice:
         print("")
         print("Other:")
         print("  C: Spawn cube")
+        print("  P: Print current pose of active hand")
         print("  M: Toggle marker visibility")
         print("  R: Reset poses to default")
         print("  Ctrl+C: Quit")
         print("="*60 + "\n")
         
         self.spawn_cube_requested = False  # Flag for cube spawning
+        self.reset_requested = False  # Flag for reset + script restart
+        self.print_pose_requested = False  # Flag for printing current pose
     
     def _on_keyboard_event(self, event, *args, **kwargs):
         """Handle keyboard events from Isaac Sim.
@@ -172,13 +179,8 @@ class KeyboardDevice:
                 print("[Keyboard] Active: RIGHT hand")
                 return False
             elif key == self._carb_input.KeyboardInput.R:
-                self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
-                self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
-                self.left_euler = np.array([0.0, 0.0, 0.0])
-                self.right_euler = np.array([0.0, 0.0, 0.0])
-                self.left_gripper = 0.0
-                self.right_gripper = 0.0
-                print("[Keyboard] Poses reset")
+                self.reset_requested = True
+                print("[Keyboard] Reset requested")
                 return False
             elif key == self._carb_input.KeyboardInput.M:
                 self.markers_visible = not self.markers_visible
@@ -186,6 +188,9 @@ class KeyboardDevice:
                 return False
             elif key == self._carb_input.KeyboardInput.C:
                 self.spawn_cube_requested = True
+                return False
+            elif key == self._carb_input.KeyboardInput.P:
+                self.print_pose_requested = True
                 return False
         
         # Check if it's a movement/rotation/gripper key we handle
@@ -245,7 +250,7 @@ class KeyboardDevice:
         if self._key_states.get(self._carb_input.KeyboardInput.E, False):
             pose[2] -= self.step_size
         
-        # Rotation updates (euler angles: roll, pitch, yaw)
+        # Orientation updates (euler angles: roll, pitch, yaw)
         rot_changed = False
         if self._key_states.get(self._carb_input.KeyboardInput.U, False):
             euler[0] -= self.rot_step  # Roll left
@@ -266,7 +271,6 @@ class KeyboardDevice:
             euler[2] -= self.rot_step  # Yaw right
             rot_changed = True
         
-        # Update quaternion if rotation changed
         if rot_changed:
             pose[3:7] = self._euler_to_quat(euler[0], euler[1], euler[2])
         
@@ -1126,6 +1130,525 @@ def _set_viewport_camera(camera_path: str) -> bool:
         return False
 
 
+# =============================================================================
+# YAML Script Executor
+# =============================================================================
+
+class ScriptExecutor:
+    """Executes a YAML-based command script to automate robot actions.
+    
+    All positions and orientations are in world (global) coordinates.
+    
+    Commands:
+        spawn_cube:      {name: str, position: [x,y,z] | random_area: {x:[lo,hi], y:[lo,hi], z:[lo,hi]},
+                          size: float, color: [r,g,b]}
+        move_to:         {arm: left|right, to: <name> | position: [x,y,z], above: float,
+                          rotation: {roll, pitch, yaw}, duration: float}
+        rotate:          {arm: left|right, roll: float, pitch: float, yaw: float, duration: float}
+        close_gripper:   {arm: left|right, force: float (N, default 5.0), duration: float (s, default 0.5)}
+        open_gripper:    {arm: left|right}
+        wait:            float (seconds)
+        wait_until_reached: {arm: left|right|both}
+        print:           str
+        parallel:        [list of sub-commands]
+    """
+    
+    POSITION_TOLERANCE = 0.02  # 2cm tolerance for "reached"
+    GRIPPER_FORCE_THRESHOLD = 5.0  # Newtons
+    GRIPPER_CLOSE_STEP = 0.002  # How much to close per frame
+    GRIPPER_OPEN_POS = 0.044
+    GRIPPER_Z_OFFSET = -0.06  # Distance from hand body to fingertip grasp point (m)
+    
+    def __init__(self, yaml_path, stage):
+        self.yaml_path = yaml_path
+        with open(yaml_path, "r") as f:
+            self.commands = yaml.safe_load(f)
+        if not isinstance(self.commands, list):
+            raise ValueError(f"YAML script must be a list of commands, got {type(self.commands)}")
+        
+        self.stage = stage
+        self.cmd_index = 0
+        self.cmd_state = {}  # Per-command state (start_time, etc.)
+        self.finished = False
+        
+        # Named object registry: name -> [x, y, z] position
+        self.object_registry = {}
+        
+        # Output targets (read by the teleop loop each frame)
+        self.left_target_pos = None   # [x, y, z] or None (world coords)
+        self.right_target_pos = None
+        self.left_target_quat = None  # [w, x, y, z] or None (world coords)
+        self.right_target_quat = None
+        self.left_gripper_target = None   # float 0..1 (0=open, 1=closed) or None
+        self.right_gripper_target = None
+        self.spawn_request = None  # (position, size, color, name) or None
+        
+        # Force-gripper state
+        self.left_gripper_closing = False
+        self.right_gripper_closing = False
+        self.left_gripper_pos = 0.0  # 0=open, 1=fully closed
+        self.right_gripper_pos = 0.0
+        
+        # Motion interpolation state
+        self._left_start_pos = None
+        self._left_end_pos = None
+        self._right_start_pos = None
+        self._right_end_pos = None
+        self._left_start_quat = None
+        self._left_end_quat = None
+        self._right_start_quat = None
+        self._right_end_quat = None
+        
+        print(f"[Script] Loaded {len(self.commands)} commands from {yaml_path}")
+    
+    def reset(self):
+        """Reset the script executor to the beginning, reloading the YAML file from disk."""
+        # Reload commands from file to pick up any edits
+        with open(self.yaml_path, "r") as f:
+            self.commands = yaml.safe_load(f)
+        if not isinstance(self.commands, list):
+            print(f"[Script] WARNING: YAML reload failed, got {type(self.commands)}")
+            self.commands = []
+        print(f"[Script] Reloaded {len(self.commands)} commands from {self.yaml_path}")
+        
+        self.cmd_index = 0
+        self.cmd_state = {}
+        self.finished = False
+        self.object_registry.clear()
+        
+        self.left_target_pos = None
+        self.right_target_pos = None
+        self.left_target_quat = None
+        self.right_target_quat = None
+        self.left_gripper_target = None
+        self.right_gripper_target = None
+        self.spawn_request = None
+        
+        self.left_gripper_closing = False
+        self.right_gripper_closing = False
+        self.left_gripper_pos = 0.0
+        self.right_gripper_pos = 0.0
+        
+        self._left_start_pos = None
+        self._left_end_pos = None
+        self._right_start_pos = None
+        self._right_end_pos = None
+        self._left_start_quat = None
+        self._left_end_quat = None
+        self._right_start_quat = None
+        self._right_end_quat = None
+        
+        print("[Script] Reset - restarting from beginning")
+    
+    def _smoothstep(self, t):
+        """Ease-in interpolation curve -- smooth start, linear finish (no crawl at end)."""
+        t = np.clip(t, 0.0, 1.0)
+        # Quadratic ease-in: starts slow, reaches full speed, no deceleration
+        # Blend: 70% linear + 30% ease-in for a gentle start without a slow end
+        ease_in = t * t
+        return 0.3 * ease_in + 0.7 * t
+    
+    def _euler_to_quat(self, roll, pitch, yaw):
+        """Convert euler angles (roll, pitch, yaw) to quaternion (w, x, y, z)."""
+        cr = np.cos(roll / 2)
+        sr = np.sin(roll / 2)
+        cp = np.cos(pitch / 2)
+        sp = np.sin(pitch / 2)
+        cy = np.cos(yaw / 2)
+        sy = np.sin(yaw / 2)
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+        return np.array([w, x, y, z])
+    
+    def _slerp(self, q0, q1, t):
+        """Spherical linear interpolation between two quaternions (w,x,y,z)."""
+        q0 = np.array(q0, dtype=np.float64)
+        q1 = np.array(q1, dtype=np.float64)
+        dot = np.dot(q0, q1)
+        if dot < 0:
+            q1 = -q1
+            dot = -dot
+        dot = np.clip(dot, -1.0, 1.0)
+        if dot > 0.9995:
+            result = q0 + t * (q1 - q0)
+            return result / np.linalg.norm(result)
+        theta_0 = np.arccos(dot)
+        theta = theta_0 * t
+        sin_theta = np.sin(theta)
+        sin_theta_0 = np.sin(theta_0)
+        s0 = np.cos(theta) - dot * sin_theta / sin_theta_0
+        s1 = sin_theta / sin_theta_0
+        result = s0 * q0 + s1 * q1
+        return result / np.linalg.norm(result)
+    
+    def _resolve_position(self, params):
+        """Resolve target position from command params (named object or explicit coords).
+        
+        When targeting a named object ('to'), applies GRIPPER_Z_OFFSET so that
+        above: 0.0 places the gripper fingers at the object center.
+        Explicit 'position' values are used as-is (no offset).
+        """
+        if "to" in params:
+            name = params["to"]
+            if name not in self.object_registry:
+                print(f"[Script] WARNING: Unknown object '{name}', skipping")
+                return None
+            pos = list(self.object_registry[name])
+            # Apply gripper offset so fingers are at the object, not the hand body
+            pos[2] += self.GRIPPER_Z_OFFSET
+            if "above" in params:
+                pos[2] += params["above"]
+            return pos
+        elif "position" in params:
+            pos = list(params["position"])
+            if "above" in params:
+                pos[2] += params["above"]
+            return pos
+        return None
+    
+    def step(self, sim_time, left_ee_pos=None, right_ee_pos=None,
+             left_contact_force=0.0, right_contact_force=0.0,
+             current_left_pos=None, current_right_pos=None,
+             current_left_quat=None, current_right_quat=None):
+        """Advance the script by one frame. Returns True if script is still running."""
+        if self.finished or self.cmd_index >= len(self.commands):
+            self.finished = True
+            return False
+        
+        # Handle force-gripper closing each frame
+        # With PD-controlled gripper (set_joint_position_target), we keep the target
+        # past the contact point so the PD controller maintains grip force.
+        # Contact detection just marks the command as "done" (grip achieved).
+        
+        if self.left_gripper_closing:
+            threshold = getattr(self, '_left_gripper_force', self.GRIPPER_FORCE_THRESHOLD)
+            speed = getattr(self, '_left_gripper_speed', self.GRIPPER_CLOSE_STEP)
+            if left_contact_force > threshold:
+                self.left_gripper_closing = False
+                # Keep gripper target where it is (or fully closed) - PD controller
+                # will maintain grip force against the contact
+                self.left_gripper_target = self.left_gripper_pos
+                print(f"[Script] Left gripper contact detected ({left_contact_force:.1f}N >= {threshold:.1f}N), holding at {self.left_gripper_pos:.3f}")
+            else:
+                self.left_gripper_pos = min(1.0, self.left_gripper_pos + speed)
+                self.left_gripper_target = self.left_gripper_pos
+        
+        if self.right_gripper_closing:
+            threshold = getattr(self, '_right_gripper_force', self.GRIPPER_FORCE_THRESHOLD)
+            speed = getattr(self, '_right_gripper_speed', self.GRIPPER_CLOSE_STEP)
+            if right_contact_force > threshold:
+                self.right_gripper_closing = False
+                self.right_gripper_target = self.right_gripper_pos
+                print(f"[Script] Right gripper contact detected ({right_contact_force:.1f}N >= {threshold:.1f}N), holding at {self.right_gripper_pos:.3f}")
+            else:
+                self.right_gripper_pos = min(1.0, self.right_gripper_pos + speed)
+                self.right_gripper_target = self.right_gripper_pos
+        
+        cmd_entry = self.commands[self.cmd_index]
+        if not isinstance(cmd_entry, dict) or len(cmd_entry) != 1:
+            print(f"[Script] WARNING: Malformed command at index {self.cmd_index}: {cmd_entry}")
+            self.cmd_index += 1
+            return True
+        
+        cmd_name = list(cmd_entry.keys())[0]
+        params = cmd_entry[cmd_name]
+        
+        # Initialize command state on first call
+        if "started" not in self.cmd_state:
+            self.cmd_state = {"started": True, "start_time": sim_time}
+            self._on_command_start(cmd_name, params, sim_time,
+                                   current_left_pos, current_right_pos,
+                                   current_left_quat, current_right_quat)
+        
+        # Check if command is complete
+        done = self._check_command(cmd_name, params, sim_time,
+                                    left_ee_pos, right_ee_pos,
+                                    left_contact_force, right_contact_force)
+        
+        if done:
+            self.cmd_state = {}
+            self.cmd_index += 1
+            if self.cmd_index >= len(self.commands):
+                self.finished = True
+                print("[Script] All commands completed!")
+        
+        return True
+    
+    def _on_command_start(self, cmd_name, params, sim_time,
+                          current_left_pos, current_right_pos,
+                          current_left_quat=None, current_right_quat=None):
+        """Called once when a new command starts."""
+        if cmd_name == "print":
+            print(f"[Script] {params}")
+        
+        elif cmd_name == "spawn_cube":
+            name = params.get("name", f"cube_{self.cmd_index}")
+            size = params.get("size", 0.025)
+            color = params.get("color", [0.2, 0.6, 1.0])
+            
+            if "random_area" in params:
+                area = params["random_area"]
+                x = random.uniform(area["x"][0], area["x"][1])
+                y = random.uniform(area["y"][0], area["y"][1])
+                z = random.uniform(area["z"][0], area["z"][1])
+                position = [x, y, z]
+            elif "position" in params:
+                position = list(params["position"])
+            else:
+                position = [0.4, 0.0, 0.5]
+            
+            self.object_registry[name] = position
+            self.spawn_request = (position, size, color, name)
+            print(f"[Script] Registered object '{name}' at ({position[0]:.3f}, {position[1]:.3f}, {position[2]:.3f})")
+        
+        elif cmd_name == "move_to":
+            arm = params.get("arm", "left")
+            target_pos = self._resolve_position(params)
+            if target_pos is not None:
+                duration = params.get("duration", 2.0)
+                self.cmd_state["duration"] = duration
+                self.cmd_state["arm"] = arm
+                self.cmd_state["target_pos"] = target_pos
+                
+                # Optional rotation for EE orientation (roll, pitch, yaw -> quaternion)
+                # Empty rotation dict {} means "keep current orientation"
+                # When targeting a named object ('to:') with no rotation, auto-compute
+                # an approach orientation that pitches toward the object.
+                rot = params.get("rotation", None)
+                has_rotation = rot is not None and len(rot) > 0
+                target_quat = None
+                if has_rotation:
+                    r = rot.get("roll", 0.0)
+                    p = rot.get("pitch", 0.0)
+                    y = rot.get("yaw", 0.0)
+                    target_quat = self._euler_to_quat(r, p, y)
+                elif "to" in params:
+                    pass  # No auto-orient: keep current EE orientation when targeting objects
+                self.cmd_state["has_rotation"] = has_rotation
+                
+                if arm == "left":
+                    self._left_start_pos = current_left_pos
+                    self._left_end_pos = target_pos
+                    self.left_target_pos = list(current_left_pos) if current_left_pos is not None else target_pos
+                    if has_rotation:
+                        self._left_start_quat = np.array(self.left_target_quat) if self.left_target_quat is not None else (current_left_quat if current_left_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
+                        self._left_end_quat = target_quat
+                        self.left_target_quat = list(self._left_start_quat)
+                else:
+                    self._right_start_pos = current_right_pos
+                    self._right_end_pos = target_pos
+                    self.right_target_pos = list(current_right_pos) if current_right_pos is not None else target_pos
+                    if has_rotation:
+                        self._right_start_quat = np.array(self.right_target_quat) if self.right_target_quat is not None else (current_right_quat if current_right_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
+                        self._right_end_quat = target_quat
+                        self.right_target_quat = list(self._right_start_quat)
+                
+                rot_msg = ""
+                if has_rotation and "rotation" in params:
+                    rot = params["rotation"]
+                    rot_msg = f" rot=({np.degrees(rot.get('roll',0)):.0f}, {np.degrees(rot.get('pitch',0)):.0f}, {np.degrees(rot.get('yaw',0)):.0f})°"
+                elif has_rotation:
+                    rot_msg = " (auto-orient)"
+                start_p = current_left_pos if arm == "left" else current_right_pos
+                print(f"[Script] Moving {arm} arm from ({start_p[0]:.3f}, {start_p[1]:.3f}, {start_p[2]:.3f}) to ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}){rot_msg} over {duration:.1f}s")
+        
+        elif cmd_name == "rotate":
+            arm = params.get("arm", "left")
+            r = params.get("roll", 0.0)
+            p = params.get("pitch", 0.0)
+            y = params.get("yaw", 0.0)
+            duration = params.get("duration", 1.0)
+            target_quat = self._euler_to_quat(r, p, y)
+            
+            self.cmd_state["duration"] = duration
+            self.cmd_state["arm"] = arm
+            
+            if arm == "left":
+                self._left_start_quat = np.array(self.left_target_quat) if self.left_target_quat is not None else (current_left_quat if current_left_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
+                self._left_end_quat = target_quat
+                self.left_target_quat = list(self._left_start_quat)
+            else:
+                self._right_start_quat = np.array(self.right_target_quat) if self.right_target_quat is not None else (current_right_quat if current_right_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
+                self._right_end_quat = target_quat
+                self.right_target_quat = list(self._right_start_quat)
+            
+            print(f"[Script] Rotating {arm} EE to (roll={np.degrees(r):.0f}, pitch={np.degrees(p):.0f}, yaw={np.degrees(y):.0f})° over {duration:.1f}s")
+        
+        elif cmd_name == "close_gripper":
+            arm = params.get("arm", "left") if isinstance(params, dict) else "left"
+            force = params.get("force", self.GRIPPER_FORCE_THRESHOLD) if isinstance(params, dict) else self.GRIPPER_FORCE_THRESHOLD
+            duration = params.get("duration", 0.5) if isinstance(params, dict) else 0.5
+            # Convert duration to per-frame step (assuming ~100Hz sim rate)
+            speed = 1.0 / max(duration * 100.0, 1.0)
+            if arm == "left":
+                self.left_gripper_closing = True
+                self.left_gripper_pos = 0.0
+                self.left_gripper_target = 0.0
+                self._left_gripper_force = force
+                self._left_gripper_speed = speed
+            else:
+                self.right_gripper_closing = True
+                self.right_gripper_pos = 0.0
+                self.right_gripper_target = 0.0
+                self._right_gripper_force = force
+                self._right_gripper_speed = speed
+            self.cmd_state["arm"] = arm
+            print(f"[Script] Closing {arm} gripper (force: {force:.1f}N, duration: {duration:.1f}s)")
+        
+        elif cmd_name == "open_gripper":
+            arm = params.get("arm", "left") if isinstance(params, dict) else "left"
+            if arm == "left":
+                self.left_gripper_closing = False
+                self.left_gripper_pos = 0.0
+                self.left_gripper_target = 0.0
+            else:
+                self.right_gripper_closing = False
+                self.right_gripper_pos = 0.0
+                self.right_gripper_target = 0.0
+            self.cmd_state["arm"] = arm
+            print(f"[Script] Opening {arm} gripper")
+        
+        elif cmd_name == "wait":
+            self.cmd_state["wait_duration"] = float(params)
+            print(f"[Script] Waiting {params}s")
+        
+        elif cmd_name == "wait_until_reached":
+            arm = params.get("arm", "both") if isinstance(params, dict) else str(params)
+            self.cmd_state["arm"] = arm
+            print(f"[Script] Waiting until {arm} arm(s) reached target")
+        
+        elif cmd_name == "parallel":
+            sub_cmds = params if isinstance(params, list) else []
+            sub_states = [{"started": True, "start_time": sim_time} for _ in sub_cmds]
+            self.cmd_state["sub_cmds"] = sub_cmds
+            self.cmd_state["sub_states"] = sub_states
+            print(f"[Script] Running {len(sub_cmds)} commands in parallel: {sub_cmds}")
+            for i, sub_cmd in enumerate(sub_cmds):
+                if isinstance(sub_cmd, dict) and len(sub_cmd) == 1:
+                    sub_name = list(sub_cmd.keys())[0]
+                    sub_params = sub_cmd[sub_name]
+                    saved_state = self.cmd_state
+                    self.cmd_state = sub_states[i]
+                    self._on_command_start(sub_name, sub_params, sim_time,
+                                           current_left_pos, current_right_pos,
+                                           current_left_quat, current_right_quat)
+                    sub_states[i] = self.cmd_state
+                    self.cmd_state = saved_state
+    
+    def _check_command(self, cmd_name, params, sim_time,
+                       left_ee_pos, right_ee_pos,
+                       left_contact_force, right_contact_force):
+        """Check if the current command is complete. Returns True if done."""
+        elapsed = sim_time - self.cmd_state["start_time"]
+        
+        if cmd_name in ("print", "spawn_cube"):
+            return True  # Instant commands
+        
+        elif cmd_name == "move_to":
+            duration = self.cmd_state.get("duration", 2.0)
+            arm = self.cmd_state.get("arm", "left")
+            has_rotation = self.cmd_state.get("has_rotation", False)
+            t = self._smoothstep(elapsed / duration) if duration > 0 else 1.0
+            
+            if arm == "left" and self._left_start_pos is not None and self._left_end_pos is not None:
+                interp = [
+                    self._left_start_pos[i] + t * (self._left_end_pos[i] - self._left_start_pos[i])
+                    for i in range(3)
+                ]
+                self.left_target_pos = interp
+                if has_rotation and self._left_start_quat is not None and self._left_end_quat is not None:
+                    self.left_target_quat = list(self._slerp(self._left_start_quat, self._left_end_quat, t))
+            elif arm == "right" and self._right_start_pos is not None and self._right_end_pos is not None:
+                interp = [
+                    self._right_start_pos[i] + t * (self._right_end_pos[i] - self._right_start_pos[i])
+                    for i in range(3)
+                ]
+                self.right_target_pos = interp
+                if has_rotation and self._right_start_quat is not None and self._right_end_quat is not None:
+                    self.right_target_quat = list(self._slerp(self._right_start_quat, self._right_end_quat, t))
+            
+            return elapsed >= duration
+        
+        elif cmd_name == "rotate":
+            duration = self.cmd_state.get("duration", 1.0)
+            arm = self.cmd_state.get("arm", "left")
+            t = self._smoothstep(elapsed / duration) if duration > 0 else 1.0
+            
+            if arm == "left" and self._left_start_quat is not None and self._left_end_quat is not None:
+                self.left_target_quat = list(self._slerp(self._left_start_quat, self._left_end_quat, t))
+            elif arm == "right" and self._right_start_quat is not None and self._right_end_quat is not None:
+                self.right_target_quat = list(self._slerp(self._right_start_quat, self._right_end_quat, t))
+            
+            return elapsed >= duration
+        
+        elif cmd_name == "close_gripper":
+            arm = self.cmd_state.get("arm", "left")
+            if arm == "left":
+                done = not self.left_gripper_closing or self.left_gripper_pos >= 1.0
+                if done and self.left_gripper_closing:
+                    self.left_gripper_closing = False
+                    print(f"[Script] Left gripper fully closed (pos={self.left_gripper_pos:.3f})")
+                return done
+            else:
+                done = not self.right_gripper_closing or self.right_gripper_pos >= 1.0
+                if done and self.right_gripper_closing:
+                    self.right_gripper_closing = False
+                    print(f"[Script] Right gripper fully closed (pos={self.right_gripper_pos:.3f})")
+                return done
+        
+        elif cmd_name == "open_gripper":
+            return True  # Instant
+        
+        elif cmd_name == "wait":
+            wait_duration = self.cmd_state.get("wait_duration", 1.0)
+            return elapsed >= wait_duration
+        
+        elif cmd_name == "wait_until_reached":
+            arm = self.cmd_state.get("arm", "both")
+            left_ok = True
+            right_ok = True
+            
+            if arm in ("left", "both") and self.left_target_pos is not None and left_ee_pos is not None:
+                dist = np.linalg.norm(np.array(self.left_target_pos) - np.array(left_ee_pos))
+                left_ok = dist < self.POSITION_TOLERANCE
+            if arm in ("right", "both") and self.right_target_pos is not None and right_ee_pos is not None:
+                dist = np.linalg.norm(np.array(self.right_target_pos) - np.array(right_ee_pos))
+                right_ok = dist < self.POSITION_TOLERANCE
+            
+            # Also timeout after 10 seconds to prevent hangs
+            if elapsed > 10.0:
+                print(f"[Script] wait_until_reached timed out after 10s")
+                return True
+            
+            return left_ok and right_ok
+        
+        elif cmd_name == "parallel":
+            sub_cmds = self.cmd_state.get("sub_cmds", [])
+            sub_states = self.cmd_state.get("sub_states", [])
+            all_done = True
+            for i, sub_cmd in enumerate(sub_cmds):
+                if not isinstance(sub_cmd, dict) or len(sub_cmd) != 1:
+                    continue
+                sub_name = list(sub_cmd.keys())[0]
+                sub_params = sub_cmd[sub_name]
+                # Temporarily swap cmd_state so _check_command sees the sub-state
+                saved_state = self.cmd_state
+                self.cmd_state = sub_states[i]
+                done = self._check_command(sub_name, sub_params, sim_time,
+                                           left_ee_pos, right_ee_pos,
+                                           left_contact_force, right_contact_force)
+                sub_states[i] = self.cmd_state
+                self.cmd_state = saved_state
+                if not done:
+                    all_done = False
+            return all_done
+        
+        return True  # Unknown commands complete immediately
+    
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg=None):
     """Main entry point for IK-based teleoperation."""
@@ -1168,6 +1691,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[WARN] Unable to set viewport camera: {exc}")
     
     print("[INFO] Using IK-based control")
+    if args_cli.script:
+        print(f"[INFO] Script mode: {args_cli.script}")
     
     # Run IK teleoperation
     run_teleop(env, args_cli)
@@ -1208,13 +1733,31 @@ def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=(0.2, 0.6, 1.0
     cube_prim.GetDisplayColorAttr().Set([Gf.Vec3f(color[0], color[1], color[2])])
     
     # Add rigid body physics
+    from pxr import UsdShade, PhysxSchema
     prim = cube_prim.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(prim)
     UsdPhysics.CollisionAPI.Apply(prim)
     
+    # Limit depenetration velocity so cube doesn't get launched on contact
+    rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    rb_api.CreateMaxDepenetrationVelocityAttr().Set(0.5)
+    
     # Set mass
     mass_api = UsdPhysics.MassAPI.Apply(prim)
-    mass_api.GetMassAttr().Set(0.1)  # 100 grams
+    mass_api.GetMassAttr().Set(0.05)  # 50 grams
+    
+    # Add friction material so the gripper can hold it
+    mat_path = f"{cube_path}/PhysicsMaterial"
+    UsdShade.Material.Define(stage, mat_path)
+    mat_prim = stage.GetPrimAtPath(mat_path)
+    mat_api = UsdPhysics.MaterialAPI.Apply(mat_prim)
+    mat_api.CreateStaticFrictionAttr().Set(1.0)
+    mat_api.CreateDynamicFrictionAttr().Set(1.0)
+    mat_api.CreateRestitutionAttr().Set(0.0)
+    
+    # Bind the material to the cube collision
+    mat_binding = UsdShade.MaterialBindingAPI.Apply(prim)
+    mat_binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
     
     print(f"[Cube] Spawned cube at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
     return cube_path
@@ -1255,15 +1798,11 @@ def run_teleop(env, args):
     right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
     sim_device = unwrapped.device if hasattr(unwrapped, "device") else "cuda:0"
     
-    # IK setup - Full pose IK for all 7 joints
-    print("[INFO] Setting up full-pose IK controllers...")
+    # ===== FULL 7-DOF POSE IK =====
+    print("[INFO] Setting up full 7-DOF pose IK (all joints, targeting hand)...")
     
-    # ===== SPLIT IK: Position (joints 1-4) + Direct wrist control (joints 5-7) =====
-    print("[INFO] Setting up split IK: Position (joints 1-4) + Wrist (joints 5-7)...")
-    
-    # Position-only IK for joints 1-4
     ik_cfg = DifferentialIKControllerCfg(
-        command_type="position",  # Position-only control
+        command_type="pose",
         use_relative_mode=False,
         ik_method="dls",
         ik_params={"lambda_val": 0.1},
@@ -1271,58 +1810,65 @@ def run_teleop(env, args):
     left_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     right_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     
-    # Get joint IDs for position control (joints 1-4)
-    left_pos_joint_ids, left_pos_joint_names = robot.find_joints([
-        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3", "openarm_left_joint4"
-    ])
-    right_pos_joint_ids, right_pos_joint_names = robot.find_joints([
-        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3", "openarm_right_joint4"
-    ])
-    
-    # Get joint IDs for wrist control (joints 5-7)
-    left_wrist_joint_ids, left_wrist_joint_names = robot.find_joints([
+    # Get all 7 joint IDs per arm
+    left_arm_joint_ids, left_arm_joint_names = robot.find_joints([
+        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3", "openarm_left_joint4",
         "openarm_left_joint5", "openarm_left_joint6", "openarm_left_joint7"
     ])
-    right_wrist_joint_ids, right_wrist_joint_names = robot.find_joints([
+    right_arm_joint_ids, right_arm_joint_names = robot.find_joints([
+        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3", "openarm_right_joint4",
         "openarm_right_joint5", "openarm_right_joint6", "openarm_right_joint7"
     ])
     
-    # Combined joint IDs for reference
-    left_arm_joint_ids = list(left_pos_joint_ids) + list(left_wrist_joint_ids)
-    right_arm_joint_ids = list(right_pos_joint_ids) + list(right_wrist_joint_ids)
-    
-    # Get body IDs for end-effectors (hand for position target)
+    # IK target body: the hand (end-effector after all 7 joints)
     left_body_ids, _ = robot.find_bodies("openarm_left_hand")
     right_body_ids, _ = robot.find_bodies("openarm_right_hand")
     left_body_idx = left_body_ids[0]
     right_body_idx = right_body_ids[0]
     
-    # Get body IDs for link4 (forearm - for wrist relative orientation)
-    left_link4_ids, _ = robot.find_bodies("openarm_left_link4")
-    right_link4_ids, _ = robot.find_bodies("openarm_right_link4")
-    left_link4_idx = left_link4_ids[0]
-    right_link4_idx = right_link4_ids[0]
-    print(f"[INFO] Link4 body idx: L={left_link4_idx}, R={right_link4_idx}")
-    
-    # For fixed-base robots, jacobian body index is offset by 1
-    # Only use joints 1-4 for position IK Jacobian
+    # Jacobian indices: for fixed-base robots, body index is offset by 1
     if robot.is_fixed_base:
         left_jacobi_body_idx = left_body_idx - 1
         right_jacobi_body_idx = right_body_idx - 1
-        left_jacobi_joint_ids = list(left_pos_joint_ids)  # Only joints 1-4
-        right_jacobi_joint_ids = list(right_pos_joint_ids)  # Only joints 1-4
+        left_jacobi_joint_ids = list(left_arm_joint_ids)
+        right_jacobi_joint_ids = list(right_arm_joint_ids)
     else:
         left_jacobi_body_idx = left_body_idx
         right_jacobi_body_idx = right_body_idx
-        left_jacobi_joint_ids = [i + 6 for i in left_pos_joint_ids]
-        right_jacobi_joint_ids = [i + 6 for i in right_pos_joint_ids]
+        left_jacobi_joint_ids = [i + 6 for i in left_arm_joint_ids]
+        right_jacobi_joint_ids = [i + 6 for i in right_arm_joint_ids]
     
-    print(f"[INFO] Position joints (1-4): L={left_pos_joint_names}, R={right_pos_joint_names}")
-    print(f"[INFO] Wrist joints (5-7): L={left_wrist_joint_names}, R={right_wrist_joint_names}")
-    print(f"[INFO] Position joint IDs: L={left_pos_joint_ids}, R={right_pos_joint_ids}")
-    print(f"[INFO] Wrist joint IDs: L={left_wrist_joint_ids}, R={right_wrist_joint_ids}")
-    print(f"[INFO] EE body index: L={left_body_idx}, R={right_body_idx}")
+    print(f"[INFO] IK joints (1-7): L={left_arm_joint_names}, R={right_arm_joint_names}")
+    print(f"[INFO] IK target body (hand): L={left_body_idx}, R={right_body_idx}")
     print(f"[INFO] Jacobi body idx: L={left_jacobi_body_idx}, R={right_jacobi_body_idx}")
+    
+    # Add high-friction physics material to gripper finger links
+    try:
+        from pxr import UsdShade, UsdPhysics as UsdPhysicsAPI
+        stage = omni.usd.get_context().get_stage()
+        finger_link_patterns = [
+            "/World/envs/env_0/Robot/openarm_left_finger_link_1",
+            "/World/envs/env_0/Robot/openarm_left_finger_link_2",
+            "/World/envs/env_0/Robot/openarm_right_finger_link_1",
+            "/World/envs/env_0/Robot/openarm_right_finger_link_2",
+        ]
+        for fp in finger_link_patterns:
+            finger_prim = stage.GetPrimAtPath(fp)
+            if finger_prim.IsValid():
+                mat_path = f"{fp}/GripFrictionMaterial"
+                UsdShade.Material.Define(stage, mat_path)
+                mat_prim = stage.GetPrimAtPath(mat_path)
+                mat_api = UsdPhysicsAPI.MaterialAPI.Apply(mat_prim)
+                mat_api.CreateStaticFrictionAttr().Set(1.0)
+                mat_api.CreateDynamicFrictionAttr().Set(1.0)
+                mat_api.CreateRestitutionAttr().Set(0.0)
+                mat_binding = UsdShade.MaterialBindingAPI.Apply(finger_prim)
+                mat_binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
+                print(f"[INFO] Added friction material to {fp}")
+            else:
+                print(f"[WARN] Finger link not found: {fp}")
+    except Exception as e:
+        print(f"[WARN] Could not add friction to gripper fingers: {e}")
     
     print("\n[INFO] Starting teleoperation loop...")
     print("[INFO] Press Ctrl+C to stop\n")
@@ -1355,13 +1901,103 @@ def run_teleop(env, args):
     prev_markers_visible = True  # Track previous visibility state
     prev_a_button = False  # Track A button for edge detection
     
-    # Get USD stage for cube spawning
+    # Get USD stage for cube spawning and markers
     try:
         import omni.usd
         stage = omni.usd.get_context().get_stage()
     except Exception:
         stage = None
         print("[WARN] Could not get USD stage for cube spawning")
+    
+    # Create target markers (3-axis arrows showing position + orientation)
+    left_marker_path = "/World/ik_target_left"
+    right_marker_path = "/World/ik_target_right"
+    try:
+        from pxr import UsdGeom, Gf
+        
+        arrow_length = 0.06
+        arrow_radius = 0.003
+        
+        # Each axis: cylinder along Z, rotated to point along X/Y/Z
+        # axis_defs: (sub_name, color, rotate_euler_deg)
+        axis_defs = [
+            ("x_axis", (1.0, 0.0, 0.0), (0, 90, 0)),   # Red = X
+            ("y_axis", (0.0, 1.0, 0.0), (-90, 0, 0)),   # Green = Y
+            ("z_axis", (0.0, 0.4, 1.0), (0, 0, 0)),     # Blue = Z (up)
+        ]
+        
+        for marker_path in [left_marker_path, right_marker_path]:
+            # Parent xform for the whole marker
+            parent_xform = UsdGeom.Xform.Define(stage, marker_path)
+            pxf = UsdGeom.Xformable(parent_xform.GetPrim())
+            pxf.ClearXformOpOrder()
+            pxf.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0))
+            pxf.AddOrientOp().Set(Gf.Quatf(1, 0, 0, 0))
+            
+            for sub_name, color, (rx, ry, rz) in axis_defs:
+                cyl_path = f"{marker_path}/{sub_name}"
+                cyl = UsdGeom.Cylinder.Define(stage, cyl_path)
+                cyl.GetRadiusAttr().Set(arrow_radius)
+                cyl.GetHeightAttr().Set(arrow_length)
+                cyl.GetDisplayColorAttr().Set([Gf.Vec3f(*color)])
+                
+                cxf = UsdGeom.Xformable(cyl.GetPrim())
+                cxf.ClearXformOpOrder()
+                # Offset along cylinder's local Z so base is at origin
+                cxf.AddTranslateOp().Set(Gf.Vec3d(0, 0, arrow_length / 2.0))
+                # Rotate to point along the correct world axis
+                cxf.AddRotateXYZOp().Set(Gf.Vec3f(rx, ry, rz))
+        
+        print("[INFO] Created IK target markers (3-axis arrows, left + right)")
+    except Exception as e:
+        print(f"[WARN] Could not create target markers: {e}")
+    
+    # Initialize script executor if script file is provided
+    script_executor = None
+    if args.script and stage is not None:
+        script_executor = ScriptExecutor(args.script, stage)
+    
+    # Get contact sensors if available
+    left_contact_sensor = None
+    right_contact_sensor = None
+    try:
+        left_contact_sensor = unwrapped.scene.get("left_contact", None)
+        right_contact_sensor = unwrapped.scene.get("right_contact", None)
+        if left_contact_sensor:
+            print("[INFO] Left contact sensor found")
+        if right_contact_sensor:
+            print("[INFO] Right contact sensor found")
+    except Exception:
+        pass
+    
+    # Sync input device poses to actual robot EE position at startup (world coords)
+    # so IK targets match where the robot is (no unwanted movement)
+    try:
+        unwrapped.sim.step(render=True)
+        robot.update(unwrapped.sim.get_physics_dt())
+        _left_ee_w = robot.data.body_pos_w[:, left_body_idx]
+        _left_eq_w = robot.data.body_quat_w[:, left_body_idx]
+        _right_ee_w = robot.data.body_pos_w[:, right_body_idx]
+        _right_eq_w = robot.data.body_quat_w[:, right_body_idx]
+        if hasattr(input_device, 'left_pose'):
+            input_device.left_pose[:3] = _left_ee_w[0].cpu().numpy()
+            input_device.left_pose[3:7] = _left_eq_w[0].cpu().numpy()
+            input_device.right_pose[:3] = _right_ee_w[0].cpu().numpy()
+            input_device.right_pose[3:7] = _right_eq_w[0].cpu().numpy()
+            # Sync euler angles from world-frame quaternion
+            if hasattr(input_device, 'left_euler'):
+                def _quat_to_euler_init(q):
+                    w, x, y, z = q[0], q[1], q[2], q[3]
+                    roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
+                    pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
+                    yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+                    return np.array([roll, pitch, yaw])
+                input_device.left_euler[:] = _quat_to_euler_init(input_device.left_pose[3:7])
+                input_device.right_euler[:] = _quat_to_euler_init(input_device.right_pose[3:7])
+        print(f"[INFO] Initial EE sync (world): L=({input_device.left_pose[0]:.3f}, {input_device.left_pose[1]:.3f}, {input_device.left_pose[2]:.3f})"
+              f" R=({input_device.right_pose[0]:.3f}, {input_device.right_pose[1]:.3f}, {input_device.right_pose[2]:.3f})")
+    except Exception as e:
+        print(f"[WARN] Could not sync initial EE poses: {e}")
     
     try:
         while simulation_app.is_running() and step_count < 100000:
@@ -1421,26 +2057,6 @@ def run_teleop(env, args):
                 left_trigger = input_device.left_gripper
                 right_trigger = input_device.right_gripper
             
-            # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
-            if left_gripper_ids:
-                left_pos = gripper_open_pos * (1.0 - left_trigger)
-                left_targets = torch.full(
-                    (1, len(left_gripper_ids)),
-                    left_pos,
-                    device=sim_device,
-                )
-                robot.write_joint_position_to_sim(left_targets, joint_ids=left_gripper_ids)
-            
-            # Right gripper: open (0.044) when trigger=0, closed (0) when trigger=1
-            if right_gripper_ids:
-                right_pos = gripper_open_pos * (1.0 - right_trigger)
-                right_targets = torch.full(
-                    (1, len(right_gripper_ids)),
-                    right_pos,
-                    device=sim_device,
-                )
-                robot.write_joint_position_to_sim(right_targets, joint_ids=right_gripper_ids)
-            
             # Check for A button press (VR) or C key (keyboard) to spawn cube
             spawn_requested = False
             
@@ -1461,133 +2077,320 @@ def run_teleop(env, args):
             
             # Spawn cube if requested
             if spawn_requested and stage is not None:
-                # Spawn cube in front of robot arms (center, slightly forward and up)
                 spawn_x = 0.4  # Forward
                 spawn_y = 0.0  # Center
                 spawn_z = 0.6  # Height to drop from
                 spawn_cube(stage, position=(spawn_x, spawn_y, spawn_z))
             
-            # ===== FULL POSE IK =====
-            # Convert poses to tensors (pose format: x, y, z, qw, qx, qy, qz)
+            # Handle P key: print current pose of active hand (world coords)
+            if hasattr(input_device, "print_pose_requested") and input_device.print_pose_requested:
+                input_device.print_pose_requested = False
+                hand = input_device.active_hand if hasattr(input_device, 'active_hand') else "left"
+                ee_idx = left_body_idx if hand == "left" else right_body_idx
+                ee_pos_w = robot.data.body_pos_w[:, ee_idx][0].cpu().numpy()
+                ee_quat_w = robot.data.body_quat_w[:, ee_idx][0].cpu().numpy()
+                w, x, y, z = ee_quat_w[0], ee_quat_w[1], ee_quat_w[2], ee_quat_w[3]
+                _roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
+                _pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
+                _yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+                _pose = input_device.left_pose if hand == "left" else input_device.right_pose
+                print(f"\n{'='*60}")
+                print(f"  {hand.upper()} arm (world coords):")
+                print(f"  EE position:   x={ee_pos_w[0]:.4f}, y={ee_pos_w[1]:.4f}, z={ee_pos_w[2]:.4f}")
+                print(f"  EE rotation:   roll={np.degrees(_roll):.1f}°, pitch={np.degrees(_pitch):.1f}°, yaw={np.degrees(_yaw):.1f}°")
+                print(f"  EE rot (rad):  roll={_roll:.4f}, pitch={_pitch:.4f}, yaw={_yaw:.4f}")
+                print(f"  Target pos:    x={_pose[0]:.4f}, y={_pose[1]:.4f}, z={_pose[2]:.4f}")
+                print(f"{'='*60}\n")
+            
+            # Handle reset: reset scene, clear cubes, restart script
+            if hasattr(input_device, "reset_requested") and input_device.reset_requested:
+                input_device.reset_requested = False
+                print("\n[Reset] ========== RESETTING SCENE ==========")
+                
+                # 1. Remove all spawned cubes from the stage
+                if stage is not None:
+                    removed = 0
+                    for prim in list(stage.Traverse()):
+                        if prim.GetPath().pathString.startswith("/World/spawned_cube_"):
+                            stage.RemovePrim(prim.GetPath())
+                            removed += 1
+                    if removed > 0:
+                        print(f"[Reset] Removed {removed} spawned cube(s)")
+                    spawn_cube.__defaults__[3][0] = 0
+                
+                # 2. Reset robot joints to default positions
+                all_joint_pos = robot.data.default_joint_pos.clone()
+                all_joint_vel = torch.zeros_like(robot.data.default_joint_vel)
+                robot.write_joint_state_to_sim(all_joint_pos, all_joint_vel)
+                # Also set joint position TARGETS to defaults so the PD controller
+                # doesn't drive the joints back to the old targets
+                robot.set_joint_position_target(all_joint_pos)
+                robot.write_data_to_sim()
+                
+                # Open grippers
+                if left_gripper_ids:
+                    left_open = torch.full((1, len(left_gripper_ids)), gripper_open_pos, device=sim_device)
+                    robot.write_joint_position_to_sim(left_open, joint_ids=left_gripper_ids)
+                    robot.set_joint_position_target(left_open, joint_ids=left_gripper_ids)
+                if right_gripper_ids:
+                    right_open = torch.full((1, len(right_gripper_ids)), gripper_open_pos, device=sim_device)
+                    robot.write_joint_position_to_sim(right_open, joint_ids=right_gripper_ids)
+                    robot.set_joint_position_target(right_open, joint_ids=right_gripper_ids)
+                
+                # Step sim a few times to let reset settle
+                for _ in range(20):
+                    unwrapped.sim.step(render=False)
+                    robot.update(unwrapped.sim.get_physics_dt())
+                unwrapped.sim.step(render=True)
+                robot.update(unwrapped.sim.get_physics_dt())
+                
+                # 3. Read back actual EE positions in world frame and sync input device
+                _left_ee_w = robot.data.body_pos_w[:, left_body_idx]
+                _left_eq_w = robot.data.body_quat_w[:, left_body_idx]
+                _right_ee_w = robot.data.body_pos_w[:, right_body_idx]
+                _right_eq_w = robot.data.body_quat_w[:, right_body_idx]
+                
+                if hasattr(input_device, 'left_pose'):
+                    input_device.left_pose[:3] = _left_ee_w[0].cpu().numpy()
+                    input_device.left_pose[3:7] = _left_eq_w[0].cpu().numpy()
+                    input_device.right_pose[:3] = _right_ee_w[0].cpu().numpy()
+                    input_device.right_pose[3:7] = _right_eq_w[0].cpu().numpy()
+                    if hasattr(input_device, 'left_euler'):
+                        def _quat_to_euler_reset(q):
+                            w, x, y, z = q[0], q[1], q[2], q[3]
+                            roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
+                            pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
+                            yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+                            return np.array([roll, pitch, yaw])
+                        input_device.left_euler[:] = _quat_to_euler_reset(input_device.left_pose[3:7])
+                        input_device.right_euler[:] = _quat_to_euler_reset(input_device.right_pose[3:7])
+                    input_device.left_gripper = 0.0
+                    input_device.right_gripper = 0.0
+                
+                # 4. Reset IK controllers
+                left_ik_controller.reset()
+                right_ik_controller.reset()
+                
+                # 6. Restart script executor (reloads YAML from disk)
+                if script_executor is not None:
+                    script_executor.reset()
+                
+                # 7. Reset step counter for script timing
+                step_count = 0
+                
+                print("[Reset] Scene reset complete, script restarting\n")
+                continue  # Restart loop so get_poses() reads the fresh synced values
+            
+            # ===== SCRIPT EXECUTOR =====
+            if script_executor is not None and not script_executor.finished:
+                # Get current EE positions in world frame for the executor
+                _left_ee_w = robot.data.body_pos_w[:, left_body_idx]
+                _left_eq_w = robot.data.body_quat_w[:, left_body_idx]
+                _right_ee_w = robot.data.body_pos_w[:, right_body_idx]
+                _right_eq_w = robot.data.body_quat_w[:, right_body_idx]
+                
+                _left_ee_np = _left_ee_w[0].cpu().numpy()
+                _right_ee_np = _right_ee_w[0].cpu().numpy()
+                _left_eq_np = _left_eq_w[0].cpu().numpy()
+                _right_eq_np = _right_eq_w[0].cpu().numpy()
+                
+                # Read contact forces
+                _left_force = 0.0
+                _right_force = 0.0
+                if left_contact_sensor is not None:
+                    try:
+                        forces = left_contact_sensor.data.net_forces_w
+                        _left_force = float(torch.norm(forces, dim=-1).max().cpu())
+                    except Exception:
+                        pass
+                if right_contact_sensor is not None:
+                    try:
+                        forces = right_contact_sensor.data.net_forces_w
+                        _right_force = float(torch.norm(forces, dim=-1).max().cpu())
+                    except Exception:
+                        pass
+                
+                sim_time = step_count * 0.01  # Approximate sim time at 100Hz
+                script_executor.step(
+                    sim_time,
+                    left_ee_pos=_left_ee_np,
+                    right_ee_pos=_right_ee_np,
+                    left_contact_force=_left_force,
+                    right_contact_force=_right_force,
+                    current_left_pos=_left_ee_np,
+                    current_right_pos=_right_ee_np,
+                    current_left_quat=_left_eq_np,
+                    current_right_quat=_right_eq_np,
+                )
+                
+                # Handle spawn requests from script
+                if script_executor.spawn_request is not None:
+                    pos, size, color, name = script_executor.spawn_request
+                    spawn_cube(stage, position=tuple(pos), size=size, color=tuple(color))
+                    script_executor.spawn_request = None
+                
+                # Override input poses with script targets (world coords)
+                if script_executor.left_target_pos is not None:
+                    left_pose[:3] = script_executor.left_target_pos
+                    if hasattr(input_device, 'left_pose'):
+                        input_device.left_pose[:3] = script_executor.left_target_pos
+                if script_executor.right_target_pos is not None:
+                    right_pose[:3] = script_executor.right_target_pos
+                    if hasattr(input_device, 'right_pose'):
+                        input_device.right_pose[:3] = script_executor.right_target_pos
+                
+                if script_executor.left_target_quat is not None:
+                    left_pose[3:7] = script_executor.left_target_quat
+                    if hasattr(input_device, 'left_pose'):
+                        input_device.left_pose[3:7] = script_executor.left_target_quat
+                if script_executor.right_target_quat is not None:
+                    right_pose[3:7] = script_executor.right_target_quat
+                    if hasattr(input_device, 'right_pose'):
+                        input_device.right_pose[3:7] = script_executor.right_target_quat
+                
+                # Override gripper targets from script
+                if script_executor.left_gripper_target is not None:
+                    left_trigger = script_executor.left_gripper_target
+                    if hasattr(input_device, "left_gripper"):
+                        input_device.left_gripper = left_trigger
+                if script_executor.right_gripper_target is not None:
+                    right_trigger = script_executor.right_gripper_target
+                    if hasattr(input_device, "right_gripper"):
+                        input_device.right_gripper = right_trigger
+                
+                # When script finishes, sync keyboard euler from current pose quat
+                if script_executor.finished and hasattr(input_device, 'left_euler'):
+                    def _quat_to_euler(q):
+                        w, x, y, z = q[0], q[1], q[2], q[3]
+                        roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
+                        pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
+                        yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+                        return roll, pitch, yaw
+                    
+                    lr, lp, ly = _quat_to_euler(input_device.left_pose[3:7])
+                    input_device.left_euler[:] = [lr, lp, ly]
+                    rr, rp, ry = _quat_to_euler(input_device.right_pose[3:7])
+                    input_device.right_euler[:] = [rr, rp, ry]
+                
+                # Stop loop when script is done and no manual override
+                if script_executor.finished and args.input != "keyboard":
+                    print("[Script] Script finished, exiting...")
+                    break
+            
+            # ===== WRITE GRIPPERS =====
+            # Use set_joint_position_target (PD controller) instead of write_joint_position_to_sim
+            # so that finger contact forces are respected and don't penetrate objects.
+            # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+            if left_gripper_ids:
+                left_pos = gripper_open_pos * (1.0 - left_trigger)
+                left_targets = torch.full(
+                    (1, len(left_gripper_ids)),
+                    left_pos,
+                    device=sim_device,
+                )
+                robot.set_joint_position_target(left_targets, joint_ids=left_gripper_ids)
+            
+            # Right gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+            if right_gripper_ids:
+                right_pos = gripper_open_pos * (1.0 - right_trigger)
+                right_targets = torch.full(
+                    (1, len(right_gripper_ids)),
+                    right_pos,
+                    device=sim_device,
+                )
+                robot.set_joint_position_target(right_targets, joint_ids=right_gripper_ids)
+            
+            # ===== FULL 7-DOF POSE IK =====
+            # Targets are in world coordinates; transform to base frame for IK
             left_target_pos = torch.tensor(left_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
             left_target_quat = torch.tensor(left_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
             right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
             right_target_quat = torch.tensor(right_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
             
-            # Get current end-effector poses in robot base frame
+            # Update target markers (position + orientation)
+            if stage is not None:
+                try:
+                    from pxr import UsdGeom, Gf
+                    markers_vis = input_device.markers_visible if hasattr(input_device, 'markers_visible') else True
+                    for m_path, pos, quat in [
+                        (left_marker_path, left_pose[:3], left_pose[3:7]),
+                        (right_marker_path, right_pose[:3], right_pose[3:7]),
+                    ]:
+                        m_prim = stage.GetPrimAtPath(m_path)
+                        if m_prim.IsValid():
+                            xform = UsdGeom.Xformable(m_prim)
+                            ops = xform.GetOrderedXformOps()
+                            if len(ops) >= 2:
+                                ops[0].Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                                ops[1].Set(Gf.Quatf(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])))
+                            img = UsdGeom.Imageable(m_prim)
+                            if markers_vis:
+                                img.MakeVisible()
+                            else:
+                                img.MakeInvisible()
+                except Exception:
+                    pass
+            
+            # Robot base frame
             root_pos_w = robot.data.root_pos_w
             root_quat_w = robot.data.root_quat_w
             
-            # Left arm EE pose
+            # Transform targets from world to base frame
+            left_target_pos_b, left_target_quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, left_target_pos, left_target_quat
+            )
+            right_target_pos_b, right_target_quat_b = math_utils.subtract_frame_transforms(
+                root_pos_w, root_quat_w, right_target_pos, right_target_quat
+            )
+            
+            # Current EE poses in base frame
             left_ee_pos_w = robot.data.body_pos_w[:, left_body_idx]
             left_ee_quat_w = robot.data.body_quat_w[:, left_body_idx]
             left_ee_pos_b, left_ee_quat_b = math_utils.subtract_frame_transforms(
                 root_pos_w, root_quat_w, left_ee_pos_w, left_ee_quat_w
             )
-            
-            # Right arm EE pose
             right_ee_pos_w = robot.data.body_pos_w[:, right_body_idx]
             right_ee_quat_w = robot.data.body_quat_w[:, right_body_idx]
             right_ee_pos_b, right_ee_quat_b = math_utils.subtract_frame_transforms(
                 root_pos_w, root_quat_w, right_ee_pos_w, right_ee_quat_w
             )
             
-            # Get Jacobians for position IK (only joints 1-4)
+            # Jacobians (full 7 joints for hand body)
             jacobians = robot.root_physx_view.get_jacobians()
-            
-            # Left arm Jacobian (only for joints 1-4)
-            left_jacobian_w = jacobians[:, left_jacobi_body_idx, :, left_jacobi_joint_ids]
             base_rot_matrix = math_utils.matrix_from_quat(math_utils.quat_inv(root_quat_w))
+            
+            left_jacobian_w = jacobians[:, left_jacobi_body_idx, :, left_jacobi_joint_ids]
             left_jacobian_b = left_jacobian_w.clone()
             left_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, :3, :])
             left_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, left_jacobian_w[:, 3:, :])
             
-            # Right arm Jacobian (only for joints 1-4)
             right_jacobian_w = jacobians[:, right_jacobi_body_idx, :, right_jacobi_joint_ids]
             right_jacobian_b = right_jacobian_w.clone()
             right_jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, :3, :])
             right_jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, right_jacobian_w[:, 3:, :])
             
-            # Get current joint positions for position IK (joints 1-4 only)
-            left_pos_joint_pos = robot.data.joint_pos[:, left_pos_joint_ids]
-            right_pos_joint_pos = robot.data.joint_pos[:, right_pos_joint_ids]
+            # Current joint positions (all 7)
+            left_joint_pos = robot.data.joint_pos[:, left_arm_joint_ids]
+            right_joint_pos = robot.data.joint_pos[:, right_arm_joint_ids]
             
-            # ===== POSITION IK (joints 1-4) =====
-            # Set position target (position-only IK needs ee_quat for reference)
-            left_ik_controller.set_command(left_target_pos, ee_quat=left_ee_quat_b)
-            right_ik_controller.set_command(right_target_pos, ee_quat=right_ee_quat_b)
+            # Set IK commands (position + orientation in base frame)
+            left_pose_cmd = torch.cat([left_target_pos_b, left_target_quat_b], dim=-1)
+            right_pose_cmd = torch.cat([right_target_pos_b, right_target_quat_b], dim=-1)
             
-            # Compute position IK for joints 1-4
-            left_pos_des = left_ik_controller.compute(
-                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_pos_joint_pos
+            left_ik_controller.set_command(left_pose_cmd)
+            right_ik_controller.set_command(right_pose_cmd)
+            
+            # Compute IK -> 7 joint targets per arm
+            left_joint_des = left_ik_controller.compute(
+                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
             )
-            right_pos_des = right_ik_controller.compute(
-                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_pos_joint_pos
+            right_joint_des = right_ik_controller.compute(
+                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
             )
             
-            # ===== WRIST DIRECT CONTROL (joints 5-7) =====
-            # Joint 5: Z-axis (forearm twist/yaw)
-            # Joint 6: X-axis (wrist flex/roll)
-            # Joint 7: Y-axis (wrist deviation/pitch)
-            
-            # Extract Euler angles from VR target quaternion
-            left_q = left_target_quat[0].cpu().numpy()
-            right_q = right_target_quat[0].cpu().numpy()
-            
-            def extract_euler(q):
-                """Extract roll (X), pitch (Y), yaw (Z) from quaternion (w,x,y,z)."""
-                w, x, y, z = q[0], q[1], q[2], q[3]
-                # Roll (X-axis)
-                sinr_cosp = 2.0 * (w * x + y * z)
-                cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-                roll = np.arctan2(sinr_cosp, cosr_cosp)
-                # Pitch (Y-axis)
-                sinp = 2.0 * (w * y - z * x)
-                pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
-                # Yaw (Z-axis)
-                siny_cosp = 2.0 * (w * z + x * y)
-                cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-                yaw = np.arctan2(siny_cosp, cosy_cosp)
-                return roll, pitch, yaw
-            
-            left_roll, left_pitch, left_yaw = extract_euler(left_q)
-            right_roll, right_pitch, right_yaw = extract_euler(right_q)
-            
-            # Track initial Euler offsets (set on first frame or reset)
-            if not hasattr(run_teleop, '_init_left_euler'):
-                run_teleop._init_left_euler = (left_roll, left_pitch, left_yaw)
-                run_teleop._init_right_euler = (right_roll, right_pitch, right_yaw)
-            
-            # Compute deltas from initial orientation
-            left_j5 = left_yaw - run_teleop._init_left_euler[2]  # Z-axis
-            left_j6 = left_roll - run_teleop._init_left_euler[0]  # X-axis
-            left_j7 = left_pitch - run_teleop._init_left_euler[1]  # Y-axis
-            
-            # Right arm is mirrored, negate rotations
-            right_j5 = -(right_yaw - run_teleop._init_right_euler[2])
-            right_j6 = -(right_roll - run_teleop._init_right_euler[0])
-            right_j7 = -(right_pitch - run_teleop._init_right_euler[1])
-            
-            # Wrap to [-π, π]
-            def wrap_angle(a):
-                return np.arctan2(np.sin(a), np.cos(a))
-            left_j5, left_j6, left_j7 = wrap_angle(left_j5), wrap_angle(left_j6), wrap_angle(left_j7)
-            right_j5, right_j6, right_j7 = wrap_angle(right_j5), wrap_angle(right_j6), wrap_angle(right_j7)
-            
-            # Debug print occasionally
-            if step_count % 60 == 0:
-                print(f"[WRIST] L: j5={np.degrees(left_j5):.1f} j6={np.degrees(left_j6):.1f} j7={np.degrees(left_j7):.1f} deg")
-                print(f"        R: j5={np.degrees(right_j5):.1f} j6={np.degrees(right_j6):.1f} j7={np.degrees(right_j7):.1f} deg")
-            
-            # Apply to joints 5, 6, 7
-            left_wrist_des = torch.tensor([[left_j5, left_j6, left_j7]], dtype=torch.float32, device=sim_device)
-            right_wrist_des = torch.tensor([[right_j5, right_j6, right_j7]], dtype=torch.float32, device=sim_device)
-            
-            # Apply joint position targets
-            robot.set_joint_position_target(left_pos_des, joint_ids=left_pos_joint_ids)
-            robot.set_joint_position_target(left_wrist_des, joint_ids=left_wrist_joint_ids)
-            robot.set_joint_position_target(right_pos_des, joint_ids=right_pos_joint_ids)
-            robot.set_joint_position_target(right_wrist_des, joint_ids=right_wrist_joint_ids)
+            # Apply all 7 joint targets per arm
+            robot.set_joint_position_target(left_joint_des, joint_ids=left_arm_joint_ids)
+            robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
             
             # Write the articulation data to simulation
             robot.write_data_to_sim()

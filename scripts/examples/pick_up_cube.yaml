@@ -1,0 +1,46 @@
+# Pick Up Cube - Example Script for OpenArm Bimanual IK Teleoperation
+#
+# Demonstrates: spawning a cube, moving the left arm to pick it up,
+# and lifting it using force-controlled grasping.
+#
+# All positions and orientations are in world (global) coordinates.
+# Full 7-DOF IK solves all joints to reach the target end-effector pose.
+#
+# move_to: position (+ optional rotation) of end-effector
+# rotate:  change only the EE orientation (keeps position)
+#
+# Usage:
+#   ./scripts/teleop_bimanual.sh --input keyboard --script scripts/examples/pick_up_cube.yaml
+
+# # Step 2: Spawn the cube
+# - print: "Spawning cube on table"
+- spawn_cube: {name: block1, random_area: {x: [0.25, 0.4], y: [-0.0, 0.15], z: [0.5, 0.5]}}
+#- wait: 1.5
+
+# Step 1: Lift arms above table (keep current orientation)
+- print: "Preparing arms - lifting above table"
+- parallel:
+  - move_to: {arm: left, position: [0.0, 0.25, 0.45], duration: 0.5}
+  - move_to: {arm: right, position: [0.0, -0.25, 0.45], duration: 0.5}
+- wait_until_reached: {arm: both}
+
+# # Step 3: Move left arm above the cube (auto-orients toward cube)
+- print: "Moving above block1"
+- move_to: {arm: left, to: block1, above: 0.07, duration: 1.0}
+- wait_until_reached: {arm: left}
+
+# # Step 4: Lower onto the cube (auto-orients toward cube)
+- print: "Lowering onto block1"
+- move_to: {arm: left, to: block1, above: 0.0, duration: 0.1}
+- wait_until_reached: {arm: left}
+
+# # Step 5: Grasp
+- print: "Grasping (force-controlled)"
+- close_gripper: {arm: left, force: 0.1, duration: 0.5}  # Gentle & slow
+
+# # Step 6: Lift
+- print: "Lifting block1"
+- move_to: {arm: left, position: [0.5, 0.55, 0.55], duration: 1.5}
+- wait_until_reached: {arm: left}
+
+# - print: "Done!"

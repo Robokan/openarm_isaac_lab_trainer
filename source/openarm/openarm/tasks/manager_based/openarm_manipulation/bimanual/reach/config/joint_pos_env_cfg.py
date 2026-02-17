@@ -28,6 +28,7 @@ from ..reach_env_cfg import (
 
 from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
     OPEN_ARM_HIGH_PD_CFG,
+    OPEN_ARM_FACTORY_HIGH_PD_CFG,
 )
 from isaaclab.assets.articulation import ArticulationCfg
 
@@ -140,7 +141,8 @@ class OpenArmReachEnvCfg_PLAY(OpenArmReachEnvCfg):
 class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
     """Reach configuration with reachability-aware sampling for teleoperation.
     
-    Uses sphere + box intersection for target positions:
+    Uses the factory USD (with built-in table and cameras) and
+    sphere + box intersection for target positions:
     - Sphere: centered at shoulder, radius = arm length (0.40m)
     - Box: practical workspace limits
     
@@ -151,6 +153,31 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
     def __post_init__(self):
         # post init of parent
         super().__post_init__()
+
+        # Use factory USD (includes table + cameras)
+        self.scene.robot = OPEN_ARM_FACTORY_HIGH_PD_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/Robot",
+            init_state=ArticulationCfg.InitialStateCfg(
+                joint_pos={
+                    "openarm_left_joint1": 0.0,
+                    "openarm_left_joint2": 0.0,
+                    "openarm_left_joint3": 0.0,
+                    "openarm_left_joint4": 0.0,
+                    "openarm_left_joint5": 0.0,
+                    "openarm_left_joint6": 0.0,
+                    "openarm_left_joint7": 0.0,
+                    "openarm_right_joint1": 0.0,
+                    "openarm_right_joint2": 0.0,
+                    "openarm_right_joint3": 0.0,
+                    "openarm_right_joint4": 0.0,
+                    "openarm_right_joint5": 0.0,
+                    "openarm_right_joint6": 0.0,
+                    "openarm_right_joint7": 0.0,
+                    "openarm_left_finger_joint.*": 0.0,
+                    "openarm_right_finger_joint.*": 0.0,
+                },
+            ),
+        )
 
         # Create marker configs with unique paths for each arm
         left_goal_marker = FRAME_MARKER_CFG.replace(

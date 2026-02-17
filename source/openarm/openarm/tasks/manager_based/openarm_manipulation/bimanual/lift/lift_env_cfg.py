@@ -38,6 +38,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import FrameTransformerCfg
+from isaaclab.sensors.contact_sensor.contact_sensor_cfg import ContactSensorCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -129,6 +130,20 @@ class BimanualLiftSceneCfg(InteractiveSceneCfg):
         ),
     )
     
+    # Contact sensors on gripper fingers for force-based grasping
+    left_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/openarm_left_finger_link.*",
+        update_period=0.0,
+        history_length=6,
+        force_threshold=1.0,
+    )
+    right_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/openarm_right_finger_link.*",
+        update_period=0.0,
+        history_length=6,
+        force_threshold=1.0,
+    )
+
     # Ground plane for physics (invisible, just for collisions)
     plane = AssetBaseCfg(
         prim_path="/World/GroundPlane",

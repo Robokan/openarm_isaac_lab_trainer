@@ -23,6 +23,7 @@ from source.openarm.openarm.tasks.manager_based.openarm_manipulation import (
 OPEN_ARM_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=f"{OPENARM_ROOT_DIR}/usds/openarm_bimanual/openarm_bimanual.usd",
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
@@ -98,8 +99,8 @@ OPEN_ARM_HIGH_PD_CFG = OPEN_ARM_CFG.copy()
 OPEN_ARM_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
 OPEN_ARM_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 400.0
 OPEN_ARM_HIGH_PD_CFG.actuators["openarm_arm"].damping = 80.0
-OPEN_ARM_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 2e3
-OPEN_ARM_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 1e2
+OPEN_ARM_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 100.0
+OPEN_ARM_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 10.0
 """Configuration of OpenArm robot with stiffer PD control.
 
 This configuration is useful for task-space control using differential IK.
@@ -118,6 +119,6 @@ OPEN_ARM_FACTORY_HIGH_PD_CFG = OPEN_ARM_FACTORY_CFG.copy()
 OPEN_ARM_FACTORY_HIGH_PD_CFG.spawn.rigid_props.disable_gravity = True
 OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 400.0
 OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].damping = 80.0
-OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 2e3
-OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 1e2
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 100.0
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 10.0
 """Configuration of OpenArm robot with cameras and stiffer PD control."""

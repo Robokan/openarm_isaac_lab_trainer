@@ -9,6 +9,7 @@ set -e
 #   ./scripts/teleop_bimanual.sh --input xr           # VR handtracking (requires WiVRn)
 #   ./scripts/teleop_bimanual.sh --input vive          # Vive controllers (requires SteamVR)
 #   ./scripts/teleop_bimanual.sh --input gamepad       # Xbox gamepad
+#   ./scripts/teleop_bimanual.sh --input keyboard --script scripts/examples/pick_up_cube.yaml  # Scripted mode
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -80,5 +81,8 @@ elif [[ "$INPUT_MODE" == "vive" ]]; then
     python -m pip install openvr >/dev/null 2>&1 || true
 fi
 
+# Ensure pyyaml is available for script mode
+python -c "import yaml" 2>/dev/null || python -m pip install pyyaml >/dev/null 2>&1 || true
+
 # Run IK teleoperation script
-python ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 "$@"
+python ./scripts/teleoperation/teleop_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 "$@"
