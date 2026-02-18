@@ -32,7 +32,7 @@ done
 cd "${REPO_ROOT}"
 
 # Activate Isaac Lab environment
-source "${REPO_ROOT}/scripts/activate_env.sh"
+source "${REPO_ROOT}/scripts/source_me.sh"
 
 # Avoid system CUDA libs overriding Isaac Sim bundled libs
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then

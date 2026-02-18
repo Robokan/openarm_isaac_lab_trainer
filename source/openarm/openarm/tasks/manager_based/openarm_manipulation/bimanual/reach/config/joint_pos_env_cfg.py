@@ -179,33 +179,25 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
             ),
         )
 
-        # Create marker configs with unique paths for each arm
-        left_goal_marker = FRAME_MARKER_CFG.replace(
-            prim_path="/Visuals/Command/left_goal_pose"
+        # Warehouse environment for visualization (visual-only, no collision)
+        self.scene.warehouse = AssetBaseCfg(
+            prim_path="/World/Warehouse",
+            init_state=AssetBaseCfg.InitialStateCfg(pos=[0, 0, 0]),
+            spawn=UsdFileCfg(
+                usd_path="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/Environments/Simple_Warehouse/warehouse.usd",
+                collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            ),
         )
-        left_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
-        left_body_marker = FRAME_MARKER_CFG.replace(
-            prim_path="/Visuals/Command/left_body_pose"
-        )
-        left_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
-
-        right_goal_marker = FRAME_MARKER_CFG.replace(
-            prim_path="/Visuals/Command/right_goal_pose"
-        )
-        right_goal_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
-        right_body_marker = FRAME_MARKER_CFG.replace(
-            prim_path="/Visuals/Command/right_body_pose"
-        )
-        right_body_marker.markers["frame"].scale = (0.1, 0.1, 0.1)
 
         # Left arm: sphere (arm reach) + box (workspace) intersection
         # Sphere: shoulder at (0, -0.15, 0.7), radius 0.40m
         # Box: x [0, 0.5], y [-0.5, 0.2], z [0.3, 1.0]
+        # debug_vis=False to hide gripper markers (we use custom VR target markers instead)
         self.commands.left_ee_pose = mdp.SphericalPoseCommandCfg(
             asset_name="robot",
             body_name="openarm_left_hand",
             resampling_time_range=(4.0, 4.0),
-            debug_vis=True,
+            debug_vis=False,
             sphere_center=(0.0, -0.15, 0.7),
             sphere_radius=0.45,
             box_x=(0.115, 0.565),
@@ -216,8 +208,6 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
                 pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
                 yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
             ),
-            goal_pose_visualizer_cfg=left_goal_marker,
-            current_pose_visualizer_cfg=left_body_marker,
         )
 
         # Right arm: sphere (arm reach) + box (workspace) intersection
@@ -227,7 +217,7 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
             asset_name="robot",
             body_name="openarm_right_hand",
             resampling_time_range=(4.0, 4.0),
-            debug_vis=True,
+            debug_vis=False,
             sphere_center=(0.0, 0.15, 0.7),
             sphere_radius=0.56,
             box_x=(0.115, 0.565),
@@ -238,8 +228,6 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
                 pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
                 yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
             ),
-            goal_pose_visualizer_cfg=right_goal_marker,
-            current_pose_visualizer_cfg=right_body_marker,
         )
 
         # Randomize starting joint pose (arms only, smaller offsets)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Activate the Isaac Lab environment with Isaac Sim paths
 #
-# Usage: source ./scripts/activate_env.sh
+# Usage: source ./scripts/source_me.sh
 
 ISAAC_LAB_PATH="${ISAAC_LAB_PATH:-$HOME/sparkpack/IsaacLab}"
 

@@ -707,7 +707,7 @@ class XRDevice:
                 if left_hand is not None:
                     quat = _quat_from_pose(left_hand)
                     if quat is not None:
-                        self.left_pose[3:7] = _map_xr_quat(quat)
+                        self.left_pose[3:7] = _map_xr_quat(quat, hand="left")
                 if right_hand is not None:
                     pos = _pos_from_pose(right_hand)
                     if pos is not None:
@@ -720,7 +720,7 @@ class XRDevice:
                 if right_hand is not None:
                     quat = _quat_from_pose(right_hand)
                     if quat is not None:
-                        self.right_pose[3:7] = _map_xr_quat(quat)
+                        self.right_pose[3:7] = _map_xr_quat(quat, hand="right")
             else:
                 import time
                 now = time.time()
@@ -920,6 +920,53 @@ class XRDevice:
         
         return states
 
+    def get_thumbstick_values(self):
+        """Get thumbstick X/Y values from both controllers.
+        
+        Returns dict with thumbstick values in range [-1, 1]:
+        {'left_x': float, 'left_y': float, 'right_x': float, 'right_y': float}
+        """
+        values = {'left_x': 0.0, 'left_y': 0.0, 'right_x': 0.0, 'right_y': 0.0}
+        
+        if self._xr_core is None:
+            return values
+        
+        try:
+            from omni.kit.xr.core import XRCore
+            xr = XRCore.get_singleton()
+            if xr is None:
+                return values
+            
+            if hasattr(xr, 'get_input_device'):
+                left_dev = xr.get_input_device("/user/hand/left")
+                right_dev = xr.get_input_device("/user/hand/right")
+                
+                # Debug: print available gestures once
+                if not hasattr(self, '_debug_thumbstick_printed'):
+                    self._debug_thumbstick_printed = True
+                    if left_dev and hasattr(left_dev, 'has_input_gesture'):
+                        for gesture in ['thumbstick', 'trackpad', 'joystick', 'primary2d']:
+                            for component in ['x', 'y', 'click', 'touch']:
+                                if left_dev.has_input_gesture(gesture, component):
+                                    print(f"[DEBUG] Left has: {gesture}/{component}")
+                
+                # Try various gesture names for thumbstick
+                for dev, prefix in [(left_dev, 'left'), (right_dev, 'right')]:
+                    if dev and hasattr(dev, 'has_input_gesture'):
+                        # Try common OpenXR thumbstick gesture names
+                        for gesture_name in ['thumbstick', 'primary2d', 'trackpad', 'joystick']:
+                            if dev.has_input_gesture(gesture_name, 'x'):
+                                values[f'{prefix}_x'] = float(dev.get_input_gesture_value(gesture_name, 'x'))
+                            if dev.has_input_gesture(gesture_name, 'y'):
+                                values[f'{prefix}_y'] = float(dev.get_input_gesture_value(gesture_name, 'y'))
+                            # Break if we found values
+                            if values[f'{prefix}_x'] != 0.0 or values[f'{prefix}_y'] != 0.0:
+                                break
+        except Exception as e:
+            pass
+        
+        return values
+
     def __del__(self):
         if self._input and self._keyboard and self._sub_keyboard:
             try:
@@ -1058,16 +1105,28 @@ def _rot_matrix_from_quat(quat):
     )
 
 
-def _map_xr_quat(quat):
-    """Map OpenXR orientation into robot space using the same axis mapping."""
+def _map_xr_quat(quat, hand="left"):
+    """Map OpenXR orientation into robot space using the same axis mapping.
+    
+    Args:
+        quat: Input quaternion from XR controller
+        hand: "left" or "right" - applies different Z rotations per hand
+    """
     try:
         m = _get_xr_map_matrix()
         r = _rot_matrix_from_quat(quat)
         r_mapped = m @ r @ m.T
         
         # Optional rotation corrections
-        rot_x_deg = float(os.environ.get("XR_GRIPPER_ROT_X_DEG", "-180"))
+        # X rotation: -180 flips gripper, -135 tilts 45° down toward table
+        rot_x_deg = float(os.environ.get("XR_GRIPPER_ROT_X_DEG", "-135"))
         rot_y_deg = float(os.environ.get("XR_GRIPPER_ROT_Y_DEG", "0"))
+        
+        # Per-hand Z rotation to align VR controllers with robot wrists
+        if hand == "left":
+            rot_z_deg = -90.0  # Left wrist: -90
+        else:
+            rot_z_deg = -90.0  # Right wrist: -90 (confirmed working)
         
         if rot_x_deg != 0:
             rot_x = math.radians(rot_x_deg)
@@ -1082,6 +1141,13 @@ def _map_xr_quat(quat):
             sy = math.sin(rot_y)
             r_fix_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
             r_mapped = r_mapped @ r_fix_y
+        
+        if rot_z_deg != 0:
+            rot_z = math.radians(rot_z_deg)
+            cz = math.cos(rot_z)
+            sz = math.sin(rot_z)
+            r_fix_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+            r_mapped = r_mapped @ r_fix_z
         
         return _quat_from_rot_matrix(
             r_mapped[0, 0], r_mapped[0, 1], r_mapped[0, 2],
@@ -1805,7 +1871,7 @@ def run_teleop(env, args):
         command_type="pose",
         use_relative_mode=False,
         ik_method="dls",
-        ik_params={"lambda_val": 0.1},
+        ik_params={"lambda_val": 0.05},  # Lower = more responsive, but less stable near singularities
     )
     left_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
     right_ik_controller = DifferentialIKController(ik_cfg, num_envs=1, device=sim_device)
@@ -1841,6 +1907,24 @@ def run_teleop(env, args):
     print(f"[INFO] IK joints (1-7): L={left_arm_joint_names}, R={right_arm_joint_names}")
     print(f"[INFO] IK target body (hand): L={left_body_idx}, R={right_body_idx}")
     print(f"[INFO] Jacobi body idx: L={left_jacobi_body_idx}, R={right_jacobi_body_idx}")
+    
+    # Get joint limits for clamping IK output
+    joint_limits_low = robot.data.soft_joint_pos_limits[0, :, 0]
+    joint_limits_high = robot.data.soft_joint_pos_limits[0, :, 1]
+    left_limits_low = joint_limits_low[left_arm_joint_ids]
+    left_limits_high = joint_limits_high[left_arm_joint_ids]
+    right_limits_low = joint_limits_low[right_arm_joint_ids]
+    right_limits_high = joint_limits_high[right_arm_joint_ids]
+    print(f"[INFO] Left arm joint limits: low={left_limits_low.cpu().numpy()}, high={left_limits_high.cpu().numpy()}")
+    
+    # Rest pose for null-space bias (bent elbow configuration)
+    # This helps escape extended-arm singularities by pulling toward a "comfortable" pose
+    # Joint order: j1, j2, j3, j4, j5, j6, j7
+    # j3 is typically the elbow - we want it slightly bent (negative = bent inward for most arms)
+    rest_pose_left = torch.tensor([[0.0, 0.3, -0.8, 0.5, 0.0, 0.0, 0.0]], device=sim_device)
+    rest_pose_right = torch.tensor([[0.0, -0.3, 0.8, 0.5, 0.0, 0.0, 0.0]], device=sim_device)
+    rest_pose_gain = 0.1  # How strongly to pull toward rest pose (0 = none, 1 = strong)
+    print(f"[INFO] Rest pose bias enabled with gain={rest_pose_gain}")
     
     # Add high-friction physics material to gripper finger links
     try:
@@ -2307,14 +2391,58 @@ def run_teleop(env, args):
             right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
             right_target_quat = torch.tensor(right_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
             
-            # Update target markers (position + orientation)
+            # ===== THUMBSTICK WRIST ROTATION OFFSET =====
+            # Add up to ±45 degrees of extra wrist rotation based on thumbstick
+            # Also track offset quaternions for marker visualization
+            left_offset_quat = None
+            right_offset_quat = None
+            
+            if hasattr(input_device, 'get_thumbstick_values'):
+                thumbstick = input_device.get_thumbstick_values()
+                max_angle_deg = 90.0
+                
+                # Left controller thumbstick -> left arm wrist rotation
+                left_stick_x = thumbstick.get('left_x', 0.0)
+                left_stick_y = thumbstick.get('left_y', 0.0)
+                
+                # Right controller thumbstick -> right arm wrist rotation  
+                right_stick_x = thumbstick.get('right_x', 0.0)
+                right_stick_y = thumbstick.get('right_y', 0.0)
+                
+                # Apply rotation offset if thumbstick is moved
+                # Y (forward/back) controls pitch, X (left/right) controls roll/twist
+                # Both axes inverted per user request
+                if abs(left_stick_x) > 0.1 or abs(left_stick_y) > 0.1:
+                    pitch_rad = math.radians(-left_stick_y * max_angle_deg)  # Forward/back -> pitch (inverted)
+                    roll_rad = math.radians(-left_stick_x * max_angle_deg)   # Left/right -> roll/twist (inverted)
+                    left_offset_quat = math_utils.quat_from_euler_xyz(
+                        torch.tensor([roll_rad], device=sim_device),   # Roll (X)
+                        torch.tensor([pitch_rad], device=sim_device),  # Pitch (Y)
+                        torch.tensor([0.0], device=sim_device)         # Yaw (Z)
+                    )  # Shape: [1, 4]
+                    left_target_quat = math_utils.quat_mul(left_target_quat, left_offset_quat)
+                
+                if abs(right_stick_x) > 0.1 or abs(right_stick_y) > 0.1:
+                    pitch_rad = math.radians(-right_stick_y * max_angle_deg)  # Inverted
+                    roll_rad = math.radians(-right_stick_x * max_angle_deg)   # Inverted
+                    right_offset_quat = math_utils.quat_from_euler_xyz(
+                        torch.tensor([roll_rad], device=sim_device),
+                        torch.tensor([pitch_rad], device=sim_device),
+                        torch.tensor([0.0], device=sim_device)
+                    )  # Shape: [1, 4]
+                    right_target_quat = math_utils.quat_mul(right_target_quat, right_offset_quat)
+            
+            # Update target markers (position + orientation, including thumbstick offset)
             if stage is not None:
                 try:
                     from pxr import UsdGeom, Gf
                     markers_vis = input_device.markers_visible if hasattr(input_device, 'markers_visible') else True
+                    # Use the modified quaternions (with thumbstick offset) for markers
+                    left_marker_quat = left_target_quat[0].cpu().numpy()
+                    right_marker_quat = right_target_quat[0].cpu().numpy()
                     for m_path, pos, quat in [
-                        (left_marker_path, left_pose[:3], left_pose[3:7]),
-                        (right_marker_path, right_pose[:3], right_pose[3:7]),
+                        (left_marker_path, left_pose[:3], left_marker_quat),
+                        (right_marker_path, right_pose[:3], right_marker_quat),
                     ]:
                         m_prim = stage.GetPrimAtPath(m_path)
                         if m_prim.IsValid():
@@ -2388,6 +2516,17 @@ def run_teleop(env, args):
                 right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
             )
             
+            # Add rest pose bias to help escape singularities (like extended arm)
+            # This gently pulls joints toward a "comfortable" bent-elbow configuration
+            left_rest_pull = rest_pose_gain * (rest_pose_left - left_joint_pos)
+            right_rest_pull = rest_pose_gain * (rest_pose_right - right_joint_pos)
+            left_joint_des = left_joint_des + left_rest_pull
+            right_joint_des = right_joint_des + right_rest_pull
+            
+            # Clamp IK output to joint limits to prevent getting stuck
+            left_joint_des = torch.clamp(left_joint_des, left_limits_low, left_limits_high)
+            right_joint_des = torch.clamp(right_joint_des, right_limits_low, right_limits_high)
+            
             # Apply all 7 joint targets per arm
             robot.set_joint_position_target(left_joint_des, joint_ids=left_arm_joint_ids)
             robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
@@ -2404,10 +2543,26 @@ def run_teleop(env, args):
             # Print status periodically
             step_count += 1
             if step_count % 60 == 0:
+                # Compute position errors (target - current)
+                left_pos_err = (left_target_pos_b - left_ee_pos_b)[0].cpu().numpy()
+                right_pos_err = (right_target_pos_b - right_ee_pos_b)[0].cpu().numpy()
+                left_err_mag = np.linalg.norm(left_pos_err)
+                right_err_mag = np.linalg.norm(right_pos_err)
+                
+                # Compute joint deltas (how much IK wants to move)
+                left_joint_delta = (left_joint_des - left_joint_pos)[0].cpu().numpy()
+                right_joint_delta = (right_joint_des - right_joint_pos)[0].cpu().numpy()
+                
                 print(f"Step {step_count:5d} | "
                       f"L:[{left_pose[0]:.2f},{left_pose[1]:.2f},{left_pose[2]:.2f}] | "
                       f"R:[{right_pose[0]:.2f},{right_pose[1]:.2f},{right_pose[2]:.2f}] | "
                       f"Grip L:{left_trigger:.2f} R:{right_trigger:.2f}")
+                
+                # Show IK errors if significant
+                if left_err_mag > 0.02 or right_err_mag > 0.02:
+                    print(f"  [IK] Pos err: L={left_err_mag:.3f}m R={right_err_mag:.3f}m")
+                    print(f"  [IK] L delta: [{', '.join(f'{d:.3f}' for d in left_joint_delta)}]")
+                    print(f"  [IK] R delta: [{', '.join(f'{d:.3f}' for d in right_joint_delta)}]")
                 
     except KeyboardInterrupt:
         print("\n[INFO] Teleoperation stopped by user")

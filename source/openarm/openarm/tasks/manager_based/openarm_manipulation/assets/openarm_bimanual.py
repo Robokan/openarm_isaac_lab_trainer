@@ -121,4 +121,5 @@ OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].stiffness = 400.0
 OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_arm"].damping = 80.0
 OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].stiffness = 100.0
 OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].damping = 10.0
+OPEN_ARM_FACTORY_HIGH_PD_CFG.actuators["openarm_gripper"].velocity_limit_sim = 0.5
 """Configuration of OpenArm robot with cameras and stiffer PD control."""
