@@ -1916,7 +1916,7 @@ def spawn_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0], scale=0.01
         print(f"[Object] Could not reload physics: {e}", flush=True)
     
     print(f"[Object] Spawned {obj_type} '{obj_name}' at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), scale={scale}", flush=True)
-    return object_path
+    return object_path, usd_path  # Return both path and USD asset path
 
 
 def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=None, object_counter=[0]):
@@ -1977,7 +1977,7 @@ def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=None, object_c
         print(f"[Object] Could not reload physics: {e}", flush=True)
     
     print(f"[Object] Spawned cube at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})", flush=True)
-    return cube_path
+    return cube_path, None  # Return tuple with None for usd_path
 
 
 def spawn_random_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0]):
@@ -1989,9 +1989,9 @@ def spawn_random_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0]):
         object_counter: mutable counter for unique naming
     
     Returns:
-        Path to the spawned object prim
+        Tuple of (prim_path, usd_asset_path) where usd_asset_path is None for cubes
     """
-    # 50% chance of mug, 50% chance of cube
+    # 50% chance of mug/fruit, 50% chance of cube
     if random.random() < 0.5:
         return spawn_object(stage, position, object_counter)
     else:
@@ -2435,7 +2435,7 @@ def run_teleop(env, args):
                         
                         # Find all spawned objects and record their positions
                         if stage is not None:
-                            from pxr import UsdGeom, Gf
+                            from pxr import UsdGeom, Gf, Sdf
                             for prim in stage.Traverse():
                                 prim_path = str(prim.GetPath())
                                 if prim_path.startswith("/World/spawned_"):
@@ -2458,12 +2458,31 @@ def run_teleop(env, args):
                                                 rot = [float(q.GetReal()), float(q.GetImaginary()[0]), 
                                                        float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
                                         
-                                        initial_conditions["objects"].append({
+                                        # Detect object type from prim path and get USD reference if any
+                                        obj_type = "cube"  # default
+                                        usd_path = None
+                                        
+                                        if "spawned_cube_" in prim_path:
+                                            obj_type = "cube"
+                                        elif "spawned_object_" in prim_path:
+                                            obj_type = "usd_reference"
+                                            # Get the USD reference path
+                                            refs = prim.GetReferences()
+                                            ref_list = refs.GetAddedOrExplicitItems()
+                                            if ref_list:
+                                                usd_path = str(ref_list[0].assetPath)
+                                        
+                                        obj_data = {
                                             "prim_path": prim_path,
+                                            "type": obj_type,
                                             "position": pos,
                                             "orientation": rot,
                                             "scale": scale,
-                                        })
+                                        }
+                                        if usd_path:
+                                            obj_data["usd_path"] = usd_path
+                                        
+                                        initial_conditions["objects"].append(obj_data)
                                     except Exception as e:
                                         print(f"[LeRobot] Could not get transform for {prim_path}: {e}")
                         
@@ -2574,9 +2593,15 @@ def run_teleop(env, args):
                             
                             # Save initial conditions (objects, robot state at start)
                             if "initial_conditions" in lerobot_current_episode:
+                                init_cond = lerobot_current_episode["initial_conditions"]
+                                # Add spawn events (objects spawned during recording)
+                                if "spawn_events" in lerobot_current_episode:
+                                    init_cond["spawn_events"] = lerobot_current_episode["spawn_events"]
                                 with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
-                                    json.dump(lerobot_current_episode["initial_conditions"], f, indent=2)
-                                print(f"[LeRobot] Saved initial conditions: {len(lerobot_current_episode['initial_conditions'].get('objects', []))} objects")
+                                    json.dump(init_cond, f, indent=2)
+                                num_initial = len(init_cond.get('objects', []))
+                                num_spawned = len(init_cond.get('spawn_events', []))
+                                print(f"[LeRobot] Saved initial conditions: {num_initial} initial objects, {num_spawned} spawn events")
                             
                             # Also create/update top-level metadata for play script
                             top_metadata_path = os.path.join(lerobot_output_dir, "metadata.json")
@@ -2591,7 +2616,6 @@ def run_teleop(env, args):
                             with open(top_metadata_path, "w") as f:
                                 json.dump(top_metadata, f, indent=2)
                             
-                            lerobot_episode_count += 1
                             duration = num_frames / fps
                             
                             print(f"\n{'='*60}")
@@ -2599,6 +2623,8 @@ def run_teleop(env, args):
                             print(f"[LeRobot] Frames: {num_frames}, Duration: {duration:.1f}s")
                             print(f"[LeRobot] Saved to: {ep_dir}")
                             print(f"{'='*60}\n")
+                            
+                            lerobot_episode_count += 1
                         else:
                             print("[LeRobot] No frames recorded, discarding episode")
                         
@@ -2636,7 +2662,7 @@ def run_teleop(env, args):
                     
                     # Find all spawned objects
                     if stage is not None:
-                        from pxr import UsdGeom, Gf
+                        from pxr import UsdGeom, Gf, Sdf
                         for prim in stage.Traverse():
                             prim_path = str(prim.GetPath())
                             if prim_path.startswith("/World/spawned_"):
@@ -2657,12 +2683,32 @@ def run_teleop(env, args):
                                             q = op.Get()
                                             rot = [float(q.GetReal()), float(q.GetImaginary()[0]),
                                                    float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
-                                    initial_conditions["objects"].append({
+                                    
+                                    # Detect object type from prim path and get USD reference if any
+                                    obj_type = "cube"  # default
+                                    usd_path = None
+                                    
+                                    if "spawned_cube_" in prim_path:
+                                        obj_type = "cube"
+                                    elif "spawned_object_" in prim_path:
+                                        obj_type = "usd_reference"
+                                        # Get the USD reference path
+                                        refs = prim.GetReferences()
+                                        ref_list = refs.GetAddedOrExplicitItems()
+                                        if ref_list:
+                                            usd_path = str(ref_list[0].assetPath)
+                                    
+                                    obj_data = {
                                         "prim_path": prim_path,
+                                        "type": obj_type,
                                         "position": pos,
                                         "orientation": rot,
                                         "scale": scale,
-                                    })
+                                    }
+                                    if usd_path:
+                                        obj_data["usd_path"] = usd_path
+                                    
+                                    initial_conditions["objects"].append(obj_data)
                                 except Exception:
                                     pass
                     
@@ -2773,8 +2819,12 @@ def run_teleop(env, args):
                         
                         # Save initial conditions
                         if "initial_conditions" in lerobot_current_episode:
+                            init_cond = lerobot_current_episode["initial_conditions"]
+                            # Add spawn events (objects spawned during recording)
+                            if "spawn_events" in lerobot_current_episode:
+                                init_cond["spawn_events"] = lerobot_current_episode["spawn_events"]
                             with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
-                                json.dump(lerobot_current_episode["initial_conditions"], f, indent=2)
+                                json.dump(init_cond, f, indent=2)
                         
                         # Update top-level metadata
                         top_metadata_path = os.path.join(lerobot_output_dir, "metadata.json")
@@ -2789,14 +2839,14 @@ def run_teleop(env, args):
                         with open(top_metadata_path, "w") as f:
                             json.dump(top_metadata, f, indent=2)
                         
-                        lerobot_episode_count += 1
-                        
                         print(f"\n{'='*60}")
                         print(f"[LeRobot] RECORDING SAVED - Episode {lerobot_episode_count}")
                         print(f"[LeRobot] Frames: {num_frames}")
                         print(f"[LeRobot] Duration: {num_frames / fps:.1f}s")
                         print(f"[LeRobot] Location: {ep_dir}")
                         print(f"{'='*60}\n")
+                        
+                        lerobot_episode_count += 1
                     else:
                         print("[LeRobot] No frames recorded, discarding episode")
                     
@@ -2812,7 +2862,56 @@ def run_teleop(env, args):
                 spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
                 spawn_z = random.uniform(0.45, 0.55)  # Drop height above table (table surface ~0.255)
                 try:
-                    spawn_random_object(stage, position=(spawn_x, spawn_y, spawn_z))
+                    spawned_path, spawned_usd_path = spawn_random_object(stage, position=(spawn_x, spawn_y, spawn_z))
+                    
+                    # If recording, add spawn event with frame number
+                    print(f"[DEBUG] Spawn complete. lerobot_current_episode={lerobot_current_episode is not None}, spawned_path={spawned_path}", flush=True)
+                    if lerobot_current_episode is not None and spawned_path:
+                        from pxr import UsdGeom, Gf
+                        prim = stage.GetPrimAtPath(spawned_path)
+                        if prim.IsValid():
+                            xformable = UsdGeom.Xformable(prim)
+                            xform_ops = xformable.GetOrderedXformOps()
+                            pos = [spawn_x, spawn_y, spawn_z]
+                            rot = [1.0, 0.0, 0.0, 0.0]
+                            scale = [1.0, 1.0, 1.0]
+                            
+                            for op in xform_ops:
+                                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                    t = op.Get()
+                                    pos = [float(t[0]), float(t[1]), float(t[2])]
+                                elif op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                                    s = op.Get()
+                                    scale = [float(s[0]), float(s[1]), float(s[2])]
+                                elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                                    q = op.Get()
+                                    rot = [float(q.GetReal()), float(q.GetImaginary()[0]), 
+                                           float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
+                            
+                            obj_type = "cube" if "spawned_cube_" in spawned_path else "usd_reference"
+                            obj_data = {
+                                "prim_path": spawned_path,
+                                "type": obj_type,
+                                "position": pos,
+                                "orientation": rot,
+                                "scale": scale,
+                            }
+                            
+                            # Add USD asset path for non-cubes (from spawn function return value)
+                            if obj_type == "usd_reference" and spawned_usd_path:
+                                obj_data["usd_path"] = spawned_usd_path
+                            
+                            # Add as spawn event with frame number (for timed spawning during playback)
+                            current_frame = len(lerobot_current_episode.get("frames", []))
+                            spawn_event = {
+                                "frame": current_frame,
+                                **obj_data
+                            }
+                            
+                            if "spawn_events" not in lerobot_current_episode:
+                                lerobot_current_episode["spawn_events"] = []
+                            lerobot_current_episode["spawn_events"].append(spawn_event)
+                            print(f"[LeRobot] Added spawn event at frame {current_frame}: {spawned_path}")
                 except Exception as e:
                     import traceback
                     print(f"[Object] Spawn failed: {e}", flush=True)

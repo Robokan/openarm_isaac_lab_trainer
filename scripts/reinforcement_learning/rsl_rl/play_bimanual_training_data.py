@@ -129,7 +129,15 @@ def verify_lerobot_fallback_data(data_dir: str, episode_idx: int = None):
     print(f"[INFO] Found {len(episode_dirs)} episodes")
     
     if episode_idx is not None:
-        episode_dirs = [episode_dirs[episode_idx]]
+        # Find episode by name (episode_N) rather than list index
+        target_name = f"episode_{episode_idx}"
+        if target_name in episode_dirs:
+            episode_dirs = [target_name]
+        elif episode_idx < len(episode_dirs):
+            episode_dirs = [episode_dirs[episode_idx]]
+        else:
+            print(f"[ERROR] Episode {episode_idx} not found. Available: {episode_dirs}")
+            return
     
     try:
         import pandas as pd
@@ -364,7 +372,17 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     episode_dirs = sorted([d for d in os.listdir(episodes_dir) if d.startswith("episode_")])
     
     if episode_idx is not None:
-        episode_dirs = [episode_dirs[episode_idx]]
+        # Find episode by name (episode_N) rather than list index
+        target_name = f"episode_{episode_idx}"
+        if target_name in episode_dirs:
+            episode_dirs = [target_name]
+        elif episode_idx < len(episode_dirs):
+            # Fall back to list index if name not found
+            episode_dirs = [episode_dirs[episode_idx]]
+        else:
+            print(f"[ERROR] Episode {episode_idx} not found. Available: {episode_dirs}")
+            simulation_app.close()
+            return
     
     # Load environment config
     from isaaclab_tasks.utils import parse_env_cfg
@@ -423,6 +441,7 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     try:
         while True:
             for ep_dir_name in episode_dirs:
+              try:
                 if stop_playback[0]:
                     break
                 
@@ -447,7 +466,12 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     with open(init_cond_path, "r") as f:
                         init_cond = json.load(f)
                 
-                print(f"\n[INFO] Playing: {ep_dir_name} ({len(actions)} steps)")
+                print(f"\n[INFO] Playing: {ep_dir_name} ({len(actions)} steps)", flush=True)
+                
+                # Check simulation still running
+                if not simulation_app.is_running():
+                    print("  [WARNING] Simulation stopped after loading episode", flush=True)
+                    break
                 
                 # Load camera images for this episode if available
                 camera_images = {"left_wrist": [], "ego": [], "right_wrist": []}
@@ -473,10 +497,32 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     cv2.resizeWindow("Camera Views", 1920, 480)
                 
                 # Reset environment
-                obs, _ = env.reset()
+                print("  [INFO] Resetting environment...", flush=True)
+                if not simulation_app.is_running():
+                    print("  [WARNING] Simulation stopped before reset", flush=True)
+                    break
+                try:
+                    obs, _ = env.reset()
+                except Exception as e:
+                    print(f"  [ERROR] Reset failed: {e}", flush=True)
+                    break
+                if not simulation_app.is_running():
+                    print("  [WARNING] Simulation stopped after reset", flush=True)
+                    break
+                print("  [INFO] Environment reset complete", flush=True)
                 skip_episode[0] = False
+                print("  [DEBUG] Step 1: skip_episode set", flush=True)
                 
+                # Check simulation still running
+                sim_running = simulation_app.is_running()
+                print(f"  [DEBUG] Step 2: sim_running={sim_running}", flush=True)
+                if not sim_running:
+                    print("  [WARNING] Simulation stopped before initial conditions", flush=True)
+                    break
+                
+                print("  [DEBUG] Step 3: about to apply initial conditions", flush=True)
                 # Apply initial conditions if available
+                print(f"  [INFO] Applying initial conditions (init_cond={'present' if init_cond else 'None'})...", flush=True)
                 if init_cond is not None:
                     num_envs = unwrapped.num_envs
                     device = unwrapped.device
@@ -505,28 +551,112 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     # Spawn objects from teleop recording (new format: objects array)
                     if "objects" in init_cond and init_cond["objects"]:
                         import omni.usd
-                        from pxr import UsdGeom, Gf, UsdPhysics
+                        from pxr import UsdGeom, Gf, UsdPhysics, PhysxSchema, Usd
                         stage = omni.usd.get_context().get_stage()
                         
+                        print(f"  [INFO] Found {len(init_cond['objects'])} objects to spawn", flush=True)
+                        spawned_count = 0
+                        updated_count = 0
+                        
                         for obj in init_cond["objects"]:
+                            print(f"  [DEBUG] Processing object: {obj.get('prim_path')} type={obj.get('type')}", flush=True)
                             prim_path = obj.get("prim_path", "")
                             pos = obj.get("position", [0, 0, 0])
-                            quat = obj.get("orientation", [1, 0, 0, 0])
+                            quat = obj.get("orientation", [1, 0, 0, 0])  # [w, x, y, z]
                             scale = obj.get("scale", [1, 1, 1])
+                            obj_type = obj.get("type", "cube")
+                            usd_path = obj.get("usd_path", None)
                             
-                            # Check if object already exists
                             prim = stage.GetPrimAtPath(prim_path)
-                            if prim.IsValid():
-                                # Update position/orientation
+                            
+                            if not prim.IsValid():
+                                print(f"  [DEBUG] Prim doesn't exist, creating: {prim_path}", flush=True)
+                                if obj_type == "cube":
+                                    # Spawn a simple physics cube
+                                    cube_prim = UsdGeom.Cube.Define(stage, prim_path)
+                                    cube_prim.GetSizeAttr().Set(0.05)  # 5cm cube
+                                    prim = cube_prim.GetPrim()
+                                    
+                                    # Add physics
+                                    UsdPhysics.RigidBodyAPI.Apply(prim)
+                                    UsdPhysics.CollisionAPI.Apply(prim)
+                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
+                                    mass_api = UsdPhysics.MassAPI.Apply(prim)
+                                    mass_api.CreateMassAttr().Set(0.05)
+                                    
+                                    print(f"  [DEBUG] Created cube at {prim_path}", flush=True)
+                                    spawned_count += 1
+                                    
+                                elif obj_type == "usd_reference" and usd_path:
+                                    # Spawn USD reference (mug, fruit, etc.) - match teleop exactly
+                                    xform = UsdGeom.Xform.Define(stage, prim_path)
+                                    prim = xform.GetPrim()
+                                    prim.GetReferences().AddReference(usd_path)
+                                    
+                                    # Set transform FIRST (like teleop)
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xformable.ClearXformOpOrder()
+                                    translate_op = xformable.AddTranslateOp()
+                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    scale_val = scale[0] if isinstance(scale, list) else scale
+                                    scale_op = xformable.AddScaleOp()
+                                    scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
+                                    
+                                    # Remove rigid body from children (like teleop)
+                                    for child in prim.GetAllChildren():
+                                        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+                                            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                                        if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+                                            child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+                                    
+                                    # Add physics to root (like teleop)
+                                    UsdPhysics.RigidBodyAPI.Apply(prim)
+                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
+                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.1)
+                                    
+                                    # Add collision to mesh children (like teleop)
+                                    for descendant in Usd.PrimRange(prim):
+                                        is_mesh = descendant.IsA(UsdGeom.Mesh)
+                                        has_collision = descendant.HasAPI(UsdPhysics.CollisionAPI)
+                                        
+                                        if is_mesh or has_collision:
+                                            if not has_collision:
+                                                UsdPhysics.CollisionAPI.Apply(descendant)
+                                            PhysxSchema.PhysxCollisionAPI.Apply(descendant)
+                                            if descendant.HasAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI):
+                                                descendant.RemoveAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI)
+                                            UsdPhysics.MeshCollisionAPI.Apply(descendant).CreateApproximationAttr().Set("convexDecomposition")
+                                    
+                                    spawned_count += 1
+                            else:
+                                updated_count += 1
+                            
+                            # Set transform for cubes and updated prims (USD refs set transform during spawn)
+                            if prim.IsValid() and obj_type == "cube":
                                 xformable = UsdGeom.Xformable(prim)
                                 xformable.ClearXformOpOrder()
-                                translate_op = xformable.AddTranslateOp()
-                                translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
-                                scale_op = xformable.AddScaleOp()
-                                scale_op.Set(Gf.Vec3d(scale[0], scale[1], scale[2]))
-                                print(f"  [INFO] Updated object: {prim_path}")
+                                translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionFloat)
+                                translate_op.Set(Gf.Vec3f(pos[0], pos[1], pos[2]))
+                                orient_op = xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionFloat)
+                                orient_op.Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
+                                scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionFloat)
+                                scale_op.Set(Gf.Vec3f(scale[0], scale[1], scale[2]))
                         
-                        print(f"  [INFO] Restored {len(init_cond['objects'])} objects from initial conditions")
+                        # Force physics to recognize new objects
+                        try:
+                            import omni.physx
+                            physx_interface = omni.physx.get_physx_interface()
+                            physx_interface.force_load_physics_from_usd()
+                        except Exception:
+                            pass
+                        
+                        print(f"  [INFO] Objects: {spawned_count} spawned, {updated_count} updated", flush=True)
+                        
+                        # Step physics a few times to let objects settle
+                        for _ in range(5):
+                            unwrapped.sim.step(render=True)
                     
                     # Set robot positions (supports both old 'robot_qpos' and new 'robot_joint_pos')
                     robot_qpos = init_cond.get("robot_qpos") or init_cond.get("robot_joint_pos")
@@ -538,12 +668,29 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             qvel = torch.tensor(robot_qvel, device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
                         else:
                             qvel = torch.zeros_like(qpos)
+                        # Set both joint state AND position targets (so PD controller doesn't fight)
                         robot.write_joint_state_to_sim(qpos, qvel)
+                        robot.set_joint_position_target(qpos)
+                        robot.write_data_to_sim()
                         print("  [INFO] Robot positions set")
+                    
+                    # Step physics a few times to let initial conditions settle
+                    for _ in range(10):
+                        unwrapped.sim.step(render=True)
                 
                 robot = unwrapped.scene["robot"]
                 num_robot_joints = robot.num_joints
                 print(f"  [INFO] Action dim: {actions.shape[1]}, Robot joints: {num_robot_joints}")
+                
+                # Load spawn events (objects spawned during recording)
+                spawn_events = init_cond.get("spawn_events", []) if init_cond else []
+                if spawn_events:
+                    print(f"  [INFO] {len(spawn_events)} spawn events to trigger during playback")
+                
+                # Get stage for spawning
+                import omni.usd
+                from pxr import UsdGeom, Gf, UsdPhysics, PhysxSchema, Usd
+                stage = omni.usd.get_context().get_stage()
                 
                 for step_idx, action in enumerate(actions):
                     if stop_playback[0] or skip_episode[0]:
@@ -554,6 +701,76 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     
                     if not simulation_app.is_running():
                         break
+                    
+                    # Check for spawn events at this frame
+                    for event in spawn_events:
+                        if event.get("frame") == step_idx:
+                            prim_path = event.get("prim_path", "")
+                            pos = event.get("position", [0, 0, 0])
+                            scale = event.get("scale", [1, 1, 1])
+                            obj_type = event.get("type", "cube")
+                            usd_path = event.get("usd_path", None)
+                            
+                            print(f"  [SPAWN] Frame {step_idx}: {prim_path} ({obj_type})")
+                            
+                            prim = stage.GetPrimAtPath(prim_path)
+                            if not prim.IsValid():
+                                if obj_type == "cube":
+                                    cube_prim = UsdGeom.Cube.Define(stage, prim_path)
+                                    cube_prim.GetSizeAttr().Set(0.05)
+                                    prim = cube_prim.GetPrim()
+                                    UsdPhysics.RigidBodyAPI.Apply(prim)
+                                    UsdPhysics.CollisionAPI.Apply(prim)
+                                    PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.05)
+                                elif obj_type == "usd_reference" and usd_path:
+                                    xform = UsdGeom.Xform.Define(stage, prim_path)
+                                    prim = xform.GetPrim()
+                                    prim.GetReferences().AddReference(usd_path)
+                                    
+                                    # Set transform FIRST (like teleop)
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xformable.ClearXformOpOrder()
+                                    translate_op = xformable.AddTranslateOp()
+                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    scale_val = scale[0] if isinstance(scale, list) else scale
+                                    scale_op = xformable.AddScaleOp()
+                                    scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
+                                    
+                                    # Remove rigid body from children (like teleop)
+                                    for child in prim.GetAllChildren():
+                                        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+                                            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
+                                        if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+                                            child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+                                    
+                                    # Add physics to root (like teleop)
+                                    UsdPhysics.RigidBodyAPI.Apply(prim)
+                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
+                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.1)
+                                    
+                                    # Add collision to mesh children (like teleop)
+                                    for descendant in Usd.PrimRange(prim):
+                                        is_mesh = descendant.IsA(UsdGeom.Mesh)
+                                        has_collision = descendant.HasAPI(UsdPhysics.CollisionAPI)
+                                        
+                                        if is_mesh or has_collision:
+                                            if not has_collision:
+                                                UsdPhysics.CollisionAPI.Apply(descendant)
+                                            PhysxSchema.PhysxCollisionAPI.Apply(descendant)
+                                            if descendant.HasAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI):
+                                                descendant.RemoveAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI)
+                                            UsdPhysics.MeshCollisionAPI.Apply(descendant).CreateApproximationAttr().Set("convexDecomposition")
+                                
+                                # Set transform for cubes
+                                elif obj_type == "cube" and prim.IsValid():
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xformable.ClearXformOpOrder()
+                                    translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionFloat)
+                                    translate_op.Set(Gf.Vec3f(pos[0], pos[1], pos[2]))
+                                    scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionFloat)
+                                    scale_op.Set(Gf.Vec3f(scale[0], scale[1], scale[2]))
                     
                     start_time = time.time()
                     
@@ -614,6 +831,10 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 # Close camera window after episode
                 if HAS_CV2:
                     cv2.destroyWindow("Camera Views")
+              except Exception as e:
+                print(f"  [ERROR] Episode processing failed: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
             
             if not loop or stop_playback[0]:
                 break
@@ -680,7 +901,16 @@ def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False,
     episode_files = sorted([f for f in os.listdir(data_dir) if f.startswith("episode_") and f.endswith(".hdf5")])
     
     if episode_idx is not None:
-        episode_files = [episode_files[episode_idx]]
+        # Find episode by name (episode_N.hdf5) rather than list index
+        target_name = f"episode_{episode_idx}.hdf5"
+        if target_name in episode_files:
+            episode_files = [target_name]
+        elif episode_idx < len(episode_files):
+            episode_files = [episode_files[episode_idx]]
+        else:
+            print(f"[ERROR] Episode {episode_idx} not found. Available: {episode_files}")
+            simulation_app.close()
+            return
     
     # Create environment
     env = gym.make(task_name)
