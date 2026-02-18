@@ -1787,30 +1787,48 @@ MUG_ASSETS = [
     f"{_OPENARM_ASSETS_DIR}/usds/mugs/4.usd",
 ]
 
+# SimReady fruit assets from Omniverse (have physics baked in)
+SIMREADY_ASSETS_URL = "https://omniverse-content-staging.s3.us-west-2.amazonaws.com/Assets/simready_content/common_assets/props"
+FRUIT_ASSETS = [
+    f"{SIMREADY_ASSETS_URL}/pomegranate01/pomegranate01.usd",
+    f"{SIMREADY_ASSETS_URL}/orange_02/orange_02.usd",
+    f"{SIMREADY_ASSETS_URL}/lemon_02/lemon_02.usd",
+    f"{SIMREADY_ASSETS_URL}/lime01/lime01.usd",
+    f"{SIMREADY_ASSETS_URL}/avocado01/avocado01.usd",
+]
+
+# All spawnable objects (mugs + fruits)
+ALL_SPAWN_ASSETS = MUG_ASSETS + FRUIT_ASSETS
+
 
 def spawn_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0], scale=0.01):
-    """Spawn a random mug at the given position.
+    """Spawn a random object (mug or fruit) at the given position.
     
-    NOTE: With GPU physics, runtime-spawned objects may not have physics until
-    the simulation is reset. Consider using spawn_cube() for objects that need
-    immediate physics, or pre-spawn objects in the scene configuration.
+    SimReady fruit assets have physics baked in and should work immediately.
+    Local mug assets need physics added manually.
     
     Args:
         stage: USD stage
         position: (x, y, z) spawn position in meters
         object_counter: mutable counter for unique naming
-        scale: Scale factor for the mug (default 0.01 to convert from cm to m)
+        scale: Scale factor (default 0.01 for mugs, 1.0 for fruits)
     
     Returns:
         Path to the spawned object prim
     """
     from pxr import UsdGeom, Gf, UsdPhysics, PhysxSchema
     
-    # Pick a random mug
-    usd_path = random.choice(MUG_ASSETS)
-    mug_name = os.path.basename(usd_path).replace('.usd', '')
+    # Pick a random object (mug or fruit)
+    usd_path = random.choice(ALL_SPAWN_ASSETS)
+    obj_name = os.path.basename(usd_path).replace('.usd', '')
+    is_fruit = usd_path.startswith(SIMREADY_ASSETS_URL)
     
-    print(f"[Object] Loading mug from: {usd_path}", flush=True)
+    # Fruits are already correctly scaled, mugs need scaling
+    if is_fruit:
+        scale = 1.0  # SimReady assets are in meters
+    
+    obj_type = "fruit" if is_fruit else "mug"
+    print(f"[Object] Loading {obj_type} from: {usd_path}", flush=True)
     
     object_counter[0] += 1
     object_path = f"/World/spawned_object_{object_counter[0]}"
@@ -1828,35 +1846,50 @@ def spawn_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0], scale=0.01
     scale_op = xformable.AddScaleOp()
     scale_op.Set(Gf.Vec3d(scale, scale, scale))
     
+    # For both fruits and mugs, we need to set up physics properly for dynamic bodies
     # Remove any existing RigidBodyAPI from children (causes hierarchy conflicts)
     for child in prim.GetAllChildren():
         if child.HasAPI(UsdPhysics.RigidBodyAPI):
             child.RemoveAPI(UsdPhysics.RigidBodyAPI)
-            print(f"[Object] Removed conflicting RigidBody from {child.GetPath()}", flush=True)
-        # Also remove PhysxRigidBodyAPI if present
         if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
             child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
     
-    # Add rigid body physics to the root prim only
+    # Add rigid body physics to the root prim
     UsdPhysics.RigidBodyAPI.Apply(prim)
-    
-    # Add PhysX rigid body properties
     physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
     
-    # Add mass to root
+    # Add mass
+    mass = 0.1 if is_fruit else 0.15  # 100g fruit, 150g mug
     mass_api = UsdPhysics.MassAPI.Apply(prim)
-    mass_api.CreateMassAttr().Set(0.15)  # 150g
+    mass_api.CreateMassAttr().Set(mass)
     
-    # Ensure collision exists on children (keep existing or add new)
-    has_collision = False
-    for child in prim.GetAllChildren():
-        if child.HasAPI(UsdPhysics.CollisionAPI):
-            has_collision = True
+    # Add collision with convex decomposition for dynamic bodies
+    # Find all mesh prims and set collision approximation
+    from pxr import UsdGeom as UsdGeomModule, Usd
     
-    # If no collision on children, add to root
-    if not has_collision:
-        UsdPhysics.CollisionAPI.Apply(prim)
+    # Use Usd.PrimRange to traverse ALL descendants (including nested references)
+    for descendant in Usd.PrimRange(prim):
+        # Check if this prim is a mesh or has collision
+        is_mesh = descendant.IsA(UsdGeomModule.Mesh)
+        has_collision = descendant.HasAPI(UsdPhysics.CollisionAPI)
+        
+        if is_mesh or has_collision:
+            # Ensure collision API is applied
+            if not has_collision:
+                UsdPhysics.CollisionAPI.Apply(descendant)
+            
+            # Apply PhysX collision API and set approximation directly
+            physx_col = PhysxSchema.PhysxCollisionAPI.Apply(descendant)
+            
+            # Remove triangle mesh collision API if present
+            if descendant.HasAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI):
+                descendant.RemoveAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI)
+            
+            # Set the approximation attribute directly on the mesh
+            # This tells PhysX to use convex decomposition instead of triangle mesh
+            mesh_col_api = UsdPhysics.MeshCollisionAPI.Apply(descendant)
+            mesh_col_api.CreateApproximationAttr().Set("convexDecomposition")
     
     # Try to force physics to recognize the new object
     try:
@@ -1868,7 +1901,7 @@ def spawn_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0], scale=0.01
     except Exception as e:
         print(f"[Object] Could not reload physics: {e}", flush=True)
     
-    print(f"[Object] Spawned mug {mug_name} at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), scale={scale}", flush=True)
+    print(f"[Object] Spawned {obj_type} '{obj_name}' at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), scale={scale}", flush=True)
     return object_path
 
 
