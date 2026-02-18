@@ -1237,7 +1237,7 @@ class ScriptExecutor:
         parallel:        [list of sub-commands]
     """
     
-    POSITION_TOLERANCE = 0.02  # 2cm tolerance for "reached"
+    POSITION_TOLERANCE = 0.02  # 2cm tolerance for "reached" (matches orientation freeze threshold)
     GRIPPER_FORCE_THRESHOLD = 5.0  # Newtons
     GRIPPER_CLOSE_STEP = 0.002  # How much to close per frame
     GRIPPER_OPEN_POS = 0.044
@@ -1367,6 +1367,59 @@ class ScriptExecutor:
         result = s0 * q0 + s1 * q1
         return result / np.linalg.norm(result)
     
+    def _point_at_quat(self, from_pos, to_pos, current_quat=None):
+        """Compute quaternion that orients gripper to point at a target position.
+        
+        Based on empirical measurement: when gripper points at object, it has
+        roll≈180° (π), pitch based on vertical angle, yaw based on horizontal angle.
+        
+        Returns quaternion (w, x, y, z).
+        """
+        from_pos = np.array(from_pos, dtype=np.float64)
+        to_pos = np.array(to_pos, dtype=np.float64)
+        
+        # Direction from gripper to target
+        direction = to_pos - from_pos
+        horizontal_dist = np.sqrt(direction[0]**2 + direction[1]**2)
+        
+        # Cache yaw when we have good horizontal distance
+        if horizontal_dist > 0.02:
+            yaw = np.arctan2(direction[1], direction[0])
+            self._last_point_at_yaw = yaw
+        else:
+            # When very close horizontally, use cached yaw to prevent flip
+            yaw = getattr(self, '_last_point_at_yaw', 0.0)
+        
+        # Pitch: vertical angle - negative means tilting down
+        # When object is at same height, pitch ≈ -90° to point gripper forward-down
+        # When object is below, pitch more negative
+        total_dist = np.linalg.norm(direction)
+        if total_dist > 0.01:
+            pitch = np.arctan2(direction[2], horizontal_dist) - np.pi/2
+        else:
+            # Very close - use a sensible default (pointing down)
+            pitch = -np.pi/2
+        
+        # Roll: gripper needs ~180° roll for proper finger orientation
+        roll = np.pi
+        
+        # Convert euler (roll, pitch, yaw) to quaternion
+        # Using ZYX convention (yaw first, then pitch, then roll)
+        cr = np.cos(roll / 2)
+        sr = np.sin(roll / 2)
+        cp = np.cos(pitch / 2)
+        sp = np.sin(pitch / 2)
+        cy = np.cos(yaw / 2)
+        sy = np.sin(yaw / 2)
+        
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+        
+        q = np.array([w, x, y, z])
+        return q / np.linalg.norm(q)
+    
     def _resolve_position(self, params):
         """Resolve target position from command params (named object or explicit coords).
         
@@ -1490,6 +1543,9 @@ class ScriptExecutor:
         elif cmd_name == "move_to":
             arm = params.get("arm", "left")
             target_pos = self._resolve_position(params)
+            if target_pos is None:
+                print(f"[Script] ERROR: move_to failed - could not resolve position for {params}")
+                print(f"[Script]   Known objects: {list(self.object_registry.keys())}")
             if target_pos is not None:
                 duration = params.get("duration", 2.0)
                 self.cmd_state["duration"] = duration
@@ -1499,24 +1555,39 @@ class ScriptExecutor:
                 # Optional rotation for EE orientation (roll, pitch, yaw -> quaternion)
                 # Empty rotation dict {} means "keep current orientation"
                 # When targeting a named object ('to:') with no rotation, auto-compute
-                # an approach orientation that pitches toward the object.
+                # an approach orientation that points the gripper at the object.
                 rot = params.get("rotation", None)
-                has_rotation = rot is not None and len(rot) > 0
+                has_explicit_rotation = rot is not None and len(rot) > 0
+                auto_orient = "to" in params and not has_explicit_rotation
                 target_quat = None
-                if has_rotation:
+                
+                if has_explicit_rotation:
                     r = rot.get("roll", 0.0)
                     p = rot.get("pitch", 0.0)
                     y = rot.get("yaw", 0.0)
                     target_quat = self._euler_to_quat(r, p, y)
-                elif "to" in params:
-                    pass  # No auto-orient: keep current EE orientation when targeting objects
+                elif auto_orient:
+                    # Auto-orient: compute quaternion to point gripper at the object
+                    # Use target_pos (where gripper will be) not start_pos
+                    obj_name = params["to"]
+                    if obj_name in self.object_registry:
+                        obj_pos = self.object_registry[obj_name]
+                        # Point from where we'll END UP toward the object
+                        target_quat = self._point_at_quat(target_pos, obj_pos)
+                
+                has_rotation = has_explicit_rotation or (auto_orient and target_quat is not None)
                 self.cmd_state["has_rotation"] = has_rotation
+                self.cmd_state["auto_orient"] = auto_orient
+                if "to" in params:
+                    self.cmd_state["obj_name"] = params["to"]
                 
                 if arm == "left":
                     self._left_start_pos = current_left_pos
                     self._left_end_pos = target_pos
                     self.left_target_pos = list(current_left_pos) if current_left_pos is not None else target_pos
-                    if has_rotation:
+                    # Reset cached auto-orient quat for new command
+                    self._left_auto_orient_quat = None
+                    if has_rotation or auto_orient:
                         self._left_start_quat = np.array(self.left_target_quat) if self.left_target_quat is not None else (current_left_quat if current_left_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
                         self._left_end_quat = target_quat
                         self.left_target_quat = list(self._left_start_quat)
@@ -1524,19 +1595,24 @@ class ScriptExecutor:
                     self._right_start_pos = current_right_pos
                     self._right_end_pos = target_pos
                     self.right_target_pos = list(current_right_pos) if current_right_pos is not None else target_pos
-                    if has_rotation:
+                    # Reset cached auto-orient quat for new command
+                    self._right_auto_orient_quat = None
+                    if has_rotation or auto_orient:
                         self._right_start_quat = np.array(self.right_target_quat) if self.right_target_quat is not None else (current_right_quat if current_right_quat is not None else np.array([1.0, 0.0, 0.0, 0.0]))
                         self._right_end_quat = target_quat
                         self.right_target_quat = list(self._right_start_quat)
                 
                 rot_msg = ""
-                if has_rotation and "rotation" in params:
+                if has_explicit_rotation and "rotation" in params:
                     rot = params["rotation"]
                     rot_msg = f" rot=({np.degrees(rot.get('roll',0)):.0f}, {np.degrees(rot.get('pitch',0)):.0f}, {np.degrees(rot.get('yaw',0)):.0f})°"
-                elif has_rotation:
-                    rot_msg = " (auto-orient)"
+                elif auto_orient and target_quat is not None:
+                    rot_msg = " (auto-orient toward object)"
                 start_p = current_left_pos if arm == "left" else current_right_pos
-                print(f"[Script] Moving {arm} arm from ({start_p[0]:.3f}, {start_p[1]:.3f}, {start_p[2]:.3f}) to ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}){rot_msg} over {duration:.1f}s")
+                if start_p is not None:
+                    print(f"[Script] Moving {arm} arm: ({start_p[0]:.3f}, {start_p[1]:.3f}, {start_p[2]:.3f}) -> ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}){rot_msg} [{duration:.1f}s]")
+                else:
+                    print(f"[Script] Moving {arm} arm: (unknown start) -> ({target_pos[0]:.3f}, {target_pos[1]:.3f}, {target_pos[2]:.3f}){rot_msg} [{duration:.1f}s]")
         
         elif cmd_name == "rotate":
             arm = params.get("arm", "left")
@@ -1601,7 +1677,11 @@ class ScriptExecutor:
         elif cmd_name == "wait_until_reached":
             arm = params.get("arm", "both") if isinstance(params, dict) else str(params)
             self.cmd_state["arm"] = arm
-            print(f"[Script] Waiting until {arm} arm(s) reached target")
+            target = self.left_target_pos if arm in ("left", "both") else self.right_target_pos
+            if target is not None:
+                print(f"[Script] Waiting for {arm} arm to reach ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})")
+            else:
+                print(f"[Script] Waiting for {arm} arm (no target set!)")
         
         elif cmd_name == "parallel":
             sub_cmds = params if isinstance(params, list) else []
@@ -1636,24 +1716,65 @@ class ScriptExecutor:
             has_rotation = self.cmd_state.get("has_rotation", False)
             t = self._smoothstep(elapsed / duration) if duration > 0 else 1.0
             
+            auto_orient = self.cmd_state.get("auto_orient", False)
+            obj_name = self.cmd_state.get("obj_name", None)
+            
             if arm == "left" and self._left_start_pos is not None and self._left_end_pos is not None:
                 interp = [
                     self._left_start_pos[i] + t * (self._left_end_pos[i] - self._left_start_pos[i])
                     for i in range(3)
                 ]
                 self.left_target_pos = interp
-                if has_rotation and self._left_start_quat is not None and self._left_end_quat is not None:
+                
+                # Auto-orient: continuously point at the object, but freeze when very close
+                if auto_orient and obj_name and obj_name in self.object_registry:
+                    obj_pos = self.object_registry[obj_name]
+                    dist_to_obj = np.linalg.norm(np.array(interp) - np.array(obj_pos))
+                    # Only update orientation when far enough to compute a stable direction
+                    if dist_to_obj > 0.02:  # > 2cm: compute fresh orientation
+                        new_quat = self._point_at_quat(interp, obj_pos)
+                        self.left_target_quat = list(new_quat)
+                        self._left_auto_orient_quat = new_quat  # Cache last good orientation
+                    elif hasattr(self, '_left_auto_orient_quat') and self._left_auto_orient_quat is not None:
+                        # Close to object: keep the last computed orientation
+                        self.left_target_quat = list(self._left_auto_orient_quat)
+                elif has_rotation and self._left_start_quat is not None and self._left_end_quat is not None:
                     self.left_target_quat = list(self._slerp(self._left_start_quat, self._left_end_quat, t))
+                    
             elif arm == "right" and self._right_start_pos is not None and self._right_end_pos is not None:
                 interp = [
                     self._right_start_pos[i] + t * (self._right_end_pos[i] - self._right_start_pos[i])
                     for i in range(3)
                 ]
                 self.right_target_pos = interp
-                if has_rotation and self._right_start_quat is not None and self._right_end_quat is not None:
+                
+                # Auto-orient: continuously point at the object, but freeze when very close
+                if auto_orient and obj_name and obj_name in self.object_registry:
+                    obj_pos = self.object_registry[obj_name]
+                    dist_to_obj = np.linalg.norm(np.array(interp) - np.array(obj_pos))
+                    # Only update orientation when far enough to compute a stable direction
+                    if dist_to_obj > 0.02:  # > 2cm: compute fresh orientation
+                        new_quat = self._point_at_quat(interp, obj_pos)
+                        self.right_target_quat = list(new_quat)
+                        self._right_auto_orient_quat = new_quat  # Cache last good orientation
+                    elif hasattr(self, '_right_auto_orient_quat') and self._right_auto_orient_quat is not None:
+                        # Close to object: keep the last computed orientation
+                        self.right_target_quat = list(self._right_auto_orient_quat)
+                elif has_rotation and self._right_start_quat is not None and self._right_end_quat is not None:
                     self.right_target_quat = list(self._slerp(self._right_start_quat, self._right_end_quat, t))
             
-            return elapsed >= duration
+            # When move completes, lock targets to exact end values
+            done = elapsed >= duration
+            if done:
+                if arm == "left":
+                    self.left_target_pos = list(self._left_end_pos)
+                    if hasattr(self, '_left_auto_orient_quat') and self._left_auto_orient_quat is not None:
+                        self.left_target_quat = list(self._left_auto_orient_quat)
+                else:
+                    self.right_target_pos = list(self._right_end_pos)
+                    if hasattr(self, '_right_auto_orient_quat') and self._right_auto_orient_quat is not None:
+                        self.right_target_quat = list(self._right_auto_orient_quat)
+            return done
         
         elif cmd_name == "rotate":
             duration = self.cmd_state.get("duration", 1.0)
@@ -1694,18 +1815,31 @@ class ScriptExecutor:
             left_ok = True
             right_ok = True
             
+            dist = 0.0
             if arm in ("left", "both") and self.left_target_pos is not None and left_ee_pos is not None:
                 dist = np.linalg.norm(np.array(self.left_target_pos) - np.array(left_ee_pos))
                 left_ok = dist < self.POSITION_TOLERANCE
+                # Print status every 2 seconds
+                if int(elapsed * 5) % 10 == 0 and elapsed > 0.1:
+                    print(f"[Script] wait: pos=({left_ee_pos[0]:.3f}, {left_ee_pos[1]:.3f}, {left_ee_pos[2]:.3f}) dist={dist:.3f}m")
             if arm in ("right", "both") and self.right_target_pos is not None and right_ee_pos is not None:
                 dist = np.linalg.norm(np.array(self.right_target_pos) - np.array(right_ee_pos))
                 right_ok = dist < self.POSITION_TOLERANCE
             
             # Also timeout after 10 seconds to prevent hangs
             if elapsed > 10.0:
-                print(f"[Script] wait_until_reached timed out after 10s")
+                target = self.left_target_pos if arm in ("left", "both") else self.right_target_pos
+                actual = left_ee_pos if arm in ("left", "both") else right_ee_pos
+                print(f"[Script] wait_until_reached TIMEOUT after 10s")
+                if actual is not None:
+                    print(f"[Script]   current: ({actual[0]:.3f}, {actual[1]:.3f}, {actual[2]:.3f})")
+                if target is not None:
+                    print(f"[Script]   target:  ({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})")
+                print(f"[Script]   dist: {dist:.3f}m (tolerance: {self.POSITION_TOLERANCE}m)")
                 return True
             
+            if left_ok and right_ok:
+                print(f"[Script] {arm} arm reached target (dist={dist:.3f}m)")
             return left_ok and right_ok
         
         elif cmd_name == "parallel":
@@ -2095,7 +2229,7 @@ def run_teleop(env, args):
     # j3 is typically the elbow - we want it slightly bent (negative = bent inward for most arms)
     rest_pose_left = torch.tensor([[0.0, 0.3, -0.8, 0.5, 0.0, 0.0, 0.0]], device=sim_device)
     rest_pose_right = torch.tensor([[0.0, -0.3, 0.8, 0.5, 0.0, 0.0, 0.0]], device=sim_device)
-    rest_pose_gain = 0.1  # How strongly to pull toward rest pose (0 = none, 1 = strong)
+    rest_pose_gain = 0.02  # How strongly to pull toward rest pose (0 = none, 1 = strong)
     print(f"[INFO] Rest pose bias enabled with gain={rest_pose_gain}")
     
     # Add high-friction physics material to gripper finger links
@@ -2183,16 +2317,9 @@ def run_teleop(env, args):
                 lerobot_episode_count = max(episode_nums) + 1
                 print(f"[LeRobot] Found {len(existing_episodes)} existing episodes, starting from episode_{lerobot_episode_count}")
     
-    # Try to import LeRobot for native format support
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        HAS_LEROBOT = True
-        print("[LeRobot] LeRobot found - will save in native LeRobot v3.0 format")
-    except ImportError:
-        HAS_LEROBOT = False
-        print("[LeRobot] LeRobot not found - will save in LeRobot-compatible format")
-    
-    lerobot_dataset = None  # Will be initialized when recording starts
+    # LeRobot-compatible format - convert using openpi/examples/openarm/convert_to_lerobot.py
+    print("[LeRobot] Will save in LeRobot-compatible format (parquet + images)")
+    print("[LeRobot] Convert to native format using: openpi/examples/openarm/convert_to_lerobot.py")
     
     # Get USD stage for cube spawning and markers
     try:
@@ -2533,14 +2660,13 @@ def run_teleop(env, args):
                         num_frames = len(lerobot_current_episode["frames"])
                         
                         if num_frames > 0:
-                            # Save episode
+                            # Save episode in LeRobot-compatible format (parquet + images)
                             import pandas as pd
                             from PIL import Image
                             
+                            fps = lerobot_current_episode["fps"]
                             ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
                             os.makedirs(ep_dir, exist_ok=True)
-                            
-                            fps = lerobot_current_episode["fps"]
                             
                             # Extract tabular data
                             states = np.array([f["observation.state"] for f in lerobot_current_episode["frames"]])
@@ -2579,10 +2705,10 @@ def run_teleop(env, args):
                             with ThreadPoolExecutor(max_workers=8) as executor:
                                 list(executor.map(save_image, save_tasks))
                             
-                            # Save metadata (include task_env for replay script)
+                            # Save metadata
                             episode_metadata = {
-                                "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",  # Environment for replay
-                                "task_text": lerobot_task_text,  # Language prompt for VLA
+                                "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
+                                "task_text": lerobot_task_text,
                                 "fps": fps,
                                 "num_frames": num_frames,
                                 "duration_seconds": num_frames / fps,
@@ -2594,7 +2720,6 @@ def run_teleop(env, args):
                             # Save initial conditions (objects, robot state at start)
                             if "initial_conditions" in lerobot_current_episode:
                                 init_cond = lerobot_current_episode["initial_conditions"]
-                                # Add spawn events (objects spawned during recording)
                                 if "spawn_events" in lerobot_current_episode:
                                     init_cond["spawn_events"] = lerobot_current_episode["spawn_events"]
                                 with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
@@ -2758,20 +2883,18 @@ def run_teleop(env, args):
                     num_frames = len(lerobot_current_episode["frames"])
                     
                     if num_frames > 0:
+                        # Save in LeRobot-compatible format (parquet + images)
                         import pandas as pd
                         from PIL import Image
                         
+                        fps = lerobot_current_episode["fps"]
                         ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
                         os.makedirs(ep_dir, exist_ok=True)
                         
-                        fps = lerobot_current_episode["fps"]
-                        
-                        # Extract tabular data
                         states = np.array([f["observation.state"] for f in lerobot_current_episode["frames"]])
                         actions = np.array([f["action"] for f in lerobot_current_episode["frames"]])
                         timestamps = np.arange(num_frames) / fps
                         
-                        # Save tabular data as parquet
                         df = pd.DataFrame({
                             "timestamp": timestamps,
                             "episode_index": [lerobot_episode_count] * num_frames,
@@ -2785,7 +2908,6 @@ def run_teleop(env, args):
                         
                         df.to_parquet(os.path.join(ep_dir, "data.parquet"))
                         
-                        # Save images in parallel for speed
                         def save_image(args):
                             img, path = args
                             img.save(path)
@@ -2805,7 +2927,6 @@ def run_teleop(env, args):
                         with ThreadPoolExecutor(max_workers=8) as executor:
                             list(executor.map(save_image, save_tasks))
                         
-                        # Save metadata
                         episode_metadata = {
                             "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
                             "task_text": lerobot_task_text,
@@ -2817,16 +2938,13 @@ def run_teleop(env, args):
                         with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
                             json.dump(episode_metadata, f, indent=2)
                         
-                        # Save initial conditions
                         if "initial_conditions" in lerobot_current_episode:
                             init_cond = lerobot_current_episode["initial_conditions"]
-                            # Add spawn events (objects spawned during recording)
                             if "spawn_events" in lerobot_current_episode:
                                 init_cond["spawn_events"] = lerobot_current_episode["spawn_events"]
                             with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
                                 json.dump(init_cond, f, indent=2)
                         
-                        # Update top-level metadata
                         top_metadata_path = os.path.join(lerobot_output_dir, "metadata.json")
                         top_metadata = {
                             "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
@@ -2932,8 +3050,8 @@ def run_teleop(env, args):
                 print(f"\n{'='*60}")
                 print(f"  {hand.upper()} arm (world coords):")
                 print(f"  EE position:   x={ee_pos_w[0]:.4f}, y={ee_pos_w[1]:.4f}, z={ee_pos_w[2]:.4f}")
+                print(f"  EE quaternion: w={w:.4f}, x={x:.4f}, y={y:.4f}, z={z:.4f}")
                 print(f"  EE rotation:   roll={np.degrees(_roll):.1f}°, pitch={np.degrees(_pitch):.1f}°, yaw={np.degrees(_yaw):.1f}°")
-                print(f"  EE rot (rad):  roll={_roll:.4f}, pitch={_pitch:.4f}, yaw={_yaw:.4f}")
                 print(f"  Target pos:    x={_pose[0]:.4f}, y={_pose[1]:.4f}, z={_pose[2]:.4f}")
                 print(f"{'='*60}\n")
             
@@ -3141,6 +3259,12 @@ def run_teleop(env, args):
             # Targets are in world coordinates; transform to base frame for IK
             left_target_pos = torch.tensor(left_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
             left_target_quat = torch.tensor(left_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
+            
+            # Debug: check for NaN or invalid quaternion
+            if step_count % 60 == 0:
+                quat_norm = np.linalg.norm(left_pose[3:7])
+                if abs(quat_norm - 1.0) > 0.01 or np.isnan(quat_norm):
+                    print(f"[WARN] Invalid left quaternion! norm={quat_norm:.3f}, quat={left_pose[3:7]}")
             right_target_pos = torch.tensor(right_pose[:3], dtype=torch.float32, device=sim_device).unsqueeze(0)
             right_target_quat = torch.tensor(right_pose[3:7], dtype=torch.float32, device=sim_device).unsqueeze(0)
             

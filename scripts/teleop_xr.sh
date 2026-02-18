@@ -14,7 +14,9 @@ set -e
 #   ./scripts/teleop_xr.sh --keyboard   # Test with keyboard (no XR)
 
 INPUT_MODE="xr"
+SCRIPT_MODE=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXTRA_ARGS=()
 
 # Check for flags
 while [[ $# -gt 0 ]]; do
@@ -23,11 +25,27 @@ while [[ $# -gt 0 ]]; do
             INPUT_MODE="keyboard"
             shift
             ;;
+        --script)
+            SCRIPT_MODE="$2"
+            EXTRA_ARGS+=("--script" "$2")
+            shift 2
+            ;;
+        --script=*)
+            SCRIPT_MODE="${1#*=}"
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
         *)
-            break
+            EXTRA_ARGS+=("$1")
+            shift
             ;;
     esac
 done
+
+# If running a script, use keyboard mode (no VR needed)
+if [[ -n "${SCRIPT_MODE}" ]]; then
+    INPUT_MODE="keyboard"
+fi
 
 cd "${REPO_ROOT}"
 
@@ -57,8 +75,8 @@ else
 fi
 
 
-# Check if WiVRn server is running (only for XR mode)
-if [[ "$INPUT_MODE" == "xr" ]] && ! pgrep -f "wivrn" > /dev/null; then
+# Check if WiVRn server is running (only for XR mode, not for script mode)
+if [[ "$INPUT_MODE" == "xr" ]] && [[ -z "${SCRIPT_MODE}" ]] && ! pgrep -f "wivrn" > /dev/null; then
     echo ""
     echo "WARNING: WiVRn server doesn't appear to be running!"
     echo "Start it with: flatpak run io.github.wivrn.wivrn"
@@ -78,15 +96,16 @@ echo "OPENARM IK TELEOPERATION"
 echo "=========================================="
 echo "Task: ${TASK}"
 echo "Control Mode: Inverse Kinematics (IK)"
-echo "Input Mode: ${INPUT_MODE}"
-echo ""
-if [[ "$INPUT_MODE" == "xr" ]]; then
-    echo "Using VR controller tracking"
+if [[ -n "${SCRIPT_MODE}" ]]; then
+    echo "Input Mode: Script"
+    echo "Script: ${SCRIPT_MODE}"
+elif [[ "$INPUT_MODE" == "xr" ]]; then
+    echo "Input Mode: VR Controllers"
     echo "Make sure:"
     echo "  1. WiVRn server is running"
     echo "  2. Vive XR Elite is connected"
 else
-    echo "Using keyboard input (test mode)"
+    echo "Input Mode: Keyboard (test mode)"
 fi
 echo "=========================================="
 echo ""
@@ -179,5 +198,5 @@ if [[ -n "${KIT_ARGS}" ]]; then
     TELEOP_CMD="${TELEOP_CMD} --kit_args \"${KIT_ARGS}\""
 fi
 
-# Execute the command
-eval ${TELEOP_CMD} "$@"
+# Execute the command with any extra args
+eval ${TELEOP_CMD} "${EXTRA_ARGS[@]}"
