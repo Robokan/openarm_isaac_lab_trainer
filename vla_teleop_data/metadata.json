@@ -4,5 +4,5 @@
   "fps": 60,
   "num_joints": 22,
   "robot_type": "openarm_bimanual",
-  "episode_count": 4
+  "episode_count": 8
 }

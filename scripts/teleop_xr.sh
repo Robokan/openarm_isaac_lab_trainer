@@ -114,9 +114,19 @@ echo ""
 KIT_ARGS=""
 if [[ "${INPUT_MODE}" == "xr" ]]; then
     RUNTIME_JSON_PATH="${REPO_ROOT}/.openxr_runtime.json"
-    WIVRN_RUNTIME_JSON_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/share/openxr/1/openxr_wivrn.json"
-    WIVRN_RUNTIME_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libopenxr_wivrn.so"
-    WIVRN_MONADO_LIB_DEFAULT="/var/lib/flatpak/app/io.github.wivrn.wivrn/x86_64/stable/07b70b9a85dd76c10b6e240f9f84212c63beeaa4213dccabb743bbd82fe992e2/files/lib/wivrn/libmonado_wivrn.so"
+    
+    # Dynamically find WiVRn Flatpak installation (path changes with updates)
+    WIVRN_RUNTIME_LIB_DEFAULT="$(find /var/lib/flatpak/app/io.github.wivrn.wivrn -name 'libopenxr_wivrn.so' 2>/dev/null | head -1)"
+    if [[ -n "${WIVRN_RUNTIME_LIB_DEFAULT}" ]]; then
+        WIVRN_LIB_DIR="$(dirname "${WIVRN_RUNTIME_LIB_DEFAULT}")"
+        WIVRN_FILES_DIR="$(dirname "$(dirname "${WIVRN_LIB_DIR}")")"
+        WIVRN_RUNTIME_JSON_DEFAULT="${WIVRN_FILES_DIR}/share/openxr/1/openxr_wivrn.json"
+        WIVRN_MONADO_LIB_DEFAULT="${WIVRN_LIB_DIR}/libmonado_wivrn.so"
+    else
+        WIVRN_RUNTIME_JSON_DEFAULT=""
+        WIVRN_MONADO_LIB_DEFAULT=""
+    fi
+    
     WIVRN_RUNTIME_JSON="${WIVRN_RUNTIME_JSON:-$WIVRN_RUNTIME_JSON_DEFAULT}"
     WIVRN_RUNTIME_LIB="${WIVRN_RUNTIME_LIB:-$WIVRN_RUNTIME_LIB_DEFAULT}"
     WIVRN_MONADO_LIB="${WIVRN_MONADO_LIB:-$WIVRN_MONADO_LIB_DEFAULT}"

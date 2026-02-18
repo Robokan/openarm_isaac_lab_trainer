@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
 
 
@@ -466,6 +467,19 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     with open(init_cond_path, "r") as f:
                         init_cond = json.load(f)
                 
+                # Load object states per frame for kinematic replay
+                objects_state_path = os.path.join(ep_path, "objects_state.json")
+                objects_per_frame = None
+                if os.path.exists(objects_state_path):
+                    with open(objects_state_path, "r") as f:
+                        objects_per_frame = json.load(f)
+                    print(f"  [INFO] Loaded object states for {len(objects_per_frame)} frames (kinematic replay)")
+                
+                # Extract observation states for kinematic replay (robot joint states)
+                state_cols = [c for c in df.columns if c.startswith("observation.state.")]
+                state_cols = sorted(state_cols, key=lambda x: int(x.split(".")[-1]))
+                states = df[state_cols].values if state_cols else None
+                
                 print(f"\n[INFO] Playing: {ep_dir_name} ({len(actions)} steps)", flush=True)
                 
                 # Check simulation still running
@@ -594,11 +608,13 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                                     prim = xform.GetPrim()
                                     prim.GetReferences().AddReference(usd_path)
                                     
-                                    # Set transform FIRST (like teleop)
+                                    # Set transform: translate, orient, scale
                                     xformable = UsdGeom.Xformable(prim)
                                     xformable.ClearXformOpOrder()
                                     translate_op = xformable.AddTranslateOp()
                                     translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    orient_op = xformable.AddOrientOp()
+                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))  # Identity quaternion
                                     scale_val = scale[0] if isinstance(scale, list) else scale
                                     scale_op = xformable.AddScaleOp()
                                     scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
@@ -687,6 +703,22 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 if spawn_events:
                     print(f"  [INFO] {len(spawn_events)} spawn events to trigger during playback")
                 
+                # Build scale cache from initial conditions + spawn events
+                # This is used for older recordings that don't have per-frame scale
+                object_scales = {}
+                if init_cond:
+                    for obj in init_cond.get("objects", []):
+                        prim_path = obj.get("prim_path", "")
+                        scale = obj.get("scale", [0.01, 0.01, 0.01])  # Default small scale for cups/mugs
+                        if prim_path:
+                            object_scales[prim_path] = scale
+                    for event in spawn_events:
+                        prim_path = event.get("prim_path", "")
+                        scale = event.get("scale", [0.01, 0.01, 0.01])
+                        if prim_path:
+                            object_scales[prim_path] = scale
+                
+                
                 # Get stage for spawning
                 import omni.usd
                 from pxr import UsdGeom, Gf, UsdPhysics, PhysxSchema, Usd
@@ -728,11 +760,13 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                                     prim = xform.GetPrim()
                                     prim.GetReferences().AddReference(usd_path)
                                     
-                                    # Set transform FIRST (like teleop)
+                                    # Set transform: translate, orient, scale (orient needed for per-frame updates)
                                     xformable = UsdGeom.Xformable(prim)
                                     xformable.ClearXformOpOrder()
                                     translate_op = xformable.AddTranslateOp()
                                     translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    orient_op = xformable.AddOrientOp()
+                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))  # Identity quaternion
                                     scale_val = scale[0] if isinstance(scale, list) else scale
                                     scale_op = xformable.AddScaleOp()
                                     scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
@@ -774,13 +808,46 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     
                     start_time = time.time()
                     
-                    # Apply joint positions directly (like teleop does)
-                    action_tensor = torch.tensor(
-                        action, device=unwrapped.device, dtype=torch.float32
-                    ).unsqueeze(0).expand(unwrapped.num_envs, -1)
+                    # Kinematic replay: set states directly instead of targets
+                    # Use observation.state (recorded joint positions) for exact replay
+                    if states is not None and step_idx < len(states):
+                        state_tensor = torch.tensor(
+                            states[step_idx], device=unwrapped.device, dtype=torch.float32
+                        ).unsqueeze(0).expand(unwrapped.num_envs, -1)
+                        qvel = torch.zeros_like(state_tensor)
+                        robot.write_joint_state_to_sim(state_tensor, qvel)
+                        robot.set_joint_position_target(state_tensor)  # Prevent PD fight
+                    else:
+                        # Fallback to action-based
+                        action_tensor = torch.tensor(
+                            action, device=unwrapped.device, dtype=torch.float32
+                        ).unsqueeze(0).expand(unwrapped.num_envs, -1)
+                        robot.set_joint_position_target(action_tensor)
                     
-                    # Set joint position targets and step physics
-                    robot.set_joint_position_target(action_tensor)
+                    # Set object positions for this frame (kinematic replay)
+                    if objects_per_frame is not None and step_idx < len(objects_per_frame):
+                        frame_objects = objects_per_frame[step_idx]
+                        for obj in frame_objects:
+                            prim_path = obj.get("prim_path", "")
+                            # Skip child prims - only process root spawned objects
+                            # Simple check: count slashes - root objects have exactly 2 (like /World/spawned_X)
+                            if prim_path.count('/') != 2:
+                                continue
+                            pos = obj.get("position", [0, 0, 0])
+                            quat = obj.get("orientation", [1, 0, 0, 0])
+                            prim = stage.GetPrimAtPath(prim_path)
+                            if prim.IsValid():
+                                try:
+                                    xformable = UsdGeom.Xformable(prim)
+                                    # Only update translate and orient - leave scale alone (set at spawn)
+                                    for op in xformable.GetOrderedXformOps():
+                                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                            op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                        elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                                            op.Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
+                                except Exception:
+                                    pass
+                    
                     robot.write_data_to_sim()
                     unwrapped.sim.step(render=True)
                     

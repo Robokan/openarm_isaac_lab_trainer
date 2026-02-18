@@ -2619,22 +2619,39 @@ def run_teleop(env, args):
                             "fps": fps,
                             "num_joints": num_joints,
                             "initial_conditions": initial_conditions,
+                            "render_products": {},  # Store render products for reuse
                         }
                         
-                        # Find all cameras using USD API
+                        # Find all cameras and create render products ONCE
                         camera_status = []
                         found_cameras = 0
                         try:
                             from pxr import UsdGeom
+                            import omni.replicator.core as rep
+                            
                             for prim in stage.Traverse():
                                 if prim.IsA(UsdGeom.Camera):
                                     cam_path = str(prim.GetPath())
-                                    # Only count env_0 cameras
+                                    cam_name = prim.GetName()
+                                    # Only use env_0 cameras
                                     if "env_0" in cam_path:
-                                        camera_status.append(f"  {prim.GetName()}: {cam_path}")
-                                        found_cameras += 1
+                                        try:
+                                            render_product = rep.create.render_product(cam_path, (640, 480))
+                                            rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                                            rgb_annot.attach([render_product])
+                                            # Map to LeRobot key
+                                            if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
+                                            elif "left" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
+                                            elif "right" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
+                                            camera_status.append(f"  {cam_name}: {cam_path} [READY]")
+                                            found_cameras += 1
+                                        except Exception as e:
+                                            camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
                         except Exception as e:
-                            camera_status.append(f"  Error querying cameras: {e}")
+                            camera_status.append(f"  Error setting up cameras: {e}")
                         
                         if found_cameras == 0:
                             camera_status.append("  No cameras found in stage")
@@ -2644,7 +2661,7 @@ def run_teleop(env, args):
                         print(f"[LeRobot] Output: {lerobot_output_dir}")
                         print(f"[LeRobot] Task: {lerobot_task_text}")
                         print(f"[LeRobot] Initial objects: {len(initial_conditions['objects'])}")
-                        print(f"[LeRobot] Cameras:")
+                        print(f"[LeRobot] Cameras ({found_cameras} active):")
                         for status in camera_status:
                             print(status)
                         print(f"[LeRobot] Press X on left controller to stop recording")
@@ -2684,6 +2701,13 @@ def run_teleop(env, args):
                                 df[f"action.{i}"] = actions[:, i]
                             
                             df.to_parquet(os.path.join(ep_dir, "data.parquet"))
+                            
+                            # Save object states per frame (for kinematic replay)
+                            objects_per_frame = [f.get("objects_state", []) for f in lerobot_current_episode["frames"]]
+                            if any(objects_per_frame):
+                                with open(os.path.join(ep_dir, "objects_state.json"), "w") as f:
+                                    json.dump(objects_per_frame, f)
+                                print(f"[LeRobot] Saved object states for {sum(1 for o in objects_per_frame if o)} frames")
                             
                             # Save images in parallel for speed
                             def save_image(args):
@@ -2843,21 +2867,38 @@ def run_teleop(env, args):
                         "fps": fps,
                         "num_joints": num_joints,
                         "initial_conditions": initial_conditions,
+                        "render_products": {},  # Store render products for reuse
                     }
                     
-                    # Find cameras using USD API
+                    # Find all cameras and create render products ONCE
                     camera_status = []
                     found_cameras = 0
                     try:
                         from pxr import UsdGeom
+                        import omni.replicator.core as rep
+                        
                         for prim in stage.Traverse():
                             if prim.IsA(UsdGeom.Camera):
                                 cam_path = str(prim.GetPath())
+                                cam_name = prim.GetName()
                                 if "env_0" in cam_path:
-                                    camera_status.append(f"  {prim.GetName()}: {cam_path}")
-                                    found_cameras += 1
+                                    try:
+                                        render_product = rep.create.render_product(cam_path, (640, 480))
+                                        rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                                        rgb_annot.attach([render_product])
+                                        # Map to LeRobot key
+                                        if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                            lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
+                                        elif "left" in cam_name.lower():
+                                            lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
+                                        elif "right" in cam_name.lower():
+                                            lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
+                                        camera_status.append(f"  {cam_name}: {cam_path} [READY]")
+                                        found_cameras += 1
+                                    except Exception as e:
+                                        camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
                     except Exception as e:
-                        camera_status.append(f"  Error querying cameras: {e}")
+                        camera_status.append(f"  Error setting up cameras: {e}")
                     
                     if found_cameras == 0:
                         camera_status.append("  No cameras found in stage")
@@ -2867,7 +2908,7 @@ def run_teleop(env, args):
                     print(f"[LeRobot] Output: {lerobot_output_dir}")
                     print(f"[LeRobot] Task: {lerobot_task_text}")
                     print(f"[LeRobot] Initial objects: {len(initial_conditions['objects'])}")
-                    print(f"[LeRobot] Cameras ({found_cameras} found):")
+                    print(f"[LeRobot] Cameras ({found_cameras} active):")
                     for status in camera_status:
                         print(status)
                     print(f"[LeRobot] Press T to stop recording")
@@ -2907,6 +2948,13 @@ def run_teleop(env, args):
                             df[f"action.{i}"] = actions[:, i]
                         
                         df.to_parquet(os.path.join(ep_dir, "data.parquet"))
+                        
+                        # Save object states per frame (for kinematic replay)
+                        objects_per_frame = [f.get("objects_state", []) for f in lerobot_current_episode["frames"]]
+                        if any(objects_per_frame):
+                            with open(os.path.join(ep_dir, "objects_state.json"), "w") as f:
+                                json.dump(objects_per_frame, f)
+                            print(f"[LeRobot] Saved object states for {sum(1 for o in objects_per_frame if o)} frames")
                         
                         def save_image(args):
                             img, path = args
@@ -3451,50 +3499,51 @@ def run_teleop(env, args):
                     "action": action.copy(),
                 }
                 
-                # Capture camera images using camera API
-                try:
-                    from pxr import UsdGeom
-                    
-                    # Find all camera prims in the stage
-                    camera_prims = []
+                # Record object positions/orientations/scale for accurate playback
+                if stage is not None:
+                    from pxr import UsdGeom, Gf
+                    import re
+                    objects_state = []
                     for prim in stage.Traverse():
-                        if prim.IsA(UsdGeom.Camera):
-                            camera_prims.append(prim)
-                    
-                    # Capture from each camera
-                    for cam_prim in camera_prims:
-                        try:
-                            cam_path = str(cam_prim.GetPath())
-                            cam_name = cam_prim.GetName()
-                            
-                            # Only capture from env_0 cameras
-                            if "env_0" not in cam_path:
-                                continue
-                            
-                            # Use render product to capture
-                            import omni.replicator.core as rep
-                            render_product = rep.create.render_product(cam_path, (640, 480))
-                            rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-                            rgb_annot.attach([render_product])
-                            data = rgb_annot.get_data()
-                            
-                            if data is not None:
-                                img_np = data[:, :, :3].astype(np.uint8)
-                                # Map camera name to LeRobot key
-                                if "ego" in cam_name.lower() or "high" in cam_name.lower():
-                                    frame["observation.images.ego"] = Image.fromarray(img_np)
-                                elif "left" in cam_name.lower():
-                                    frame["observation.images.left_wrist"] = Image.fromarray(img_np)
-                                elif "right" in cam_name.lower():
-                                    frame["observation.images.right_wrist"] = Image.fromarray(img_np)
-                                else:
-                                    frame[f"observation.images.{cam_name}"] = Image.fromarray(img_np)
-                        except Exception:
-                            pass
-                                
-                except Exception as e:
-                    if len(lerobot_current_episode["frames"]) == 0:
-                        print(f"[LeRobot] Camera capture error: {e}")
+                        prim_path = str(prim.GetPath())
+                        # Only capture ROOT spawned objects (direct children of /World/)
+                        # Simple check: root objects have exactly 2 slashes (like /World/spawned_X)
+                        if prim_path.startswith("/World/spawned_") and prim_path.count('/') == 2:
+                            try:
+                                xformable = UsdGeom.Xformable(prim)
+                                world_transform = xformable.ComputeLocalToWorldTransform(0)
+                                pos = world_transform.ExtractTranslation()
+                                rot = world_transform.ExtractRotationQuat()
+                                # Extract scale from xform ops
+                                scale = [1.0, 1.0, 1.0]
+                                for op in xformable.GetOrderedXformOps():
+                                    if op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                                        s = op.Get()
+                                        if s is not None:
+                                            scale = [float(s[0]), float(s[1]), float(s[2])]
+                                            break
+                                objects_state.append({
+                                    "prim_path": prim_path,
+                                    "position": [float(pos[0]), float(pos[1]), float(pos[2])],
+                                    "orientation": [float(rot.GetReal()), float(rot.GetImaginary()[0]), 
+                                                   float(rot.GetImaginary()[1]), float(rot.GetImaginary()[2])],
+                                    "scale": scale,
+                                })
+                            except Exception:
+                                pass
+                    if objects_state:
+                        frame["objects_state"] = objects_state
+                
+                # Capture camera images using pre-created render products (fast)
+                render_products = lerobot_current_episode.get("render_products", {})
+                for cam_key, rgb_annot in render_products.items():
+                    try:
+                        data = rgb_annot.get_data()
+                        if data is not None:
+                            img_np = data[:, :, :3].astype(np.uint8)
+                            frame[cam_key] = Image.fromarray(img_np)
+                    except Exception:
+                        pass
                 
                 lerobot_current_episode["frames"].append(frame)
                 
@@ -3512,17 +3561,16 @@ def run_teleop(env, args):
                 left_err_mag = np.linalg.norm(left_pos_err)
                 right_err_mag = np.linalg.norm(right_pos_err)
                 
-                # Compute joint deltas (how much IK wants to move)
-                left_joint_delta = (left_joint_des - left_joint_pos)[0].cpu().numpy()
-                right_joint_delta = (right_joint_des - right_joint_pos)[0].cpu().numpy()
-                
                 print(f"Step {step_count:5d} | "
                       f"L:[{left_pose[0]:.2f},{left_pose[1]:.2f},{left_pose[2]:.2f}] | "
                       f"R:[{right_pose[0]:.2f},{right_pose[1]:.2f},{right_pose[2]:.2f}] | "
                       f"Grip L:{left_trigger:.2f} R:{right_trigger:.2f}")
                 
-                # Show IK errors if significant
-                if left_err_mag > 0.02 or right_err_mag > 0.02:
+                # Show IK errors if significant (only when IK is active)
+                if vr_tracking_active and (left_err_mag > 0.02 or right_err_mag > 0.02):
+                    # Compute joint deltas (how much IK wants to move)
+                    left_joint_delta = (left_joint_des - left_joint_pos)[0].cpu().numpy()
+                    right_joint_delta = (right_joint_des - right_joint_pos)[0].cpu().numpy()
                     print(f"  [IK] Pos err: L={left_err_mag:.3f}m R={right_err_mag:.3f}m")
                     print(f"  [IK] L delta: [{', '.join(f'{d:.3f}' for d in left_joint_delta)}]")
                     print(f"  [IK] R delta: [{', '.join(f'{d:.3f}' for d in right_joint_delta)}]")
