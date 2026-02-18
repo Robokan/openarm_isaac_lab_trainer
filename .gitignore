@@ -20,3 +20,5 @@ outputs
 */tutorials/
 datasets
 video/*
+
+vla_teleop_data/*
