@@ -105,7 +105,7 @@ class KeyboardDevice:
         self.left_gripper = 0.0
         self.right_gripper = 0.0
         self.gripper_step = 0.05  # How fast gripper opens/closes
-        self.markers_visible = True  # Toggle for marker visibility
+        self.markers_visible = False  # Toggle for marker visibility (hidden by default, M to show)
         self.active_hand = "left"
         self._carb_input = carb.input
         self._key_states = {}  # Track held keys for polling
@@ -512,6 +512,7 @@ class XRDevice:
         self.sensitivity = sensitivity
         self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
+        self.markers_visible = False  # Hidden by default, M to show
         self._reported_session = False
         self._xr_log_path = "/tmp/xr_device.log"
         self._last_enable_attempt = 0.0
@@ -609,6 +610,9 @@ class XRDevice:
                 self._log("[XRDevice] Manual XR enable requested")
                 self._enable_first_available_profile()
                 self._dump_status(prefix="[XRDevice][After X]")
+            elif event.input == carb.input.KeyboardInput.M:
+                self.markers_visible = not self.markers_visible
+                self._log(f"[XRDevice] Markers {'visible' if self.markers_visible else 'hidden'}")
         except Exception:
             pass
         return True
@@ -1767,25 +1771,130 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print("[INFO] Environment closed")
 
 
-def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=(0.2, 0.6, 1.0), cube_counter=[0]):
+# Mug USD assets for random spawning
+import os as _os
+_OPENARM_ROOT_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_OPENARM_ASSETS_DIR = _os.path.join(
+    _os.path.dirname(_OPENARM_ROOT_DIR),  # scripts/
+    "..", "source", "openarm", "openarm", "tasks", "manager_based", "openarm_manipulation"
+)
+_OPENARM_ASSETS_DIR = _os.path.normpath(_OPENARM_ASSETS_DIR)
+
+MUG_ASSETS = [
+    f"{_OPENARM_ASSETS_DIR}/usds/mugs/1.usd",
+    f"{_OPENARM_ASSETS_DIR}/usds/mugs/2.usd",
+    f"{_OPENARM_ASSETS_DIR}/usds/mugs/3.usd",
+    f"{_OPENARM_ASSETS_DIR}/usds/mugs/4.usd",
+]
+
+
+def spawn_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0], scale=0.01):
+    """Spawn a random mug at the given position.
+    
+    NOTE: With GPU physics, runtime-spawned objects may not have physics until
+    the simulation is reset. Consider using spawn_cube() for objects that need
+    immediate physics, or pre-spawn objects in the scene configuration.
+    
+    Args:
+        stage: USD stage
+        position: (x, y, z) spawn position in meters
+        object_counter: mutable counter for unique naming
+        scale: Scale factor for the mug (default 0.01 to convert from cm to m)
+    
+    Returns:
+        Path to the spawned object prim
+    """
+    from pxr import UsdGeom, Gf, UsdPhysics, PhysxSchema
+    
+    # Pick a random mug
+    usd_path = random.choice(MUG_ASSETS)
+    mug_name = os.path.basename(usd_path).replace('.usd', '')
+    
+    print(f"[Object] Loading mug from: {usd_path}", flush=True)
+    
+    object_counter[0] += 1
+    object_path = f"/World/spawned_object_{object_counter[0]}"
+    
+    # Create xform and add USD reference
+    xform = UsdGeom.Xform.Define(stage, object_path)
+    prim = xform.GetPrim()
+    prim.GetReferences().AddReference(usd_path)
+    
+    # Set transform
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    translate_op = xformable.AddTranslateOp()
+    translate_op.Set(Gf.Vec3d(position[0], position[1], position[2]))
+    scale_op = xformable.AddScaleOp()
+    scale_op.Set(Gf.Vec3d(scale, scale, scale))
+    
+    # Remove any existing RigidBodyAPI from children (causes hierarchy conflicts)
+    for child in prim.GetAllChildren():
+        if child.HasAPI(UsdPhysics.RigidBodyAPI):
+            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
+            print(f"[Object] Removed conflicting RigidBody from {child.GetPath()}", flush=True)
+        # Also remove PhysxRigidBodyAPI if present
+        if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+            child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
+    
+    # Add rigid body physics to the root prim only
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    
+    # Add PhysX rigid body properties
+    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
+    
+    # Add mass to root
+    mass_api = UsdPhysics.MassAPI.Apply(prim)
+    mass_api.CreateMassAttr().Set(0.15)  # 150g
+    
+    # Ensure collision exists on children (keep existing or add new)
+    has_collision = False
+    for child in prim.GetAllChildren():
+        if child.HasAPI(UsdPhysics.CollisionAPI):
+            has_collision = True
+    
+    # If no collision on children, add to root
+    if not has_collision:
+        UsdPhysics.CollisionAPI.Apply(prim)
+    
+    # Try to force physics to recognize the new object
+    try:
+        import omni.physx
+        physx_interface = omni.physx.get_physx_interface()
+        # Force a simulation step update to pick up new objects
+        physx_interface.force_load_physics_from_usd()
+        print(f"[Object] Physics reloaded for new object", flush=True)
+    except Exception as e:
+        print(f"[Object] Could not reload physics: {e}", flush=True)
+    
+    print(f"[Object] Spawned mug {mug_name} at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f}), scale={scale}", flush=True)
+    return object_path
+
+
+def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=None, object_counter=[0]):
     """Spawn a physics-enabled cube at the given position.
     
     Args:
         stage: USD stage
         position: (x, y, z) spawn position in meters
-        size: cube size in meters
-        color: (r, g, b) color values 0-1
-        cube_counter: mutable counter for unique naming
+        size: cube size in meters (half-extent)
+        color: (r, g, b) color values 0-1, or None for random color
+        object_counter: mutable counter for unique naming
     
     Returns:
         Path to the spawned cube prim
     """
-    from pxr import UsdGeom, UsdPhysics, Gf, Sdf
+    from pxr import UsdGeom, UsdPhysics, Gf, PhysxSchema
     
-    cube_counter[0] += 1
-    cube_path = f"/World/spawned_cube_{cube_counter[0]}"
+    # Random color if not specified
+    if color is None:
+        color = (random.random(), random.random(), random.random())
     
-    # Create the cube
+    object_counter[0] += 1
+    cube_path = f"/World/spawned_cube_{object_counter[0]}"
+    
+    # Create the cube geometry
     cube_prim = UsdGeom.Cube.Define(stage, cube_path)
     cube_prim.GetSizeAttr().Set(size * 2)  # USD cube size is full width
     
@@ -1799,34 +1908,47 @@ def spawn_cube(stage, position=(0.4, 0.0, 0.5), size=0.025, color=(0.2, 0.6, 1.0
     cube_prim.GetDisplayColorAttr().Set([Gf.Vec3f(color[0], color[1], color[2])])
     
     # Add rigid body physics
-    from pxr import UsdShade, PhysxSchema
     prim = cube_prim.GetPrim()
     UsdPhysics.RigidBodyAPI.Apply(prim)
     UsdPhysics.CollisionAPI.Apply(prim)
     
-    # Limit depenetration velocity so cube doesn't get launched on contact
-    rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-    rb_api.CreateMaxDepenetrationVelocityAttr().Set(0.5)
+    # Add PhysX properties (don't set velocities - GPU physics doesn't allow it)
+    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
+    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
     
     # Set mass
     mass_api = UsdPhysics.MassAPI.Apply(prim)
-    mass_api.GetMassAttr().Set(0.05)  # 50 grams
+    mass_api.CreateMassAttr().Set(0.05)  # 50 grams
     
-    # Add friction material so the gripper can hold it
-    mat_path = f"{cube_path}/PhysicsMaterial"
-    UsdShade.Material.Define(stage, mat_path)
-    mat_prim = stage.GetPrimAtPath(mat_path)
-    mat_api = UsdPhysics.MaterialAPI.Apply(mat_prim)
-    mat_api.CreateStaticFrictionAttr().Set(1.0)
-    mat_api.CreateDynamicFrictionAttr().Set(1.0)
-    mat_api.CreateRestitutionAttr().Set(0.0)
+    # Try to force physics to recognize the new object
+    try:
+        import omni.physx
+        physx_interface = omni.physx.get_physx_interface()
+        physx_interface.force_load_physics_from_usd()
+        print(f"[Object] Physics reloaded for new cube", flush=True)
+    except Exception as e:
+        print(f"[Object] Could not reload physics: {e}", flush=True)
     
-    # Bind the material to the cube collision
-    mat_binding = UsdShade.MaterialBindingAPI.Apply(prim)
-    mat_binding.Bind(UsdShade.Material(mat_prim), UsdShade.Tokens.weakerThanDescendants, "physics")
-    
-    print(f"[Cube] Spawned cube at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+    print(f"[Object] Spawned cube at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})", flush=True)
     return cube_path
+
+
+def spawn_random_object(stage, position=(0.4, 0.0, 0.5), object_counter=[0]):
+    """Spawn either a random mug or a cube at the given position.
+    
+    Args:
+        stage: USD stage
+        position: (x, y, z) spawn position in meters
+        object_counter: mutable counter for unique naming
+    
+    Returns:
+        Path to the spawned object prim
+    """
+    # 50% chance of mug, 50% chance of cube
+    if random.random() < 0.5:
+        return spawn_object(stage, position, object_counter)
+    else:
+        return spawn_cube(stage, position, object_counter=object_counter)
 
 
 def run_teleop(env, args):
@@ -1982,7 +2104,7 @@ def run_teleop(env, args):
         robot.write_joint_position_to_sim(right_open, joint_ids=right_gripper_ids)
     
     step_count = 0
-    prev_markers_visible = True  # Track previous visibility state
+    prev_markers_visible = False  # Track previous visibility state (hidden by default)
     prev_a_button = False  # Track A button for edge detection
     
     # Get USD stage for cube spawning and markers
@@ -2159,12 +2281,19 @@ def run_teleop(env, args):
                 spawn_requested = True
                 input_device.spawn_cube_requested = False  # Reset flag
             
-            # Spawn cube if requested
+            # Spawn random object (mug or cube) if requested
             if spawn_requested and stage is not None:
-                spawn_x = 0.4  # Forward
-                spawn_y = 0.0  # Center
-                spawn_z = 0.6  # Height to drop from
-                spawn_cube(stage, position=(spawn_x, spawn_y, spawn_z))
+                print("[Object] Spawn requested, attempting...", flush=True)
+                # Random position on the table
+                spawn_x = random.uniform(0.25, 0.50)  # Forward range on table
+                spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
+                spawn_z = random.uniform(0.45, 0.55)  # Drop height above table (table surface ~0.255)
+                try:
+                    spawn_random_object(stage, position=(spawn_x, spawn_y, spawn_z))
+                except Exception as e:
+                    import traceback
+                    print(f"[Object] Spawn failed: {e}", flush=True)
+                    traceback.print_exc()
             
             # Handle P key: print current pose of active hand (world coords)
             if hasattr(input_device, "print_pose_requested") and input_device.print_pose_requested:
