@@ -189,6 +189,7 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
             ),
         )
 
+
         # Left arm: sphere (arm reach) + box (workspace) intersection
         # Sphere: shoulder at (0, -0.15, 0.7), radius 0.40m
         # Box: x [0, 0.5], y [-0.5, 0.2], z [0.3, 1.0]

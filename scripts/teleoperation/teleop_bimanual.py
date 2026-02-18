@@ -70,6 +70,8 @@ import numpy as np
 import math
 import yaml
 import random
+import json
+from concurrent.futures import ThreadPoolExecutor
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
@@ -144,12 +146,16 @@ class KeyboardDevice:
         print("  P: Print current pose of active hand")
         print("  M: Toggle marker visibility")
         print("  R: Reset poses to default")
+        print("  Y: Start LeRobot recording")
+        print("  T: Stop LeRobot recording")
         print("  Ctrl+C: Quit")
         print("="*60 + "\n")
         
         self.spawn_cube_requested = False  # Flag for cube spawning
         self.reset_requested = False  # Flag for reset + script restart
         self.print_pose_requested = False  # Flag for printing current pose
+        self.start_recording_requested = False  # Flag for starting LeRobot recording
+        self.stop_recording_requested = False  # Flag for stopping LeRobot recording
     
     def _on_keyboard_event(self, event, *args, **kwargs):
         """Handle keyboard events from Isaac Sim.
@@ -191,6 +197,14 @@ class KeyboardDevice:
                 return False
             elif key == self._carb_input.KeyboardInput.P:
                 self.print_pose_requested = True
+                return False
+            elif key == self._carb_input.KeyboardInput.Y:
+                self.start_recording_requested = True
+                print("[Keyboard] Start recording requested")
+                return False
+            elif key == self._carb_input.KeyboardInput.T:
+                self.stop_recording_requested = True
+                print("[Keyboard] Stop recording requested")
                 return False
         
         # Check if it's a movement/rotation/gripper key we handle
@@ -2019,6 +2033,9 @@ def run_teleop(env, args):
     right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
     sim_device = unwrapped.device if hasattr(unwrapped, "device") else "cuda:0"
     
+    # Print available scene entities (for debugging cameras)
+    print(f"[INFO] Scene entities: {list(unwrapped.scene.keys())}")
+    
     # ===== FULL 7-DOF POSE IK =====
     print("[INFO] Setting up full 7-DOF pose IK (all joints, targeting hand)...")
     
@@ -2139,6 +2156,43 @@ def run_teleop(env, args):
     step_count = 0
     prev_markers_visible = False  # Track previous visibility state (hidden by default)
     prev_a_button = False  # Track A button for edge detection
+    prev_y_button = False  # Track Y button for recording start
+    prev_x_button = False  # Track X button for recording stop
+    
+    # LeRobot capture state
+    lerobot_recording = False
+    lerobot_current_episode = None
+    lerobot_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "vla_teleop_data")
+    lerobot_task_text = "bimanual teleoperation"
+    
+    # Check for existing episodes and set counter to next available
+    lerobot_episode_count = 0
+    episodes_dir = os.path.join(lerobot_output_dir, "episodes")
+    if os.path.exists(episodes_dir):
+        existing_episodes = [d for d in os.listdir(episodes_dir) if d.startswith("episode_")]
+        if existing_episodes:
+            # Extract episode numbers and find the max
+            episode_nums = []
+            for ep in existing_episodes:
+                try:
+                    num = int(ep.replace("episode_", ""))
+                    episode_nums.append(num)
+                except ValueError:
+                    pass
+            if episode_nums:
+                lerobot_episode_count = max(episode_nums) + 1
+                print(f"[LeRobot] Found {len(existing_episodes)} existing episodes, starting from episode_{lerobot_episode_count}")
+    
+    # Try to import LeRobot for native format support
+    try:
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        HAS_LEROBOT = True
+        print("[LeRobot] LeRobot found - will save in native LeRobot v3.0 format")
+    except ImportError:
+        HAS_LEROBOT = False
+        print("[LeRobot] LeRobot not found - will save in LeRobot-compatible format")
+    
+    lerobot_dataset = None  # Will be initialized when recording starts
     
     # Get USD stage for cube spawning and markers
     try:
@@ -2238,6 +2292,16 @@ def run_teleop(env, args):
     except Exception as e:
         print(f"[WARN] Could not sync initial EE poses: {e}")
     
+    # VR tracking active flag - wait for user input before tracking starts
+    vr_tracking_active = False
+    if args.input != "xr":
+        vr_tracking_active = True  # Always active for keyboard/gamepad
+    else:
+        print(f"\n{'='*60}")
+        print("[VR] WAITING FOR INPUT - Position yourself in VR")
+        print("[VR] Press any button or move joystick to start tracking")
+        print(f"{'='*60}\n")
+    
     try:
         while simulation_app.is_running() and step_count < 100000:
             # Update input device (poll key states for keyboard)
@@ -2303,16 +2367,442 @@ def run_teleop(env, args):
             if hasattr(input_device, "get_button_states"):
                 button_states = input_device.get_button_states()
                 a_pressed = button_states.get('right_a', False)
+                b_pressed = button_states.get('right_b', False)
+                y_pressed = button_states.get('left_y', False)
+                x_pressed = button_states.get('left_x', False)
+                
+                # Check for any VR input to activate tracking
+                if not vr_tracking_active:
+                    # Check buttons
+                    any_button = a_pressed or b_pressed or y_pressed or x_pressed
+                    # Check triggers
+                    any_trigger = left_trigger > 0.1 or right_trigger > 0.1
+                    # Check thumbsticks
+                    any_thumbstick = False
+                    if hasattr(input_device, 'get_thumbstick_values'):
+                        ts = input_device.get_thumbstick_values()
+                        any_thumbstick = (abs(ts.get('left_x', 0)) > 0.2 or abs(ts.get('left_y', 0)) > 0.2 or
+                                         abs(ts.get('right_x', 0)) > 0.2 or abs(ts.get('right_y', 0)) > 0.2)
+                    
+                    if any_button or any_trigger or any_thumbstick:
+                        vr_tracking_active = True
+                        # Sync VR controller poses to current robot EE positions
+                        # so arms start from controller position without jumping
+                        try:
+                            _left_ee_w = robot.data.body_pos_w[:, left_body_idx]
+                            _left_eq_w = robot.data.body_quat_w[:, left_body_idx]
+                            _right_ee_w = robot.data.body_pos_w[:, right_body_idx]
+                            _right_eq_w = robot.data.body_quat_w[:, right_body_idx]
+                            if hasattr(input_device, 'left_pose'):
+                                input_device.left_pose[:3] = _left_ee_w[0].cpu().numpy()
+                                input_device.left_pose[3:7] = _left_eq_w[0].cpu().numpy()
+                                input_device.right_pose[:3] = _right_ee_w[0].cpu().numpy()
+                                input_device.right_pose[3:7] = _right_eq_w[0].cpu().numpy()
+                        except Exception:
+                            pass
+                        print(f"\n{'='*60}")
+                        print("[VR] TRACKING ACTIVATED - Arms will now follow controllers")
+                        print(f"{'='*60}\n")
                 
                 # Edge detection: spawn only on button press (not hold)
                 if a_pressed and not prev_a_button:
                     spawn_requested = True
                 prev_a_button = a_pressed
+                
+                # Y button (left controller): Start recording
+                if y_pressed and not prev_y_button:
+                    if not lerobot_recording:
+                        lerobot_recording = True
+                        os.makedirs(lerobot_output_dir, exist_ok=True)
+                        
+                        # Initialize episode frame buffer
+                        num_joints = robot.data.joint_pos.shape[1]
+                        fps = int(1.0 / unwrapped.sim.get_physics_dt())
+                        
+                        # Capture initial conditions
+                        initial_conditions = {
+                            # Robot initial state
+                            "robot_joint_pos": robot.data.joint_pos[0].cpu().numpy().tolist(),
+                            "robot_joint_vel": robot.data.joint_vel[0].cpu().numpy().tolist(),
+                            # End-effector positions and orientations
+                            "left_ee_pos": robot.data.body_pos_w[:, left_body_idx][0].cpu().numpy().tolist(),
+                            "left_ee_quat": robot.data.body_quat_w[:, left_body_idx][0].cpu().numpy().tolist(),
+                            "right_ee_pos": robot.data.body_pos_w[:, right_body_idx][0].cpu().numpy().tolist(),
+                            "right_ee_quat": robot.data.body_quat_w[:, right_body_idx][0].cpu().numpy().tolist(),
+                            # Objects on table
+                            "objects": [],
+                        }
+                        
+                        # Find all spawned objects and record their positions
+                        if stage is not None:
+                            from pxr import UsdGeom, Gf
+                            for prim in stage.Traverse():
+                                prim_path = str(prim.GetPath())
+                                if prim_path.startswith("/World/spawned_"):
+                                    try:
+                                        xformable = UsdGeom.Xformable(prim)
+                                        xform_ops = xformable.GetOrderedXformOps()
+                                        pos = [0.0, 0.0, 0.0]
+                                        rot = [1.0, 0.0, 0.0, 0.0]  # quat w,x,y,z
+                                        scale = [1.0, 1.0, 1.0]
+                                        
+                                        for op in xform_ops:
+                                            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                                t = op.Get()
+                                                pos = [float(t[0]), float(t[1]), float(t[2])]
+                                            elif op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                                                s = op.Get()
+                                                scale = [float(s[0]), float(s[1]), float(s[2])]
+                                            elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                                                q = op.Get()
+                                                rot = [float(q.GetReal()), float(q.GetImaginary()[0]), 
+                                                       float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
+                                        
+                                        initial_conditions["objects"].append({
+                                            "prim_path": prim_path,
+                                            "position": pos,
+                                            "orientation": rot,
+                                            "scale": scale,
+                                        })
+                                    except Exception as e:
+                                        print(f"[LeRobot] Could not get transform for {prim_path}: {e}")
+                        
+                        lerobot_current_episode = {
+                            "frames": [],
+                            "start_time": time.time(),
+                            "fps": fps,
+                            "num_joints": num_joints,
+                            "initial_conditions": initial_conditions,
+                        }
+                        
+                        # Find all cameras using USD API
+                        camera_status = []
+                        found_cameras = 0
+                        try:
+                            from pxr import UsdGeom
+                            for prim in stage.Traverse():
+                                if prim.IsA(UsdGeom.Camera):
+                                    cam_path = str(prim.GetPath())
+                                    # Only count env_0 cameras
+                                    if "env_0" in cam_path:
+                                        camera_status.append(f"  {prim.GetName()}: {cam_path}")
+                                        found_cameras += 1
+                        except Exception as e:
+                            camera_status.append(f"  Error querying cameras: {e}")
+                        
+                        if found_cameras == 0:
+                            camera_status.append("  No cameras found in stage")
+                        
+                        print(f"\n{'='*60}")
+                        print(f"[LeRobot] RECORDING STARTED - Episode {lerobot_episode_count + 1}")
+                        print(f"[LeRobot] Output: {lerobot_output_dir}")
+                        print(f"[LeRobot] Task: {lerobot_task_text}")
+                        print(f"[LeRobot] Initial objects: {len(initial_conditions['objects'])}")
+                        print(f"[LeRobot] Cameras:")
+                        for status in camera_status:
+                            print(status)
+                        print(f"[LeRobot] Press X on left controller to stop recording")
+                        print(f"{'='*60}\n")
+                    else:
+                        print("[LeRobot] Already recording!")
+                prev_y_button = y_pressed
+                
+                # X button (left controller): Stop recording and save
+                if x_pressed and not prev_x_button:
+                    if lerobot_recording and lerobot_current_episode is not None:
+                        lerobot_recording = False
+                        num_frames = len(lerobot_current_episode["frames"])
+                        
+                        if num_frames > 0:
+                            # Save episode
+                            import pandas as pd
+                            from PIL import Image
+                            
+                            ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
+                            os.makedirs(ep_dir, exist_ok=True)
+                            
+                            fps = lerobot_current_episode["fps"]
+                            
+                            # Extract tabular data
+                            states = np.array([f["observation.state"] for f in lerobot_current_episode["frames"]])
+                            actions = np.array([f["action"] for f in lerobot_current_episode["frames"]])
+                            timestamps = np.arange(num_frames) / fps
+                            
+                            # Save tabular data as parquet
+                            df = pd.DataFrame({
+                                "timestamp": timestamps,
+                                "task": [lerobot_task_text] * num_frames,
+                            })
+                            for i in range(states.shape[1]):
+                                df[f"observation.state.{i}"] = states[:, i]
+                            for i in range(actions.shape[1]):
+                                df[f"action.{i}"] = actions[:, i]
+                            
+                            df.to_parquet(os.path.join(ep_dir, "data.parquet"))
+                            
+                            # Save images in parallel for speed
+                            def save_image(args):
+                                img, path = args
+                                img.save(path)
+                            
+                            save_tasks = []
+                            for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                                cam_name = cam_key.split(".")[-1]
+                                cam_dir = os.path.join(ep_dir, cam_name)
+                                os.makedirs(cam_dir, exist_ok=True)
+                                
+                                for idx, frame in enumerate(lerobot_current_episode["frames"]):
+                                    if cam_key in frame and frame[cam_key] is not None:
+                                        img = frame[cam_key]
+                                        path = os.path.join(cam_dir, f"frame_{idx:06d}.png")
+                                        save_tasks.append((img, path))
+                            
+                            with ThreadPoolExecutor(max_workers=8) as executor:
+                                list(executor.map(save_image, save_tasks))
+                            
+                            # Save metadata (include task_env for replay script)
+                            episode_metadata = {
+                                "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",  # Environment for replay
+                                "task_text": lerobot_task_text,  # Language prompt for VLA
+                                "fps": fps,
+                                "num_frames": num_frames,
+                                "duration_seconds": num_frames / fps,
+                                "num_joints": lerobot_current_episode["num_joints"],
+                            }
+                            with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
+                                json.dump(episode_metadata, f, indent=2)
+                            
+                            # Save initial conditions (objects, robot state at start)
+                            if "initial_conditions" in lerobot_current_episode:
+                                with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
+                                    json.dump(lerobot_current_episode["initial_conditions"], f, indent=2)
+                                print(f"[LeRobot] Saved initial conditions: {len(lerobot_current_episode['initial_conditions'].get('objects', []))} objects")
+                            
+                            # Also create/update top-level metadata for play script
+                            top_metadata_path = os.path.join(lerobot_output_dir, "metadata.json")
+                            top_metadata = {
+                                "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
+                                "task_text": lerobot_task_text,
+                                "fps": fps,
+                                "num_joints": lerobot_current_episode["num_joints"],
+                                "robot_type": "openarm_bimanual",
+                                "episode_count": lerobot_episode_count + 1,
+                            }
+                            with open(top_metadata_path, "w") as f:
+                                json.dump(top_metadata, f, indent=2)
+                            
+                            lerobot_episode_count += 1
+                            duration = num_frames / fps
+                            
+                            print(f"\n{'='*60}")
+                            print(f"[LeRobot] RECORDING SAVED - Episode {lerobot_episode_count}")
+                            print(f"[LeRobot] Frames: {num_frames}, Duration: {duration:.1f}s")
+                            print(f"[LeRobot] Saved to: {ep_dir}")
+                            print(f"{'='*60}\n")
+                        else:
+                            print("[LeRobot] No frames recorded, discarding episode")
+                        
+                        lerobot_current_episode = None
+                    else:
+                        print("[LeRobot] Not currently recording")
+                prev_x_button = x_pressed
             
             # Keyboard: Check C key flag
             if hasattr(input_device, "spawn_cube_requested") and input_device.spawn_cube_requested:
                 spawn_requested = True
                 input_device.spawn_cube_requested = False  # Reset flag
+            
+            # Keyboard: Y key to start recording
+            if hasattr(input_device, "start_recording_requested") and input_device.start_recording_requested:
+                input_device.start_recording_requested = False  # Reset flag
+                if not lerobot_recording:
+                    lerobot_recording = True
+                    os.makedirs(lerobot_output_dir, exist_ok=True)
+                    
+                    # Initialize episode frame buffer
+                    num_joints = robot.data.joint_pos.shape[1]
+                    fps = int(1.0 / unwrapped.sim.get_physics_dt())
+                    
+                    # Capture initial conditions
+                    initial_conditions = {
+                        "robot_joint_pos": robot.data.joint_pos[0].cpu().numpy().tolist(),
+                        "robot_joint_vel": robot.data.joint_vel[0].cpu().numpy().tolist(),
+                        "left_ee_pos": robot.data.body_pos_w[:, left_body_idx][0].cpu().numpy().tolist(),
+                        "left_ee_quat": robot.data.body_quat_w[:, left_body_idx][0].cpu().numpy().tolist(),
+                        "right_ee_pos": robot.data.body_pos_w[:, right_body_idx][0].cpu().numpy().tolist(),
+                        "right_ee_quat": robot.data.body_quat_w[:, right_body_idx][0].cpu().numpy().tolist(),
+                        "objects": [],
+                    }
+                    
+                    # Find all spawned objects
+                    if stage is not None:
+                        from pxr import UsdGeom, Gf
+                        for prim in stage.Traverse():
+                            prim_path = str(prim.GetPath())
+                            if prim_path.startswith("/World/spawned_"):
+                                try:
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xform_ops = xformable.GetOrderedXformOps()
+                                    pos = [0.0, 0.0, 0.0]
+                                    rot = [1.0, 0.0, 0.0, 0.0]
+                                    scale = [1.0, 1.0, 1.0]
+                                    for op in xform_ops:
+                                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                            t = op.Get()
+                                            pos = [float(t[0]), float(t[1]), float(t[2])]
+                                        elif op.GetOpType() == UsdGeom.XformOp.TypeScale:
+                                            s = op.Get()
+                                            scale = [float(s[0]), float(s[1]), float(s[2])]
+                                        elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                                            q = op.Get()
+                                            rot = [float(q.GetReal()), float(q.GetImaginary()[0]),
+                                                   float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
+                                    initial_conditions["objects"].append({
+                                        "prim_path": prim_path,
+                                        "position": pos,
+                                        "orientation": rot,
+                                        "scale": scale,
+                                    })
+                                except Exception:
+                                    pass
+                    
+                    lerobot_current_episode = {
+                        "frames": [],
+                        "start_time": time.time(),
+                        "fps": fps,
+                        "num_joints": num_joints,
+                        "initial_conditions": initial_conditions,
+                    }
+                    
+                    # Find cameras using USD API
+                    camera_status = []
+                    found_cameras = 0
+                    try:
+                        from pxr import UsdGeom
+                        for prim in stage.Traverse():
+                            if prim.IsA(UsdGeom.Camera):
+                                cam_path = str(prim.GetPath())
+                                if "env_0" in cam_path:
+                                    camera_status.append(f"  {prim.GetName()}: {cam_path}")
+                                    found_cameras += 1
+                    except Exception as e:
+                        camera_status.append(f"  Error querying cameras: {e}")
+                    
+                    if found_cameras == 0:
+                        camera_status.append("  No cameras found in stage")
+                    
+                    print(f"\n{'='*60}")
+                    print(f"[LeRobot] RECORDING STARTED - Episode {lerobot_episode_count + 1}")
+                    print(f"[LeRobot] Output: {lerobot_output_dir}")
+                    print(f"[LeRobot] Task: {lerobot_task_text}")
+                    print(f"[LeRobot] Initial objects: {len(initial_conditions['objects'])}")
+                    print(f"[LeRobot] Cameras ({found_cameras} found):")
+                    for status in camera_status:
+                        print(status)
+                    print(f"[LeRobot] Press T to stop recording")
+                    print(f"{'='*60}\n")
+                else:
+                    print("[LeRobot] Already recording!")
+            
+            # Keyboard: T key to stop recording
+            if hasattr(input_device, "stop_recording_requested") and input_device.stop_recording_requested:
+                input_device.stop_recording_requested = False  # Reset flag
+                if lerobot_recording and lerobot_current_episode is not None:
+                    lerobot_recording = False
+                    num_frames = len(lerobot_current_episode["frames"])
+                    
+                    if num_frames > 0:
+                        import pandas as pd
+                        from PIL import Image
+                        
+                        ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
+                        os.makedirs(ep_dir, exist_ok=True)
+                        
+                        fps = lerobot_current_episode["fps"]
+                        
+                        # Extract tabular data
+                        states = np.array([f["observation.state"] for f in lerobot_current_episode["frames"]])
+                        actions = np.array([f["action"] for f in lerobot_current_episode["frames"]])
+                        timestamps = np.arange(num_frames) / fps
+                        
+                        # Save tabular data as parquet
+                        df = pd.DataFrame({
+                            "timestamp": timestamps,
+                            "episode_index": [lerobot_episode_count] * num_frames,
+                            "frame_index": np.arange(num_frames),
+                            "task": [lerobot_task_text] * num_frames,
+                        })
+                        for i in range(states.shape[1]):
+                            df[f"observation.state.{i}"] = states[:, i]
+                        for i in range(actions.shape[1]):
+                            df[f"action.{i}"] = actions[:, i]
+                        
+                        df.to_parquet(os.path.join(ep_dir, "data.parquet"))
+                        
+                        # Save images in parallel for speed
+                        def save_image(args):
+                            img, path = args
+                            img.save(path)
+                        
+                        save_tasks = []
+                        for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                            cam_name = cam_key.split(".")[-1]
+                            cam_dir = os.path.join(ep_dir, cam_name)
+                            os.makedirs(cam_dir, exist_ok=True)
+                            
+                            for idx, frame in enumerate(lerobot_current_episode["frames"]):
+                                if cam_key in frame and frame[cam_key] is not None:
+                                    img = frame[cam_key]
+                                    path = os.path.join(cam_dir, f"frame_{idx:06d}.png")
+                                    save_tasks.append((img, path))
+                        
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            list(executor.map(save_image, save_tasks))
+                        
+                        # Save metadata
+                        episode_metadata = {
+                            "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
+                            "task_text": lerobot_task_text,
+                            "fps": fps,
+                            "num_frames": num_frames,
+                            "duration_seconds": num_frames / fps,
+                            "num_joints": lerobot_current_episode["num_joints"],
+                        }
+                        with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
+                            json.dump(episode_metadata, f, indent=2)
+                        
+                        # Save initial conditions
+                        if "initial_conditions" in lerobot_current_episode:
+                            with open(os.path.join(ep_dir, "initial_conditions.json"), "w") as f:
+                                json.dump(lerobot_current_episode["initial_conditions"], f, indent=2)
+                        
+                        # Update top-level metadata
+                        top_metadata_path = os.path.join(lerobot_output_dir, "metadata.json")
+                        top_metadata = {
+                            "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
+                            "task_text": lerobot_task_text,
+                            "fps": fps,
+                            "num_joints": lerobot_current_episode["num_joints"],
+                            "robot_type": "openarm_bimanual",
+                            "episode_count": lerobot_episode_count + 1,
+                        }
+                        with open(top_metadata_path, "w") as f:
+                            json.dump(top_metadata, f, indent=2)
+                        
+                        lerobot_episode_count += 1
+                        
+                        print(f"\n{'='*60}")
+                        print(f"[LeRobot] RECORDING SAVED - Episode {lerobot_episode_count}")
+                        print(f"[LeRobot] Frames: {num_frames}")
+                        print(f"[LeRobot] Duration: {num_frames / fps:.1f}s")
+                        print(f"[LeRobot] Location: {ep_dir}")
+                        print(f"{'='*60}\n")
+                    else:
+                        print("[LeRobot] No frames recorded, discarding episode")
+                    
+                    lerobot_current_episode = None
+                else:
+                    print("[LeRobot] Not currently recording")
             
             # Spawn random object (mug or cube) if requested
             if spawn_requested and stage is not None:
@@ -2524,27 +3014,29 @@ def run_teleop(env, args):
                     break
             
             # ===== WRITE GRIPPERS =====
+            # Only apply gripper targets when tracking is active
             # Use set_joint_position_target (PD controller) instead of write_joint_position_to_sim
             # so that finger contact forces are respected and don't penetrate objects.
-            # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
-            if left_gripper_ids:
-                left_pos = gripper_open_pos * (1.0 - left_trigger)
-                left_targets = torch.full(
-                    (1, len(left_gripper_ids)),
-                    left_pos,
-                    device=sim_device,
-                )
-                robot.set_joint_position_target(left_targets, joint_ids=left_gripper_ids)
-            
-            # Right gripper: open (0.044) when trigger=0, closed (0) when trigger=1
-            if right_gripper_ids:
-                right_pos = gripper_open_pos * (1.0 - right_trigger)
-                right_targets = torch.full(
-                    (1, len(right_gripper_ids)),
-                    right_pos,
-                    device=sim_device,
-                )
-                robot.set_joint_position_target(right_targets, joint_ids=right_gripper_ids)
+            if vr_tracking_active:
+                # Left gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+                if left_gripper_ids:
+                    left_pos = gripper_open_pos * (1.0 - left_trigger)
+                    left_targets = torch.full(
+                        (1, len(left_gripper_ids)),
+                        left_pos,
+                        device=sim_device,
+                    )
+                    robot.set_joint_position_target(left_targets, joint_ids=left_gripper_ids)
+                
+                # Right gripper: open (0.044) when trigger=0, closed (0) when trigger=1
+                if right_gripper_ids:
+                    right_pos = gripper_open_pos * (1.0 - right_trigger)
+                    right_targets = torch.full(
+                        (1, len(right_gripper_ids)),
+                        right_pos,
+                        device=sim_device,
+                    )
+                    robot.set_joint_position_target(right_targets, joint_ids=right_gripper_ids)
             
             # ===== FULL 7-DOF POSE IK =====
             # Targets are in world coordinates; transform to base frame for IK
@@ -2663,35 +3155,38 @@ def run_teleop(env, args):
             left_joint_pos = robot.data.joint_pos[:, left_arm_joint_ids]
             right_joint_pos = robot.data.joint_pos[:, right_arm_joint_ids]
             
-            # Set IK commands (position + orientation in base frame)
-            left_pose_cmd = torch.cat([left_target_pos_b, left_target_quat_b], dim=-1)
-            right_pose_cmd = torch.cat([right_target_pos_b, right_target_quat_b], dim=-1)
-            
-            left_ik_controller.set_command(left_pose_cmd)
-            right_ik_controller.set_command(right_pose_cmd)
-            
-            # Compute IK -> 7 joint targets per arm
-            left_joint_des = left_ik_controller.compute(
-                left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
-            )
-            right_joint_des = right_ik_controller.compute(
-                right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
-            )
-            
-            # Add rest pose bias to help escape singularities (like extended arm)
-            # This gently pulls joints toward a "comfortable" bent-elbow configuration
-            left_rest_pull = rest_pose_gain * (rest_pose_left - left_joint_pos)
-            right_rest_pull = rest_pose_gain * (rest_pose_right - right_joint_pos)
-            left_joint_des = left_joint_des + left_rest_pull
-            right_joint_des = right_joint_des + right_rest_pull
-            
-            # Clamp IK output to joint limits to prevent getting stuck
-            left_joint_des = torch.clamp(left_joint_des, left_limits_low, left_limits_high)
-            right_joint_des = torch.clamp(right_joint_des, right_limits_low, right_limits_high)
-            
-            # Apply all 7 joint targets per arm
-            robot.set_joint_position_target(left_joint_des, joint_ids=left_arm_joint_ids)
-            robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
+            # Only compute and apply IK when tracking is active
+            # This allows user to position in VR before arms start following
+            if vr_tracking_active:
+                # Set IK commands (position + orientation in base frame)
+                left_pose_cmd = torch.cat([left_target_pos_b, left_target_quat_b], dim=-1)
+                right_pose_cmd = torch.cat([right_target_pos_b, right_target_quat_b], dim=-1)
+                
+                left_ik_controller.set_command(left_pose_cmd)
+                right_ik_controller.set_command(right_pose_cmd)
+                
+                # Compute IK -> 7 joint targets per arm
+                left_joint_des = left_ik_controller.compute(
+                    left_ee_pos_b, left_ee_quat_b, left_jacobian_b, left_joint_pos
+                )
+                right_joint_des = right_ik_controller.compute(
+                    right_ee_pos_b, right_ee_quat_b, right_jacobian_b, right_joint_pos
+                )
+                
+                # Add rest pose bias to help escape singularities (like extended arm)
+                # This gently pulls joints toward a "comfortable" bent-elbow configuration
+                left_rest_pull = rest_pose_gain * (rest_pose_left - left_joint_pos)
+                right_rest_pull = rest_pose_gain * (rest_pose_right - right_joint_pos)
+                left_joint_des = left_joint_des + left_rest_pull
+                right_joint_des = right_joint_des + right_rest_pull
+                
+                # Clamp IK output to joint limits to prevent getting stuck
+                left_joint_des = torch.clamp(left_joint_des, left_limits_low, left_limits_high)
+                right_joint_des = torch.clamp(right_joint_des, right_limits_low, right_limits_high)
+                
+                # Apply all 7 joint targets per arm
+                robot.set_joint_position_target(left_joint_des, joint_ids=left_arm_joint_ids)
+                robot.set_joint_position_target(right_joint_des, joint_ids=right_arm_joint_ids)
             
             # Write the articulation data to simulation
             robot.write_data_to_sim()
@@ -2701,6 +3196,89 @@ def run_teleop(env, args):
             
             # Update robot data from simulation
             robot.update(unwrapped.sim.get_physics_dt())
+            
+            # LeRobot: Capture frame if recording (only when tracking is active)
+            if lerobot_recording and lerobot_current_episode is not None and vr_tracking_active:
+                from PIL import Image
+                
+                # Get current joint positions (observation state)
+                joint_pos = robot.data.joint_pos[0].cpu().numpy().astype(np.float32)
+                
+                # Action = commanded joint targets from IK + gripper targets
+                # Build full action array with the same shape as observation
+                action = joint_pos.copy()  # Start with current state
+                
+                # Overwrite arm joints with the IK-computed targets (what we commanded)
+                action[left_arm_joint_ids] = left_joint_des[0].cpu().numpy().astype(np.float32)
+                action[right_arm_joint_ids] = right_joint_des[0].cpu().numpy().astype(np.float32)
+                
+                # Overwrite gripper joints with gripper targets
+                if left_gripper_ids:
+                    left_gripper_target = gripper_open_pos * (1.0 - left_trigger)
+                    for gid in left_gripper_ids:
+                        action[gid] = left_gripper_target
+                if right_gripper_ids:
+                    right_gripper_target = gripper_open_pos * (1.0 - right_trigger)
+                    for gid in right_gripper_ids:
+                        action[gid] = right_gripper_target
+                
+                # Build frame dict
+                frame = {
+                    "observation.state": joint_pos.copy(),
+                    "action": action.copy(),
+                }
+                
+                # Capture camera images using camera API
+                try:
+                    from pxr import UsdGeom
+                    
+                    # Find all camera prims in the stage
+                    camera_prims = []
+                    for prim in stage.Traverse():
+                        if prim.IsA(UsdGeom.Camera):
+                            camera_prims.append(prim)
+                    
+                    # Capture from each camera
+                    for cam_prim in camera_prims:
+                        try:
+                            cam_path = str(cam_prim.GetPath())
+                            cam_name = cam_prim.GetName()
+                            
+                            # Only capture from env_0 cameras
+                            if "env_0" not in cam_path:
+                                continue
+                            
+                            # Use render product to capture
+                            import omni.replicator.core as rep
+                            render_product = rep.create.render_product(cam_path, (640, 480))
+                            rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                            rgb_annot.attach([render_product])
+                            data = rgb_annot.get_data()
+                            
+                            if data is not None:
+                                img_np = data[:, :, :3].astype(np.uint8)
+                                # Map camera name to LeRobot key
+                                if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                    frame["observation.images.ego"] = Image.fromarray(img_np)
+                                elif "left" in cam_name.lower():
+                                    frame["observation.images.left_wrist"] = Image.fromarray(img_np)
+                                elif "right" in cam_name.lower():
+                                    frame["observation.images.right_wrist"] = Image.fromarray(img_np)
+                                else:
+                                    frame[f"observation.images.{cam_name}"] = Image.fromarray(img_np)
+                        except Exception:
+                            pass
+                                
+                except Exception as e:
+                    if len(lerobot_current_episode["frames"]) == 0:
+                        print(f"[LeRobot] Camera capture error: {e}")
+                
+                lerobot_current_episode["frames"].append(frame)
+                
+                # Print recording indicator periodically
+                if len(lerobot_current_episode["frames"]) % 60 == 0:
+                    elapsed = time.time() - lerobot_current_episode["start_time"]
+                    print(f"[LeRobot] Recording... {len(lerobot_current_episode['frames'])} frames ({elapsed:.1f}s)")
             
             # Print status periodically
             step_count += 1

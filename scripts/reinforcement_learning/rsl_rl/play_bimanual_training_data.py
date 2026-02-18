@@ -299,13 +299,17 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     """Replay LeRobot fallback format data in simulation."""
     # Delayed imports for simulation
     from isaaclab.app import AppLauncher
+    import argparse
     
-    class Args:
-        headless = False
-        enable_cameras = False
-        device = "cuda:0"
+    args = argparse.Namespace(
+        headless=False,
+        enable_cameras=False,
+        device="cuda:0",
+        livestream=-1,
+        experience="",
+    )
     
-    app_launcher = AppLauncher(Args())
+    app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
     import gymnasium as gym
@@ -320,19 +324,39 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     import isaaclab_tasks  # noqa: F401
     import openarm.tasks  # noqa: F401
     
-    # Load metadata
-    metadata_path = os.path.join(data_dir, "metadata.json")
-    with open(metadata_path, "r") as f:
-        metadata = json.load(f)
+    # Camera view window disabled (Isaac Sim bundles headless OpenCV)
+    HAS_CV2 = False
     
-    task_name = metadata.get("task", "Isaac-Lift-Cube-OpenArm-Bi-Play-v0")
-    if "-Play" not in task_name:
+    # Load metadata (try top-level first, then per-episode)
+    metadata_path = os.path.join(data_dir, "metadata.json")
+    metadata = {}
+    
+    if os.path.exists(metadata_path):
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+    else:
+        # Try to load from first episode's metadata
+        episodes_dir = os.path.join(data_dir, "episodes")
+        if os.path.exists(episodes_dir):
+            ep_dirs = sorted([d for d in os.listdir(episodes_dir) if d.startswith("episode_")])
+            if ep_dirs:
+                ep_meta_path = os.path.join(episodes_dir, ep_dirs[0], "metadata.json")
+                if os.path.exists(ep_meta_path):
+                    with open(ep_meta_path, "r") as f:
+                        metadata = json.load(f)
+                    print(f"[INFO] Using metadata from {ep_dirs[0]}")
+    
+    task_name = metadata.get("task", "Isaac-Reach-OpenArm-Bi-Teleop-v0")
+    # Convert to Play variant if needed (but Teleop tasks don't have Play variants)
+    if "-Play" not in task_name and "-Teleop" not in task_name:
         task_name = task_name.replace("-v0", "-Play-v0")
     
     fps = metadata.get("fps", 50)
     dt = 1.0 / fps
+    task_text = metadata.get("task_text", metadata.get("task", ""))
     
     print(f"[INFO] Task: {task_name}")
+    print(f"[INFO] Task text: {task_text}")
     print(f"[INFO] FPS: {fps}, dt: {dt}")
     
     # Find episode directories
@@ -342,8 +366,17 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     if episode_idx is not None:
         episode_dirs = [episode_dirs[episode_idx]]
     
+    # Load environment config
+    from isaaclab_tasks.utils import parse_env_cfg
+    env_cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=1)
+    env_cfg.scene.num_envs = 1
+    
+    # Disable randomization for replay
+    if hasattr(env_cfg, 'observations') and hasattr(env_cfg.observations, 'policy'):
+        env_cfg.observations.policy.enable_corruption = False
+    
     # Create environment
-    env = gym.make(task_name)
+    env = gym.make(task_name, cfg=env_cfg)
     unwrapped = env.unwrapped
     
     # Keyboard controls
@@ -402,8 +435,9 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 
                 df = pd.read_parquet(parquet_path)
                 
-                # Extract actions from columns
-                action_cols = sorted([c for c in df.columns if c.startswith("action.")])
+                # Extract actions from columns (sort numerically, not alphabetically)
+                action_cols = [c for c in df.columns if c.startswith("action.")]
+                action_cols = sorted(action_cols, key=lambda x: int(x.split(".")[-1]))
                 actions = df[action_cols].values
                 
                 # Load initial conditions if available
@@ -415,6 +449,29 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 
                 print(f"\n[INFO] Playing: {ep_dir_name} ({len(actions)} steps)")
                 
+                # Load camera images for this episode if available
+                camera_images = {"left_wrist": [], "ego": [], "right_wrist": []}
+                if HAS_CV2:
+                    for cam_name in camera_images.keys():
+                        cam_dir = os.path.join(ep_path, cam_name)
+                        if os.path.exists(cam_dir):
+                            frame_files = sorted([f for f in os.listdir(cam_dir) if f.endswith(".png")])
+                            for ff in frame_files:
+                                img = cv2.imread(os.path.join(cam_dir, ff))
+                                if img is not None:
+                                    camera_images[cam_name].append(img)
+                    
+                    # Report camera availability
+                    for cam_name, imgs in camera_images.items():
+                        if imgs:
+                            print(f"  Camera {cam_name}: {len(imgs)} frames ({imgs[0].shape[1]}x{imgs[0].shape[0]})")
+                        else:
+                            print(f"  Camera {cam_name}: not found")
+                    
+                    # Create camera view window
+                    cv2.namedWindow("Camera Views", cv2.WINDOW_NORMAL)
+                    cv2.resizeWindow("Camera Views", 1920, 480)
+                
                 # Reset environment
                 obs, _ = env.reset()
                 skip_episode[0] = False
@@ -424,31 +481,69 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     num_envs = unwrapped.num_envs
                     device = unwrapped.device
                     
-                    # Set cube positions
+                    # Set cube positions (old format: left_cube_pos/right_cube_pos)
                     if "left_cube_pos" in init_cond and "right_cube_pos" in init_cond:
-                        left_obj = unwrapped.scene["object_left"]
-                        right_obj = unwrapped.scene["object_right"]
-                        
-                        left_pos = torch.tensor(init_cond["left_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
-                        left_quat = torch.tensor(init_cond.get("left_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
-                        right_pos = torch.tensor(init_cond["right_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
-                        right_quat = torch.tensor(init_cond.get("right_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
-                        
-                        left_obj.write_root_pose_to_sim(torch.cat([left_pos, left_quat], dim=-1))
-                        right_obj.write_root_pose_to_sim(torch.cat([right_pos, right_quat], dim=-1))
-                        
-                        zeros_vel = torch.zeros((num_envs, 6), device=device, dtype=torch.float32)
-                        left_obj.write_root_velocity_to_sim(zeros_vel)
-                        right_obj.write_root_velocity_to_sim(zeros_vel)
-                        print("  [INFO] Cube positions set")
+                        try:
+                            left_obj = unwrapped.scene["object_left"]
+                            right_obj = unwrapped.scene["object_right"]
+                            
+                            left_pos = torch.tensor(init_cond["left_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                            left_quat = torch.tensor(init_cond.get("left_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                            right_pos = torch.tensor(init_cond["right_cube_pos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                            right_quat = torch.tensor(init_cond.get("right_cube_quat", [1, 0, 0, 0]), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                            
+                            left_obj.write_root_pose_to_sim(torch.cat([left_pos, left_quat], dim=-1))
+                            right_obj.write_root_pose_to_sim(torch.cat([right_pos, right_quat], dim=-1))
+                            
+                            zeros_vel = torch.zeros((num_envs, 6), device=device, dtype=torch.float32)
+                            left_obj.write_root_velocity_to_sim(zeros_vel)
+                            right_obj.write_root_velocity_to_sim(zeros_vel)
+                            print("  [INFO] Cube positions set")
+                        except KeyError:
+                            pass
                     
-                    # Set robot positions
-                    if "robot_qpos" in init_cond:
+                    # Spawn objects from teleop recording (new format: objects array)
+                    if "objects" in init_cond and init_cond["objects"]:
+                        import omni.usd
+                        from pxr import UsdGeom, Gf, UsdPhysics
+                        stage = omni.usd.get_context().get_stage()
+                        
+                        for obj in init_cond["objects"]:
+                            prim_path = obj.get("prim_path", "")
+                            pos = obj.get("position", [0, 0, 0])
+                            quat = obj.get("orientation", [1, 0, 0, 0])
+                            scale = obj.get("scale", [1, 1, 1])
+                            
+                            # Check if object already exists
+                            prim = stage.GetPrimAtPath(prim_path)
+                            if prim.IsValid():
+                                # Update position/orientation
+                                xformable = UsdGeom.Xformable(prim)
+                                xformable.ClearXformOpOrder()
+                                translate_op = xformable.AddTranslateOp()
+                                translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                scale_op = xformable.AddScaleOp()
+                                scale_op.Set(Gf.Vec3d(scale[0], scale[1], scale[2]))
+                                print(f"  [INFO] Updated object: {prim_path}")
+                        
+                        print(f"  [INFO] Restored {len(init_cond['objects'])} objects from initial conditions")
+                    
+                    # Set robot positions (supports both old 'robot_qpos' and new 'robot_joint_pos')
+                    robot_qpos = init_cond.get("robot_qpos") or init_cond.get("robot_joint_pos")
+                    robot_qvel = init_cond.get("robot_qvel") or init_cond.get("robot_joint_vel")
+                    if robot_qpos is not None:
                         robot = unwrapped.scene["robot"]
-                        qpos = torch.tensor(init_cond["robot_qpos"], device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
-                        qvel = torch.tensor(init_cond.get("robot_qvel", [0] * len(init_cond["robot_qpos"])), device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        qpos = torch.tensor(robot_qpos, device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        if robot_qvel is not None:
+                            qvel = torch.tensor(robot_qvel, device=device, dtype=torch.float32).unsqueeze(0).expand(num_envs, -1)
+                        else:
+                            qvel = torch.zeros_like(qpos)
                         robot.write_joint_state_to_sim(qpos, qvel)
                         print("  [INFO] Robot positions set")
+                
+                robot = unwrapped.scene["robot"]
+                num_robot_joints = robot.num_joints
+                print(f"  [INFO] Action dim: {actions.shape[1]}, Robot joints: {num_robot_joints}")
                 
                 for step_idx, action in enumerate(actions):
                     if stop_playback[0] or skip_episode[0]:
@@ -462,13 +557,49 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     
                     start_time = time.time()
                     
+                    # Apply joint positions directly (like teleop does)
                     action_tensor = torch.tensor(
-                        [action] * unwrapped.num_envs,
-                        device=unwrapped.device,
-                        dtype=torch.float32
-                    )
+                        action, device=unwrapped.device, dtype=torch.float32
+                    ).unsqueeze(0).expand(unwrapped.num_envs, -1)
                     
-                    obs, _, _, _, _ = env.step(action_tensor)
+                    # Set joint position targets and step physics
+                    robot.set_joint_position_target(action_tensor)
+                    robot.write_data_to_sim()
+                    unwrapped.sim.step(render=True)
+                    
+                    # Update camera view window
+                    if HAS_CV2:
+                        # Get images for this frame (or last available if fewer frames than actions)
+                        left_img = camera_images["left_wrist"][min(step_idx, len(camera_images["left_wrist"]) - 1)] if camera_images["left_wrist"] else None
+                        ego_img = camera_images["ego"][min(step_idx, len(camera_images["ego"]) - 1)] if camera_images["ego"] else None
+                        right_img = camera_images["right_wrist"][min(step_idx, len(camera_images["right_wrist"]) - 1)] if camera_images["right_wrist"] else None
+                        
+                        # Create composite image: [left_wrist | ego | right_wrist]
+                        target_height = 480
+                        panels = []
+                        
+                        for img, label in [(left_img, "Left Wrist"), (ego_img, "Ego"), (right_img, "Right Wrist")]:
+                            if img is not None:
+                                # Resize to target height while maintaining aspect ratio
+                                h, w = img.shape[:2]
+                                scale = target_height / h
+                                new_w = int(w * scale)
+                                resized = cv2.resize(img, (new_w, target_height))
+                                # Add label
+                                cv2.putText(resized, label, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                                cv2.putText(resized, f"Frame {step_idx}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+                                panels.append(resized)
+                            else:
+                                # Create placeholder
+                                placeholder = np.zeros((target_height, 640, 3), dtype=np.uint8)
+                                cv2.putText(placeholder, f"{label} - No Data", (150, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (128, 128, 128), 2)
+                                panels.append(placeholder)
+                        
+                        # Concatenate horizontally
+                        if panels:
+                            composite = np.hstack(panels)
+                            cv2.imshow("Camera Views", composite)
+                            cv2.waitKey(1)  # Required to update window
                     
                     if step_idx % 50 == 0:
                         print(f"  Step {step_idx}/{len(actions)}", end="\r")
@@ -479,6 +610,10 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             time.sleep(sleep_time)
                 
                 print(f"  {ep_dir_name} complete.          ")
+                
+                # Close camera window after episode
+                if HAS_CV2:
+                    cv2.destroyWindow("Camera Views")
             
             if not loop or stop_playback[0]:
                 break
@@ -488,6 +623,8 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
         print("\n[INFO] Interrupted.")
     finally:
         stop_requested.set()
+        if HAS_CV2:
+            cv2.destroyAllWindows()
         input_interface.unsubscribe_to_keyboard_events(keyboard, keyboard_sub)
         env.close()
         simulation_app.close()
@@ -497,13 +634,17 @@ def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False,
     """Replay legacy HDF5 format data in simulation."""
     # Delayed imports for simulation
     from isaaclab.app import AppLauncher
+    import argparse
     
-    class Args:
-        headless = False
-        enable_cameras = False
-        device = "cuda:0"
+    args = argparse.Namespace(
+        headless=False,
+        enable_cameras=False,
+        device="cuda:0",
+        livestream=-1,
+        experience="",
+    )
     
-    app_launcher = AppLauncher(Args())
+    app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
     import gymnasium as gym
@@ -523,13 +664,16 @@ def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False,
     with open(metadata_path, "r") as f:
         metadata = json.load(f)
     
-    task_name = metadata.get("task", "Isaac-Lift-Cube-OpenArm-Bi-Play-v0")
-    if "-Play" not in task_name:
+    task_name = metadata.get("task", "Isaac-Reach-OpenArm-Bi-Teleop-v0")
+    # Convert to Play variant if needed (but Teleop tasks don't have Play variants)
+    if "-Play" not in task_name and "-Teleop" not in task_name:
         task_name = task_name.replace("-v0", "-Play-v0")
     
     dt = metadata.get("dt", 0.02)
+    task_text = metadata.get("task_text", metadata.get("task", ""))
     
     print(f"[INFO] Task: {task_name}")
+    print(f"[INFO] Task text: {task_text}")
     print(f"[INFO] dt: {dt}")
     
     # Find episode files
@@ -673,14 +817,16 @@ def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False,
                     
                     start_time = time.time()
                     
-                    # Convert to tensor
+                    # Apply joint positions directly (like teleop does)
+                    robot = unwrapped.scene["robot"]
                     action_tensor = torch.tensor(
-                        [action] * unwrapped.num_envs,
-                        device=unwrapped.device,
-                        dtype=torch.float32
-                    )
+                        action, device=unwrapped.device, dtype=torch.float32
+                    ).unsqueeze(0).expand(unwrapped.num_envs, -1)
                     
-                    obs, _, _, _, _ = env.step(action_tensor)
+                    # Set joint position targets and step physics
+                    robot.set_joint_position_target(action_tensor)
+                    robot.write_data_to_sim()
+                    unwrapped.sim.step(render=True)
                     
                     if step_idx % 50 == 0:
                         print(f"  Step {step_idx}/{len(actions)}", end="\r")

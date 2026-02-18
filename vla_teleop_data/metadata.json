@@ -1,0 +1,8 @@
+{
+  "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
+  "task_text": "bimanual teleoperation",
+  "fps": 60,
+  "num_joints": 22,
+  "robot_type": "openarm_bimanual",
+  "episode_count": 1
+}
