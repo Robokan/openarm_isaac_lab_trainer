@@ -2427,6 +2427,7 @@ def run_teleop(env, args):
     object_pool = {
         "cubes": [],    # List of {"asset": RigidObject, "active": bool, "idx": int}
         "mugs": [],     # List of {"asset": RigidObject, "active": bool, "idx": int}
+        "fruits": [],   # List of {"asset": RigidObject, "active": bool, "idx": int}
     }
     
     # Get pool objects from scene (defined in joint_pos_env_cfg.py)
@@ -2447,7 +2448,14 @@ def run_teleop(env, args):
             mug_asset = unwrapped.scene[mug_name]
             object_pool["mugs"].append({"asset": mug_asset, "active": False, "idx": i})
     
-    print(f"[Pool] Found {len(object_pool['cubes'])} cubes, {len(object_pool['mugs'])} mugs")
+    # Load fruits (6 total)
+    for i in range(6):
+        fruit_name = f"pool_fruit_{i}"
+        if fruit_name in scene_keys:
+            fruit_asset = unwrapped.scene[fruit_name]
+            object_pool["fruits"].append({"asset": fruit_asset, "active": False, "idx": i})
+    
+    print(f"[Pool] Found {len(object_pool['cubes'])} cubes, {len(object_pool['mugs'])} mugs, {len(object_pool['fruits'])} fruits")
     
     def activate_pool_object(pool_type, position):
         """Activate an object from the pool at the given position.
@@ -2491,7 +2499,7 @@ def run_teleop(env, args):
         asset.write_root_velocity_to_sim(vel)
         
         # Mark as inactive
-        for pool_type in ["cubes", "mugs"]:
+        for pool_type in ["cubes", "mugs", "fruits"]:
             for obj in object_pool[pool_type]:
                 if obj["asset"] is asset:
                     obj["active"] = False
@@ -3112,8 +3120,8 @@ def run_teleop(env, args):
                 spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
                 spawn_z = random.uniform(0.45, 0.55)  # Drop height above table
                 try:
-                    # Randomly pick from cubes or mugs pool, try other if first exhausted
-                    pool_types = ["cubes", "mugs"]
+                    # Randomly pick from cubes, mugs, or fruits pool, try others if first exhausted
+                    pool_types = ["cubes", "mugs", "fruits"]
                     random.shuffle(pool_types)
                     
                     spawned_path, spawned_asset = None, None

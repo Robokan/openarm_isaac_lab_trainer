@@ -43,7 +43,7 @@ from ..reach_env_cfg import ReachSceneCfg
 # Shared rigid body properties for pool objects
 _pool_rigid_props = sim_utils.RigidBodyPropertiesCfg()
 
-# Local mug assets path
+# Local mug and fruit assets paths
 import os as _os
 _CONFIG_DIR = _os.path.dirname(_os.path.abspath(__file__))
 _USDS_DIR = _os.path.normpath(_os.path.join(_CONFIG_DIR, "..", "..", "..", "usds"))
@@ -52,6 +52,14 @@ _MUG_ASSETS = [
     f"{_USDS_DIR}/mugs/2.usd",
     f"{_USDS_DIR}/mugs/3.usd",
     f"{_USDS_DIR}/mugs/4.usd",
+]
+_FRUIT_ASSETS = [
+    f"{_USDS_DIR}/fruits/orange_02.usd",
+    f"{_USDS_DIR}/fruits/lemon_02.usd",
+    f"{_USDS_DIR}/fruits/lime01.usd",
+    f"{_USDS_DIR}/fruits/avocado01.usd",
+    f"{_USDS_DIR}/fruits/pomegranate01.usd",
+    f"{_USDS_DIR}/fruits/lychee01.usd",
 ]
 
 
@@ -163,6 +171,74 @@ class TeleopSceneCfg(ReachSceneCfg):
         ),
     )
     
+    # Pool fruits (6 total) - fixed local USD files with RigidBodyAPI on root
+    # Fruits are already in meters (~7cm orange, ~4cm lemon), so scale=1.0
+    pool_fruit_0: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_0",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, -0.6, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[0],  # orange
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
+    pool_fruit_1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_1",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, -0.3, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[1],  # lemon
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
+    pool_fruit_2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_2",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, 0.0, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[2],  # lime
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
+    pool_fruit_3: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_3",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, 0.3, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[3],  # avocado
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.2),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
+    pool_fruit_4: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_4",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, 0.6, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[4],  # pomegranate
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
+    pool_fruit_5: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolFruit_5",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, 0.9, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=UsdFileCfg(
+            usd_path=_FRUIT_ASSETS[5],  # lychee
+            scale=(1.0, 1.0, 1.0),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.02),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+        ),
+    )
 
 
 ##
