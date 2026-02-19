@@ -14,12 +14,14 @@
 
 import math
 
-from isaaclab.assets import AssetBaseCfg
+from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
+from isaaclab.sim.spawners.shapes import CuboidCfg
 import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
+from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
 from .. import mdp
 from ..reach_env_cfg import (
@@ -31,6 +33,135 @@ from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.open
     OPEN_ARM_FACTORY_HIGH_PD_CFG,
 )
 from isaaclab.assets.articulation import ArticulationCfg
+from isaaclab.scene import InteractiveSceneCfg
+from ..reach_env_cfg import ReachSceneCfg
+
+##
+# Scene configuration with object pool for teleoperation
+##
+
+# Shared rigid body properties for pool objects
+_pool_rigid_props = sim_utils.RigidBodyPropertiesCfg()
+
+
+@configclass
+class TeleopSceneCfg(ReachSceneCfg):
+    """Scene config with pre-spawned object pool for teleoperation."""
+    
+    # Pool cubes (5 total) - on floor away from robot
+    pool_cube_0: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolCube_0",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.0, -0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+        ),
+    )
+    pool_cube_1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolCube_1",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.0, -0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+        ),
+    )
+    pool_cube_2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolCube_2",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.0, 0.0, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0)),
+        ),
+    )
+    pool_cube_3: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolCube_3",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.0, 0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0)),
+        ),
+    )
+    pool_cube_4: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolCube_4",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.0, 0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.05, 0.05, 0.05),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.1),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 1.0)),
+        ),
+    )
+    
+    # Pool objects (5 total) - also cubes but different sizes/colors
+    pool_object_0: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolObject_0",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, -0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.04, 0.04, 0.04),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.2, 0.8)),
+        ),
+    )
+    pool_object_1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolObject_1",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, -0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.04, 0.04, 0.04),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.2, 0.2)),
+        ),
+    )
+    pool_object_2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolObject_2",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.0, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.04, 0.04, 0.04),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.8, 0.2)),
+        ),
+    )
+    pool_object_3: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolObject_3",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.04, 0.04, 0.04),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.8, 0.2)),
+        ),
+    )
+    pool_object_4: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolObject_4",
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
+        spawn=CuboidCfg(
+            size=(0.04, 0.04, 0.04),
+            rigid_props=_pool_rigid_props,
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            collision_props=sim_utils.CollisionPropertiesCfg(),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.8, 0.8)),
+        ),
+    )
+
 
 ##
 # Environment configuration
@@ -148,7 +279,12 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
     
     This ensures all targets are within physical arm reach.
     Orientations are ±45° around gripper-down pose.
+    
+    Includes TeleopSceneCfg with pre-spawned pool objects.
     """
+    
+    # Use TeleopSceneCfg which includes pool objects
+    scene: TeleopSceneCfg = TeleopSceneCfg(num_envs=4096, env_spacing=2.5)
 
     def __post_init__(self):
         # post init of parent
@@ -188,7 +324,6 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
                 collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
             ),
         )
-
 
         # Left arm: sphere (arm reach) + box (workspace) intersection
         # Sphere: shoulder at (0, -0.15, 0.7), radius 0.40m

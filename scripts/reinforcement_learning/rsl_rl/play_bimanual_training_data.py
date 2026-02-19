@@ -586,79 +586,44 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             if not prim.IsValid():
                                 print(f"  [DEBUG] Prim doesn't exist, creating: {prim_path}", flush=True)
                                 if obj_type == "cube":
-                                    # Spawn a simple physics cube
+                                    # Spawn a visual cube (no physics - kinematic playback)
                                     cube_prim = UsdGeom.Cube.Define(stage, prim_path)
                                     cube_prim.GetSizeAttr().Set(0.05)  # 5cm cube
                                     prim = cube_prim.GetPrim()
                                     
-                                    # Add physics
-                                    UsdPhysics.RigidBodyAPI.Apply(prim)
-                                    UsdPhysics.CollisionAPI.Apply(prim)
-                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
-                                    mass_api = UsdPhysics.MassAPI.Apply(prim)
-                                    mass_api.CreateMassAttr().Set(0.05)
-                                    
-                                    print(f"  [DEBUG] Created cube at {prim_path}", flush=True)
-                                    spawned_count += 1
-                                    
-                                elif obj_type == "usd_reference" and usd_path:
-                                    # Spawn USD reference (mug, fruit, etc.) - match teleop exactly
-                                    xform = UsdGeom.Xform.Define(stage, prim_path)
-                                    prim = xform.GetPrim()
-                                    prim.GetReferences().AddReference(usd_path)
-                                    
-                                    # Set transform: translate, orient, scale
+                                    # Set transform (no physics)
                                     xformable = UsdGeom.Xformable(prim)
                                     xformable.ClearXformOpOrder()
                                     translate_op = xformable.AddTranslateOp()
                                     translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
                                     orient_op = xformable.AddOrientOp()
-                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))  # Identity quaternion
+                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))
+                                    scale_op = xformable.AddScaleOp()
+                                    scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
+                                    
+                                    print(f"  [DEBUG] Created cube at {prim_path}", flush=True)
+                                    spawned_count += 1
+                                    
+                                elif obj_type == "usd_reference" and usd_path:
+                                    # Spawn USD reference (no physics - kinematic playback)
+                                    xform = UsdGeom.Xform.Define(stage, prim_path)
+                                    prim = xform.GetPrim()
+                                    prim.GetReferences().AddReference(usd_path)
+                                    
+                                    # Set transform (no physics)
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xformable.ClearXformOpOrder()
+                                    translate_op = xformable.AddTranslateOp()
+                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    orient_op = xformable.AddOrientOp()
+                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))
                                     scale_val = scale[0] if isinstance(scale, list) else scale
                                     scale_op = xformable.AddScaleOp()
                                     scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
                                     
-                                    # Remove rigid body from children (like teleop)
-                                    for child in prim.GetAllChildren():
-                                        if child.HasAPI(UsdPhysics.RigidBodyAPI):
-                                            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
-                                        if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
-                                            child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
-                                    
-                                    # Add physics to root (like teleop)
-                                    UsdPhysics.RigidBodyAPI.Apply(prim)
-                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
-                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.1)
-                                    
-                                    # Add collision to mesh children (like teleop)
-                                    for descendant in Usd.PrimRange(prim):
-                                        is_mesh = descendant.IsA(UsdGeom.Mesh)
-                                        has_collision = descendant.HasAPI(UsdPhysics.CollisionAPI)
-                                        
-                                        if is_mesh or has_collision:
-                                            if not has_collision:
-                                                UsdPhysics.CollisionAPI.Apply(descendant)
-                                            PhysxSchema.PhysxCollisionAPI.Apply(descendant)
-                                            if descendant.HasAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI):
-                                                descendant.RemoveAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI)
-                                            UsdPhysics.MeshCollisionAPI.Apply(descendant).CreateApproximationAttr().Set("convexDecomposition")
-                                    
                                     spawned_count += 1
                             else:
                                 updated_count += 1
-                            
-                            # Set transform for cubes and updated prims (USD refs set transform during spawn)
-                            if prim.IsValid() and obj_type == "cube":
-                                xformable = UsdGeom.Xformable(prim)
-                                xformable.ClearXformOpOrder()
-                                translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionFloat)
-                                translate_op.Set(Gf.Vec3f(pos[0], pos[1], pos[2]))
-                                orient_op = xformable.AddOrientOp(precision=UsdGeom.XformOp.PrecisionFloat)
-                                orient_op.Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
-                                scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionFloat)
-                                scale_op.Set(Gf.Vec3f(scale[0], scale[1], scale[2]))
                         
                         # Force physics to recognize new objects
                         try:
@@ -751,16 +716,21 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                                     cube_prim = UsdGeom.Cube.Define(stage, prim_path)
                                     cube_prim.GetSizeAttr().Set(0.05)
                                     prim = cube_prim.GetPrim()
-                                    UsdPhysics.RigidBodyAPI.Apply(prim)
-                                    UsdPhysics.CollisionAPI.Apply(prim)
-                                    PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.05)
+                                    # Set transform (no physics - kinematic only)
+                                    xformable = UsdGeom.Xformable(prim)
+                                    xformable.ClearXformOpOrder()
+                                    translate_op = xformable.AddTranslateOp()
+                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                    orient_op = xformable.AddOrientOp()
+                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))
+                                    scale_op = xformable.AddScaleOp()
+                                    scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
                                 elif obj_type == "usd_reference" and usd_path:
                                     xform = UsdGeom.Xform.Define(stage, prim_path)
                                     prim = xform.GetPrim()
                                     prim.GetReferences().AddReference(usd_path)
                                     
-                                    # Set transform: translate, orient, scale (orient needed for per-frame updates)
+                                    # Set transform: translate, orient, scale (no physics - kinematic only)
                                     xformable = UsdGeom.Xformable(prim)
                                     xformable.ClearXformOpOrder()
                                     translate_op = xformable.AddTranslateOp()
@@ -770,41 +740,6 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                                     scale_val = scale[0] if isinstance(scale, list) else scale
                                     scale_op = xformable.AddScaleOp()
                                     scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
-                                    
-                                    # Remove rigid body from children (like teleop)
-                                    for child in prim.GetAllChildren():
-                                        if child.HasAPI(UsdPhysics.RigidBodyAPI):
-                                            child.RemoveAPI(UsdPhysics.RigidBodyAPI)
-                                        if child.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
-                                            child.RemoveAPI(PhysxSchema.PhysxRigidBodyAPI)
-                                    
-                                    # Add physics to root (like teleop)
-                                    UsdPhysics.RigidBodyAPI.Apply(prim)
-                                    physx_rb = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
-                                    physx_rb.CreateEnableGyroscopicForcesAttr().Set(True)
-                                    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.1)
-                                    
-                                    # Add collision to mesh children (like teleop)
-                                    for descendant in Usd.PrimRange(prim):
-                                        is_mesh = descendant.IsA(UsdGeom.Mesh)
-                                        has_collision = descendant.HasAPI(UsdPhysics.CollisionAPI)
-                                        
-                                        if is_mesh or has_collision:
-                                            if not has_collision:
-                                                UsdPhysics.CollisionAPI.Apply(descendant)
-                                            PhysxSchema.PhysxCollisionAPI.Apply(descendant)
-                                            if descendant.HasAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI):
-                                                descendant.RemoveAPI(PhysxSchema.PhysxTriangleMeshCollisionAPI)
-                                            UsdPhysics.MeshCollisionAPI.Apply(descendant).CreateApproximationAttr().Set("convexDecomposition")
-                                
-                                # Set transform for cubes
-                                elif obj_type == "cube" and prim.IsValid():
-                                    xformable = UsdGeom.Xformable(prim)
-                                    xformable.ClearXformOpOrder()
-                                    translate_op = xformable.AddTranslateOp(precision=UsdGeom.XformOp.PrecisionFloat)
-                                    translate_op.Set(Gf.Vec3f(pos[0], pos[1], pos[2]))
-                                    scale_op = xformable.AddScaleOp(precision=UsdGeom.XformOp.PrecisionFloat)
-                                    scale_op.Set(Gf.Vec3f(scale[0], scale[1], scale[2]))
                     
                     start_time = time.time()
                     
@@ -830,7 +765,6 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                         for obj in frame_objects:
                             prim_path = obj.get("prim_path", "")
                             # Skip child prims - only process root spawned objects
-                            # Simple check: count slashes - root objects have exactly 2 (like /World/spawned_X)
                             if prim_path.count('/') != 2:
                                 continue
                             pos = obj.get("position", [0, 0, 0])
@@ -839,7 +773,7 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             if prim.IsValid():
                                 try:
                                     xformable = UsdGeom.Xformable(prim)
-                                    # Only update translate and orient - leave scale alone (set at spawn)
+                                    # Update translate and orient - leave scale alone (set at spawn)
                                     for op in xformable.GetOrderedXformOps():
                                         if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
                                             op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))

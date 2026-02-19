@@ -2296,6 +2296,7 @@ def run_teleop(env, args):
     # LeRobot capture state
     lerobot_recording = False
     lerobot_current_episode = None
+    spawned_objects_cache = []  # Cache of spawned object prim paths
     lerobot_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "vla_teleop_data")
     lerobot_task_text = "bimanual teleoperation"
     
@@ -2418,6 +2419,87 @@ def run_teleop(env, args):
               f" R=({input_device.right_pose[0]:.3f}, {input_device.right_pose[1]:.3f}, {input_device.right_pose[2]:.3f})")
     except Exception as e:
         print(f"[WARN] Could not sync initial EE poses: {e}")
+    
+    # =====================================================================
+    # OBJECT POOL - Using Isaac Lab RigidObject assets from scene config
+    # Objects are pre-spawned on floor away from robot, teleported to table on activation
+    # =====================================================================
+    POOL_SIZE = 5
+    object_pool = {
+        "cubes": [],    # List of {"asset": RigidObject, "active": bool, "idx": int}
+        "objects": [],  # List of {"asset": RigidObject, "active": bool, "idx": int}
+    }
+    
+    # Get pool objects from scene (defined in joint_pos_env_cfg.py)
+    print(f"\n[Pool] Loading pool objects from scene...")
+    scene_keys = list(unwrapped.scene.keys()) if hasattr(unwrapped.scene, 'keys') else []
+    print(f"[Pool] Scene keys: {scene_keys}")
+    
+    for i in range(POOL_SIZE):
+        # Pool cubes - access via dict-like syntax
+        cube_name = f"pool_cube_{i}"
+        if cube_name in scene_keys:
+            cube_asset = unwrapped.scene[cube_name]
+            object_pool["cubes"].append({"asset": cube_asset, "active": False, "idx": i})
+        
+        # Pool objects
+        obj_name = f"pool_object_{i}"
+        if obj_name in scene_keys:
+            obj_asset = unwrapped.scene[obj_name]
+            object_pool["objects"].append({"asset": obj_asset, "active": False, "idx": i})
+    
+    print(f"[Pool] Found {len(object_pool['cubes'])} cubes, {len(object_pool['objects'])} objects")
+    
+    def activate_pool_object(pool_type, position):
+        """Activate an object from the pool at the given position.
+        Returns (prim_path, asset) or (None, None) if pool exhausted."""
+        import torch
+        
+        pool_list = object_pool[pool_type]
+        for obj in pool_list:
+            if not obj["active"]:
+                obj["active"] = True
+                asset = obj["asset"]
+                
+                # Teleport to position using Isaac Lab API
+                pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
+                quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)  # w,x,y,z upright
+                vel = torch.zeros((1, 6), device=asset.device)
+                
+                # Write pose and velocity to simulation (properly syncs with physics)
+                asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+                asset.write_root_velocity_to_sim(vel)
+                
+                prim_path = asset.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0")
+                return prim_path, asset
+        
+        print(f"[Pool] WARNING: {pool_type} pool exhausted!")
+        return None, None
+    
+    def deactivate_pool_object(asset):
+        """Return an object to the pool (move back to floor away from robot)."""
+        import torch
+        
+        # Move back to floor away from robot
+        pos = torch.tensor([[-2.0, 0.0, 0.03]], device=asset.device)
+        quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
+        vel = torch.zeros((1, 6), device=asset.device)
+        
+        asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+        asset.write_root_velocity_to_sim(vel)
+        
+        # Mark as inactive
+        for pool_type in ["cubes", "objects"]:
+            for obj in object_pool[pool_type]:
+                if obj["asset"] is asset:
+                    obj["active"] = False
+                    return True
+        return False
+    
+    # Track active objects for recording
+    active_pool_objects = []  # List of {"asset": RigidObject, "prim_path": str}
+    
+    # =====================================================================
     
     # VR tracking active flag - wait for user input before tracking starts
     vr_tracking_active = False
@@ -3020,64 +3102,53 @@ def run_teleop(env, args):
                 else:
                     print("[LeRobot] Not currently recording")
             
-            # Spawn random object (mug or cube) if requested
-            if spawn_requested and stage is not None:
-                print("[Object] Spawn requested, attempting...", flush=True)
+            # Spawn random object from pool if requested
+            if spawn_requested:
+                print("[Object] Spawn requested from pool...", flush=True)
                 # Random position on the table
                 spawn_x = random.uniform(0.25, 0.50)  # Forward range on table
                 spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
-                spawn_z = random.uniform(0.45, 0.55)  # Drop height above table (table surface ~0.255)
+                spawn_z = random.uniform(0.45, 0.55)  # Drop height above table
                 try:
-                    spawned_path, spawned_usd_path = spawn_random_object(stage, position=(spawn_x, spawn_y, spawn_z))
+                    # Randomly pick from objects or cubes pool
+                    pool_type = "objects" if random.random() < 0.5 else "cubes"
+                    spawned_path, spawned_asset = activate_pool_object(pool_type, (spawn_x, spawn_y, spawn_z))
                     
-                    # If recording, add spawn event with frame number
-                    print(f"[DEBUG] Spawn complete. lerobot_current_episode={lerobot_current_episode is not None}, spawned_path={spawned_path}", flush=True)
-                    if lerobot_current_episode is not None and spawned_path:
-                        from pxr import UsdGeom, Gf
-                        prim = stage.GetPrimAtPath(spawned_path)
-                        if prim.IsValid():
-                            xformable = UsdGeom.Xformable(prim)
-                            xform_ops = xformable.GetOrderedXformOps()
-                            pos = [spawn_x, spawn_y, spawn_z]
-                            rot = [1.0, 0.0, 0.0, 0.0]
-                            scale = [1.0, 1.0, 1.0]
+                    # Track active object for recording (using Isaac Lab RigidObject)
+                    if spawned_path and spawned_asset:
+                        active_pool_objects.append({"asset": spawned_asset, "prim_path": spawned_path})
+                        print(f"[Pool] Activated {pool_type} at ({spawn_x:.2f}, {spawn_y:.2f}, {spawn_z:.2f})", flush=True)
+                    else:
+                        print(f"[Pool] Failed to activate from {pool_type} pool", flush=True)
+                    
+                    # If recording, add spawn event
+                    if lerobot_current_episode is not None and spawned_path and spawned_asset:
+                        # Get position from Isaac Lab RigidObject
+                        pos = spawned_asset.data.root_pos_w[0].cpu().numpy().tolist()
+                        rot_quat = spawned_asset.data.root_quat_w[0].cpu().numpy().tolist()  # w,x,y,z
+                        rot = [float(rot_quat[0]), float(rot_quat[1]), float(rot_quat[2]), float(rot_quat[3])]
+                        scale = [1.0, 1.0, 1.0]  # Default scale
                             
-                            for op in xform_ops:
-                                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                                    t = op.Get()
-                                    pos = [float(t[0]), float(t[1]), float(t[2])]
-                                elif op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                                    s = op.Get()
-                                    scale = [float(s[0]), float(s[1]), float(s[2])]
-                                elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-                                    q = op.Get()
-                                    rot = [float(q.GetReal()), float(q.GetImaginary()[0]), 
-                                           float(q.GetImaginary()[1]), float(q.GetImaginary()[2])]
-                            
-                            obj_type = "cube" if "spawned_cube_" in spawned_path else "usd_reference"
-                            obj_data = {
-                                "prim_path": spawned_path,
-                                "type": obj_type,
-                                "position": pos,
-                                "orientation": rot,
-                                "scale": scale,
-                            }
-                            
-                            # Add USD asset path for non-cubes (from spawn function return value)
-                            if obj_type == "usd_reference" and spawned_usd_path:
-                                obj_data["usd_path"] = spawned_usd_path
-                            
-                            # Add as spawn event with frame number (for timed spawning during playback)
-                            current_frame = len(lerobot_current_episode.get("frames", []))
-                            spawn_event = {
-                                "frame": current_frame,
-                                **obj_data
-                            }
-                            
-                            if "spawn_events" not in lerobot_current_episode:
-                                lerobot_current_episode["spawn_events"] = []
-                            lerobot_current_episode["spawn_events"].append(spawn_event)
-                            print(f"[LeRobot] Added spawn event at frame {current_frame}: {spawned_path}")
+                        obj_type = "pool_cube" if pool_type == "cubes" else "pool_object"
+                        obj_data = {
+                            "prim_path": spawned_path,
+                            "type": obj_type,
+                            "position": pos,
+                            "orientation": rot,
+                            "scale": scale,
+                        }
+                        
+                        # Add as spawn event with frame number (for timed spawning during playback)
+                        current_frame = len(lerobot_current_episode.get("frames", []))
+                        spawn_event = {
+                            "frame": current_frame,
+                            **obj_data
+                        }
+                        
+                        if "spawn_events" not in lerobot_current_episode:
+                            lerobot_current_episode["spawn_events"] = []
+                        lerobot_current_episode["spawn_events"].append(spawn_event)
+                        print(f"[LeRobot] Added spawn event at frame {current_frame}: {spawned_path}")
                 except Exception as e:
                     import traceback
                     print(f"[Object] Spawn failed: {e}", flush=True)
@@ -3499,38 +3570,32 @@ def run_teleop(env, args):
                     "action": action.copy(),
                 }
                 
-                # Record object positions/orientations/scale for accurate playback
-                if stage is not None:
-                    from pxr import UsdGeom, Gf
-                    import re
+                # Record object positions/orientations using Isaac Lab RigidObject API
+                # This reads directly from physics simulation (accurate transforms)
+                if active_pool_objects:
                     objects_state = []
-                    for prim in stage.Traverse():
-                        prim_path = str(prim.GetPath())
-                        # Only capture ROOT spawned objects (direct children of /World/)
-                        # Simple check: root objects have exactly 2 slashes (like /World/spawned_X)
-                        if prim_path.startswith("/World/spawned_") and prim_path.count('/') == 2:
-                            try:
-                                xformable = UsdGeom.Xformable(prim)
-                                world_transform = xformable.ComputeLocalToWorldTransform(0)
-                                pos = world_transform.ExtractTranslation()
-                                rot = world_transform.ExtractRotationQuat()
-                                # Extract scale from xform ops
-                                scale = [1.0, 1.0, 1.0]
-                                for op in xformable.GetOrderedXformOps():
-                                    if op.GetOpType() == UsdGeom.XformOp.TypeScale:
-                                        s = op.Get()
-                                        if s is not None:
-                                            scale = [float(s[0]), float(s[1]), float(s[2])]
-                                            break
-                                objects_state.append({
-                                    "prim_path": prim_path,
-                                    "position": [float(pos[0]), float(pos[1]), float(pos[2])],
-                                    "orientation": [float(rot.GetReal()), float(rot.GetImaginary()[0]), 
-                                                   float(rot.GetImaginary()[1]), float(rot.GetImaginary()[2])],
-                                    "scale": scale,
-                                })
-                            except Exception:
-                                pass
+                    dt = unwrapped.sim.get_physics_dt()
+                    
+                    for obj_info in active_pool_objects:
+                        asset = obj_info["asset"]
+                        prim_path = obj_info["prim_path"]
+                        try:
+                            # Update asset data from simulation (critical!)
+                            asset.update(dt)
+                            
+                            # Read physics state from Isaac Lab RigidObject
+                            pos = asset.data.root_pos_w[0].cpu().numpy().tolist()
+                            quat = asset.data.root_quat_w[0].cpu().numpy().tolist()  # w,x,y,z
+                            
+                            objects_state.append({
+                                "prim_path": prim_path,
+                                "position": [float(pos[0]), float(pos[1]), float(pos[2])],
+                                "orientation": [float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])],
+                                "scale": [1.0, 1.0, 1.0],
+                            })
+                        except Exception as e:
+                            print(f"[Recording] Error getting transform for {prim_path}: {e}")
+                    
                     if objects_state:
                         frame["objects_state"] = objects_state
                 
