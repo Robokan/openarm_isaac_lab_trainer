@@ -3116,7 +3116,7 @@ def run_teleop(env, args):
             if spawn_requested:
                 print("[Object] Spawn requested from pool...", flush=True)
                 # Random position on the table
-                spawn_x = random.uniform(0.25, 0.50)  # Forward range on table
+                spawn_x = random.uniform(0.15, 0.40)  # Forward range on table (closer to robot)
                 spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
                 spawn_z = random.uniform(0.45, 0.55)  # Drop height above table
                 try:

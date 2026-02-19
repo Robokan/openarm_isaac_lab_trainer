@@ -222,7 +222,7 @@ class TeleopSceneCfg(ReachSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-3.0, 0.6, 0.05), rot=(1.0, 0.0, 0.0, 0.0)),
         spawn=UsdFileCfg(
             usd_path=_FRUIT_ASSETS[4],  # pomegranate
-            scale=(1.0, 1.0, 1.0),
+            scale=(0.67, 0.67, 0.67),  # 2/3 size
             rigid_props=_pool_rigid_props,
             mass_props=sim_utils.MassPropertiesCfg(mass=0.25),
             collision_props=sim_utils.CollisionPropertiesCfg(),
