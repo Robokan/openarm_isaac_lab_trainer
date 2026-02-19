@@ -43,6 +43,18 @@ from ..reach_env_cfg import ReachSceneCfg
 # Shared rigid body properties for pool objects
 _pool_rigid_props = sim_utils.RigidBodyPropertiesCfg()
 
+# Local mug assets path
+import os as _os
+_CONFIG_DIR = _os.path.dirname(_os.path.abspath(__file__))
+_USDS_DIR = _os.path.normpath(_os.path.join(_CONFIG_DIR, "..", "..", "..", "usds"))
+_MUG_ASSETS = [
+    f"{_USDS_DIR}/mugs/1.usd",
+    f"{_USDS_DIR}/mugs/2.usd",
+    f"{_USDS_DIR}/mugs/3.usd",
+    f"{_USDS_DIR}/mugs/4.usd",
+]
+
+
 
 @configclass
 class TeleopSceneCfg(ReachSceneCfg):
@@ -105,62 +117,52 @@ class TeleopSceneCfg(ReachSceneCfg):
         ),
     )
     
-    # Pool objects (5 total) - also cubes but different sizes/colors
-    pool_object_0: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/PoolObject_0",
+    # Pool mugs (4 total) - local USD files, scaled down
+    pool_mug_0: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolMug_0",
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, -0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=CuboidCfg(
-            size=(0.04, 0.04, 0.04),
+        spawn=UsdFileCfg(
+            usd_path=_MUG_ASSETS[0],
+            scale=(0.01, 0.01, 0.01),
             rigid_props=_pool_rigid_props,
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.2, 0.8)),
         ),
     )
-    pool_object_1: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/PoolObject_1",
+    pool_mug_1: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolMug_1",
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, -0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=CuboidCfg(
-            size=(0.04, 0.04, 0.04),
+        spawn=UsdFileCfg(
+            usd_path=_MUG_ASSETS[1],
+            scale=(0.01, 0.01, 0.01),
             rigid_props=_pool_rigid_props,
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.2, 0.2)),
         ),
     )
-    pool_object_2: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/PoolObject_2",
+    pool_mug_2: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolMug_2",
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.0, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=CuboidCfg(
-            size=(0.04, 0.04, 0.04),
+        spawn=UsdFileCfg(
+            usd_path=_MUG_ASSETS[2],
+            scale=(0.01, 0.01, 0.01),
             rigid_props=_pool_rigid_props,
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.8, 0.2)),
         ),
     )
-    pool_object_3: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/PoolObject_3",
+    pool_mug_3: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/PoolMug_3",
         init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.3, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=CuboidCfg(
-            size=(0.04, 0.04, 0.04),
+        spawn=UsdFileCfg(
+            usd_path=_MUG_ASSETS[3],
+            scale=(0.01, 0.01, 0.01),
             rigid_props=_pool_rigid_props,
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
+            mass_props=sim_utils.MassPropertiesCfg(mass=0.15),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.8, 0.8, 0.2)),
         ),
     )
-    pool_object_4: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/PoolObject_4",
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(-2.5, 0.6, 0.03), rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=CuboidCfg(
-            size=(0.04, 0.04, 0.04),
-            rigid_props=_pool_rigid_props,
-            mass_props=sim_utils.MassPropertiesCfg(mass=0.08),
-            collision_props=sim_utils.CollisionPropertiesCfg(),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.2, 0.8, 0.8)),
-        ),
-    )
+    
 
 
 ##

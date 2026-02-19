@@ -2424,31 +2424,30 @@ def run_teleop(env, args):
     # OBJECT POOL - Using Isaac Lab RigidObject assets from scene config
     # Objects are pre-spawned on floor away from robot, teleported to table on activation
     # =====================================================================
-    POOL_SIZE = 5
     object_pool = {
         "cubes": [],    # List of {"asset": RigidObject, "active": bool, "idx": int}
-        "objects": [],  # List of {"asset": RigidObject, "active": bool, "idx": int}
+        "mugs": [],     # List of {"asset": RigidObject, "active": bool, "idx": int}
     }
     
     # Get pool objects from scene (defined in joint_pos_env_cfg.py)
     print(f"\n[Pool] Loading pool objects from scene...")
     scene_keys = list(unwrapped.scene.keys()) if hasattr(unwrapped.scene, 'keys') else []
-    print(f"[Pool] Scene keys: {scene_keys}")
     
-    for i in range(POOL_SIZE):
-        # Pool cubes - access via dict-like syntax
+    # Load cubes (5 total)
+    for i in range(5):
         cube_name = f"pool_cube_{i}"
         if cube_name in scene_keys:
             cube_asset = unwrapped.scene[cube_name]
             object_pool["cubes"].append({"asset": cube_asset, "active": False, "idx": i})
-        
-        # Pool objects
-        obj_name = f"pool_object_{i}"
-        if obj_name in scene_keys:
-            obj_asset = unwrapped.scene[obj_name]
-            object_pool["objects"].append({"asset": obj_asset, "active": False, "idx": i})
     
-    print(f"[Pool] Found {len(object_pool['cubes'])} cubes, {len(object_pool['objects'])} objects")
+    # Load mugs (4 total)
+    for i in range(4):
+        mug_name = f"pool_mug_{i}"
+        if mug_name in scene_keys:
+            mug_asset = unwrapped.scene[mug_name]
+            object_pool["mugs"].append({"asset": mug_asset, "active": False, "idx": i})
+    
+    print(f"[Pool] Found {len(object_pool['cubes'])} cubes, {len(object_pool['mugs'])} mugs")
     
     def activate_pool_object(pool_type, position):
         """Activate an object from the pool at the given position.
@@ -2470,7 +2469,10 @@ def run_teleop(env, args):
                 asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
                 asset.write_root_velocity_to_sim(vel)
                 
-                prim_path = asset.cfg.prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0")
+                # Get actual prim path (not the config regex pattern)
+                # For single env, it's env_0
+                pool_name = asset.cfg.prim_path.split("/")[-1]  # e.g., "PoolCube_0"
+                prim_path = f"/World/envs/env_0/{pool_name}"
                 return prim_path, asset
         
         print(f"[Pool] WARNING: {pool_type} pool exhausted!")
@@ -2489,7 +2491,7 @@ def run_teleop(env, args):
         asset.write_root_velocity_to_sim(vel)
         
         # Mark as inactive
-        for pool_type in ["cubes", "objects"]:
+        for pool_type in ["cubes", "mugs"]:
             for obj in object_pool[pool_type]:
                 if obj["asset"] is asset:
                     obj["active"] = False
@@ -3110,16 +3112,22 @@ def run_teleop(env, args):
                 spawn_y = random.uniform(-0.20, 0.20)  # Left/right range on table
                 spawn_z = random.uniform(0.45, 0.55)  # Drop height above table
                 try:
-                    # Randomly pick from objects or cubes pool
-                    pool_type = "objects" if random.random() < 0.5 else "cubes"
-                    spawned_path, spawned_asset = activate_pool_object(pool_type, (spawn_x, spawn_y, spawn_z))
+                    # Randomly pick from cubes or mugs pool, try other if first exhausted
+                    pool_types = ["cubes", "mugs"]
+                    random.shuffle(pool_types)
+                    
+                    spawned_path, spawned_asset = None, None
+                    for pool_type in pool_types:
+                        spawned_path, spawned_asset = activate_pool_object(pool_type, (spawn_x, spawn_y, spawn_z))
+                        if spawned_path:
+                            break
                     
                     # Track active object for recording (using Isaac Lab RigidObject)
                     if spawned_path and spawned_asset:
                         active_pool_objects.append({"asset": spawned_asset, "prim_path": spawned_path})
                         print(f"[Pool] Activated {pool_type} at ({spawn_x:.2f}, {spawn_y:.2f}, {spawn_z:.2f})", flush=True)
                     else:
-                        print(f"[Pool] Failed to activate from {pool_type} pool", flush=True)
+                        print(f"[Pool] All pools exhausted!", flush=True)
                     
                     # If recording, add spawn event
                     if lerobot_current_episode is not None and spawned_path and spawned_asset:
@@ -3129,7 +3137,7 @@ def run_teleop(env, args):
                         rot = [float(rot_quat[0]), float(rot_quat[1]), float(rot_quat[2]), float(rot_quat[3])]
                         scale = [1.0, 1.0, 1.0]  # Default scale
                             
-                        obj_type = "pool_cube" if pool_type == "cubes" else "pool_object"
+                        obj_type = f"pool_{pool_type[:-1]}"  # cubes->pool_cube, mugs->pool_mug, fruits->pool_fruit
                         obj_data = {
                             "prim_path": spawned_path,
                             "type": obj_type,

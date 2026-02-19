@@ -398,6 +398,14 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     env = gym.make(task_name, cfg=env_cfg)
     unwrapped = env.unwrapped
     
+    # Load pool objects from scene (for kinematic playback of recorded pool objects)
+    pool_objects = {}  # Maps pool name (e.g., "pool_cube_0") to scene asset
+    scene_keys = list(unwrapped.scene.keys()) if hasattr(unwrapped.scene, 'keys') else []
+    for key in scene_keys:
+        if key.startswith("pool_cube_") or key.startswith("pool_mug_") or key.startswith("pool_fruit_"):
+            pool_objects[key] = unwrapped.scene[key]
+    print(f"[INFO] Found {len(pool_objects)} pool objects in scene: {list(pool_objects.keys())}")
+    
     # Keyboard controls
     import carb.input
     import omni.appwindow
@@ -704,42 +712,64 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                         if event.get("frame") == step_idx:
                             prim_path = event.get("prim_path", "")
                             pos = event.get("position", [0, 0, 0])
+                            quat = event.get("orientation", [1, 0, 0, 0])
                             scale = event.get("scale", [1, 1, 1])
                             obj_type = event.get("type", "cube")
                             usd_path = event.get("usd_path", None)
                             
-                            print(f"  [SPAWN] Frame {step_idx}: {prim_path} ({obj_type})")
+                            # Check if this is a pool object
+                            # Extract pool name from prim_path like /World/envs/env_0/PoolCube_0
+                            pool_name = None
+                            prim_name = prim_path.split("/")[-1] if "/" in prim_path else ""
+                            if prim_name.startswith("Pool"):
+                                import re
+                                parts = re.findall(r'[A-Z][a-z]*|[0-9]+', prim_name)
+                                if len(parts) >= 2:
+                                    pool_name = f"{parts[0].lower()}_{parts[1].lower()}_{prim_name.split('_')[-1]}"
                             
-                            prim = stage.GetPrimAtPath(prim_path)
-                            if not prim.IsValid():
-                                if obj_type == "cube":
-                                    cube_prim = UsdGeom.Cube.Define(stage, prim_path)
-                                    cube_prim.GetSizeAttr().Set(0.05)
-                                    prim = cube_prim.GetPrim()
-                                    # Set transform (no physics - kinematic only)
-                                    xformable = UsdGeom.Xformable(prim)
-                                    xformable.ClearXformOpOrder()
-                                    translate_op = xformable.AddTranslateOp()
-                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
-                                    orient_op = xformable.AddOrientOp()
-                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))
-                                    scale_op = xformable.AddScaleOp()
-                                    scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
-                                elif obj_type == "usd_reference" and usd_path:
-                                    xform = UsdGeom.Xform.Define(stage, prim_path)
-                                    prim = xform.GetPrim()
-                                    prim.GetReferences().AddReference(usd_path)
-                                    
-                                    # Set transform: translate, orient, scale (no physics - kinematic only)
-                                    xformable = UsdGeom.Xformable(prim)
-                                    xformable.ClearXformOpOrder()
-                                    translate_op = xformable.AddTranslateOp()
-                                    translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
-                                    orient_op = xformable.AddOrientOp()
-                                    orient_op.Set(Gf.Quatf(1, 0, 0, 0))  # Identity quaternion
-                                    scale_val = scale[0] if isinstance(scale, list) else scale
-                                    scale_op = xformable.AddScaleOp()
-                                    scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
+                            if pool_name and pool_name in pool_objects:
+                                # Use Isaac Lab API to teleport pool object
+                                print(f"  [SPAWN] Frame {step_idx}: {pool_name} (pool object)")
+                                try:
+                                    asset = pool_objects[pool_name]
+                                    pos_tensor = torch.tensor([[pos[0], pos[1], pos[2]]], device=asset.device)
+                                    quat_tensor = torch.tensor([[quat[0], quat[1], quat[2], quat[3]]], device=asset.device)
+                                    vel = torch.zeros((1, 6), device=asset.device)
+                                    asset.write_root_pose_to_sim(torch.cat([pos_tensor, quat_tensor], dim=-1))
+                                    asset.write_root_velocity_to_sim(vel)
+                                except Exception as e:
+                                    print(f"  [WARN] Failed to teleport pool object {pool_name}: {e}")
+                            else:
+                                # Fallback: create new prim dynamically
+                                print(f"  [SPAWN] Frame {step_idx}: {prim_path} ({obj_type})")
+                                
+                                prim = stage.GetPrimAtPath(prim_path)
+                                if not prim.IsValid():
+                                    if obj_type == "cube":
+                                        cube_prim = UsdGeom.Cube.Define(stage, prim_path)
+                                        cube_prim.GetSizeAttr().Set(0.05)
+                                        prim = cube_prim.GetPrim()
+                                        xformable = UsdGeom.Xformable(prim)
+                                        xformable.ClearXformOpOrder()
+                                        translate_op = xformable.AddTranslateOp()
+                                        translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                        orient_op = xformable.AddOrientOp()
+                                        orient_op.Set(Gf.Quatf(1, 0, 0, 0))
+                                        scale_op = xformable.AddScaleOp()
+                                        scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
+                                    elif obj_type == "usd_reference" and usd_path:
+                                        xform = UsdGeom.Xform.Define(stage, prim_path)
+                                        prim = xform.GetPrim()
+                                        prim.GetReferences().AddReference(usd_path)
+                                        xformable = UsdGeom.Xformable(prim)
+                                        xformable.ClearXformOpOrder()
+                                        translate_op = xformable.AddTranslateOp()
+                                        translate_op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                        orient_op = xformable.AddOrientOp()
+                                        orient_op.Set(Gf.Quatf(1, 0, 0, 0))
+                                        scale_val = scale[0] if isinstance(scale, list) else scale
+                                        scale_op = xformable.AddScaleOp()
+                                        scale_op.Set(Gf.Vec3d(scale_val, scale_val, scale_val))
                     
                     start_time = time.time()
                     
@@ -764,23 +794,50 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                         frame_objects = objects_per_frame[step_idx]
                         for obj in frame_objects:
                             prim_path = obj.get("prim_path", "")
-                            # Skip child prims - only process root spawned objects
-                            if prim_path.count('/') != 2:
-                                continue
                             pos = obj.get("position", [0, 0, 0])
                             quat = obj.get("orientation", [1, 0, 0, 0])
-                            prim = stage.GetPrimAtPath(prim_path)
-                            if prim.IsValid():
+                            
+                            # Check if this is a pool object
+                            # Extract pool name from paths like:
+                            #   /World/envs/env_0/PoolCube_0 (new format)
+                            #   /World/envs/env_.*/PoolCube_0 (old format with regex)
+                            pool_name = None
+                            # Get the last component (e.g., "PoolCube_0") and convert to pool key
+                            prim_name = prim_path.split("/")[-1] if "/" in prim_path else ""
+                            if prim_name.startswith("Pool"):
+                                # Convert PoolCube_0 -> pool_cube_0
+                                # Split on capital letters: Pool, Cube, _0
+                                import re
+                                parts = re.findall(r'[A-Z][a-z]*|[0-9]+', prim_name)
+                                if len(parts) >= 2:
+                                    pool_name = f"{parts[0].lower()}_{parts[1].lower()}_{prim_name.split('_')[-1]}"
+                            
+                            if pool_name and pool_name in pool_objects:
+                                # Use Isaac Lab API to set position (kinematic)
                                 try:
-                                    xformable = UsdGeom.Xformable(prim)
-                                    # Update translate and orient - leave scale alone (set at spawn)
-                                    for op in xformable.GetOrderedXformOps():
-                                        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                                            op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
-                                        elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
-                                            op.Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
-                                except Exception:
-                                    pass
+                                    asset = pool_objects[pool_name]
+                                    pos_tensor = torch.tensor([[pos[0], pos[1], pos[2]]], device=asset.device)
+                                    quat_tensor = torch.tensor([[quat[0], quat[1], quat[2], quat[3]]], device=asset.device)
+                                    vel = torch.zeros((1, 6), device=asset.device)
+                                    asset.write_root_pose_to_sim(torch.cat([pos_tensor, quat_tensor], dim=-1))
+                                    asset.write_root_velocity_to_sim(vel)
+                                except Exception as e:
+                                    pass  # Silently skip errors
+                            else:
+                                # Fallback to USD xform for non-pool objects
+                                # Convert regex pattern to actual path if needed
+                                actual_path = prim_path.replace("env_.*", "env_0").replace("{ENV_REGEX_NS}", "/World/envs/env_0")
+                                prim = stage.GetPrimAtPath(actual_path)
+                                if prim.IsValid():
+                                    try:
+                                        xformable = UsdGeom.Xformable(prim)
+                                        for op in xformable.GetOrderedXformOps():
+                                            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                                                op.Set(Gf.Vec3d(pos[0], pos[1], pos[2]))
+                                            elif op.GetOpType() == UsdGeom.XformOp.TypeOrient:
+                                                op.Set(Gf.Quatf(quat[0], quat[1], quat[2], quat[3]))
+                                    except Exception:
+                                        pass
                     
                     robot.write_data_to_sim()
                     unwrapped.sim.step(render=True)
