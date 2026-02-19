@@ -54,12 +54,12 @@ _MUG_ASSETS = [
     f"{_USDS_DIR}/mugs/4.usd",
 ]
 _FRUIT_ASSETS = [
-    f"{_USDS_DIR}/fruits/orange_02.usd",
-    f"{_USDS_DIR}/fruits/lemon_02.usd",
-    f"{_USDS_DIR}/fruits/lime01.usd",
-    f"{_USDS_DIR}/fruits/avocado01.usd",
-    f"{_USDS_DIR}/fruits/pomegranate01.usd",
-    f"{_USDS_DIR}/fruits/lychee01.usd",
+    f"{_USDS_DIR}/fruits/fixed/orange_02.usd",
+    f"{_USDS_DIR}/fruits/fixed/lemon_02.usd",
+    f"{_USDS_DIR}/fruits/fixed/lime01.usd",
+    f"{_USDS_DIR}/fruits/fixed/avocado01.usd",
+    f"{_USDS_DIR}/fruits/fixed/pomegranate01.usd",
+    f"{_USDS_DIR}/fruits/fixed/lychee01.usd",
 ]
 
 
