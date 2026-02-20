@@ -42,6 +42,8 @@ parser.add_argument("--viewport-camera", type=str, default=None,
                     help="Viewport camera prim path to render from (overrides auto selection)")
 parser.add_argument("--script", type=str, default=None,
                     help="Path to YAML script file for automated command sequences")
+parser.add_argument("--collect-video", action="store_true",
+                    help="Capture camera images during recording (default: off for faster recording)")
 
 # Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
@@ -62,6 +64,7 @@ simulation_app = app_launcher.app
 
 """Rest follows after Isaac Sim is initialized."""
 
+import gc
 import gymnasium as gym
 import os
 import time
@@ -142,7 +145,8 @@ class KeyboardDevice:
         print("  2: Select RIGHT hand")
         print("")
         print("Other:")
-        print("  C: Spawn cube")
+        print("  C: Spawn object")
+        print("  B: Reset all objects to pool")
         print("  P: Print current pose of active hand")
         print("  M: Toggle marker visibility")
         print("  R: Reset poses to default")
@@ -152,6 +156,7 @@ class KeyboardDevice:
         print("="*60 + "\n")
         
         self.spawn_cube_requested = False  # Flag for cube spawning
+        self.reset_pool_requested = False  # Flag for resetting all objects to pool
         self.reset_requested = False  # Flag for reset + script restart
         self.print_pose_requested = False  # Flag for printing current pose
         self.start_recording_requested = False  # Flag for starting LeRobot recording
@@ -194,6 +199,9 @@ class KeyboardDevice:
                 return False
             elif key == self._carb_input.KeyboardInput.C:
                 self.spawn_cube_requested = True
+                return False
+            elif key == self._carb_input.KeyboardInput.B:
+                self.reset_pool_requested = True
                 return False
             elif key == self._carb_input.KeyboardInput.P:
                 self.print_pose_requested = True
@@ -2290,6 +2298,7 @@ def run_teleop(env, args):
     step_count = 0
     prev_markers_visible = False  # Track previous visibility state (hidden by default)
     prev_a_button = False  # Track A button for edge detection
+    prev_b_button = False  # Track B button for reset all objects
     prev_y_button = False  # Track Y button for recording start
     prev_x_button = False  # Track X button for recording stop
     
@@ -2521,6 +2530,15 @@ def run_teleop(env, args):
         print("[VR] Press any button or move joystick to start tracking")
         print(f"{'='*60}\n")
     
+    # Cache imports for performance (avoid re-importing every frame)
+    try:
+        from pxr import UsdGeom as _UsdGeom, Gf as _Gf
+    except ImportError:
+        _UsdGeom = None
+        _Gf = None
+    
+    from PIL import Image as _PILImage
+    
     try:
         while simulation_app.is_running() and step_count < 100000:
             # Update input device (poll key states for keyboard)
@@ -2628,6 +2646,26 @@ def run_teleop(env, args):
                     spawn_requested = True
                 prev_a_button = a_pressed
                 
+                # B button (right controller): Reset all objects to pool
+                if b_pressed and not prev_b_button:
+                    if active_pool_objects:
+                        print(f"[Pool] Resetting {len(active_pool_objects)} objects to pool...")
+                        for obj_info in active_pool_objects:
+                            try:
+                                deactivate_pool_object(obj_info["asset"])
+                                # Mark as inactive in pool
+                                for pool_type in ["cubes", "mugs", "fruits"]:
+                                    for pool_obj in object_pool[pool_type]:
+                                        if pool_obj["asset"] == obj_info["asset"]:
+                                            pool_obj["active"] = False
+                            except Exception as e:
+                                print(f"[Pool] Failed to reset object: {e}")
+                        active_pool_objects.clear()
+                        print("[Pool] All objects returned to pool")
+                    else:
+                        print("[Pool] No active objects to reset")
+                prev_b_button = b_pressed
+                
                 # Y button (left controller): Start recording
                 if y_pressed and not prev_y_button:
                     if not lerobot_recording:
@@ -2714,38 +2752,41 @@ def run_teleop(env, args):
                             "render_products": {},  # Store render products for reuse
                         }
                         
-                        # Find all cameras and create render products ONCE
+                        # Find all cameras and create render products ONCE (only if --collect-video)
                         camera_status = []
                         found_cameras = 0
-                        try:
-                            from pxr import UsdGeom
-                            import omni.replicator.core as rep
-                            
-                            for prim in stage.Traverse():
-                                if prim.IsA(UsdGeom.Camera):
-                                    cam_path = str(prim.GetPath())
-                                    cam_name = prim.GetName()
-                                    # Only use env_0 cameras
-                                    if "env_0" in cam_path:
-                                        try:
-                                            render_product = rep.create.render_product(cam_path, (640, 480))
-                                            rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-                                            rgb_annot.attach([render_product])
-                                            # Map to LeRobot key
-                                            if "ego" in cam_name.lower() or "high" in cam_name.lower():
-                                                lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
-                                            elif "left" in cam_name.lower():
-                                                lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
-                                            elif "right" in cam_name.lower():
-                                                lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
-                                            camera_status.append(f"  {cam_name}: {cam_path} [READY]")
-                                            found_cameras += 1
-                                        except Exception as e:
-                                            camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
-                        except Exception as e:
-                            camera_status.append(f"  Error setting up cameras: {e}")
+                        if getattr(args, 'collect_video', False):
+                            try:
+                                from pxr import UsdGeom
+                                import omni.replicator.core as rep
+                                
+                                for prim in stage.Traverse():
+                                    if prim.IsA(UsdGeom.Camera):
+                                        cam_path = str(prim.GetPath())
+                                        cam_name = prim.GetName()
+                                        # Only use env_0 cameras
+                                        if "env_0" in cam_path:
+                                            try:
+                                                render_product = rep.create.render_product(cam_path, (640, 480))
+                                                rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                                                rgb_annot.attach([render_product])
+                                                # Map to LeRobot key
+                                                if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                                    lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
+                                                elif "left" in cam_name.lower():
+                                                    lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
+                                                elif "right" in cam_name.lower():
+                                                    lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
+                                                camera_status.append(f"  {cam_name}: {cam_path} [READY]")
+                                                found_cameras += 1
+                                            except Exception as e:
+                                                camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
+                            except Exception as e:
+                                camera_status.append(f"  Error setting up cameras: {e}")
+                        else:
+                            camera_status.append("  Video collection disabled (use --collect-video to enable)")
                         
-                        if found_cameras == 0:
+                        if found_cameras == 0 and getattr(args, 'collect_video', False):
                             camera_status.append("  No cameras found in stage")
                         
                         print(f"\n{'='*60}")
@@ -2771,7 +2812,6 @@ def run_teleop(env, args):
                         if num_frames > 0:
                             # Save episode in LeRobot-compatible format (parquet + images)
                             import pandas as pd
-                            from PIL import Image
                             
                             fps = lerobot_current_episode["fps"]
                             ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
@@ -2801,25 +2841,29 @@ def run_teleop(env, args):
                                     json.dump(objects_per_frame, f)
                                 print(f"[LeRobot] Saved object states for {sum(1 for o in objects_per_frame if o)} frames")
                             
-                            # Save images in parallel for speed
-                            def save_image(args):
-                                img, path = args
-                                img.save(path)
-                            
-                            save_tasks = []
-                            for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
-                                cam_name = cam_key.split(".")[-1]
-                                cam_dir = os.path.join(ep_dir, cam_name)
-                                os.makedirs(cam_dir, exist_ok=True)
+                            # Save images in parallel for speed (only if --collect-video was used)
+                            if getattr(args, 'collect_video', False):
+                                def save_image(save_args):
+                                    img, path = save_args
+                                    img.save(path, quality=90)  # JPEG quality 90 for fast encoding
                                 
-                                for idx, frame in enumerate(lerobot_current_episode["frames"]):
-                                    if cam_key in frame and frame[cam_key] is not None:
-                                        img = frame[cam_key]
-                                        path = os.path.join(cam_dir, f"frame_{idx:06d}.png")
-                                        save_tasks.append((img, path))
-                            
-                            with ThreadPoolExecutor(max_workers=8) as executor:
-                                list(executor.map(save_image, save_tasks))
+                                save_tasks = []
+                                for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                                    cam_name = cam_key.split(".")[-1]
+                                    cam_dir = os.path.join(ep_dir, cam_name)
+                                    os.makedirs(cam_dir, exist_ok=True)
+                                    
+                                    for idx, frame in enumerate(lerobot_current_episode["frames"]):
+                                        if cam_key in frame and frame[cam_key] is not None:
+                                            img = frame[cam_key]
+                                            path = os.path.join(cam_dir, f"frame_{idx:06d}.jpg")
+                                            save_tasks.append((img, path))
+                                
+                                with ThreadPoolExecutor(max_workers=8) as executor:
+                                    list(executor.map(save_image, save_tasks))
+                                print(f"[LeRobot] Saved {len(save_tasks)} images (JPEG)")
+                            else:
+                                print(f"[LeRobot] No video collected (use --collect-video or play_teleop_data.sh --collect-video)")
                             
                             # Save metadata
                             episode_metadata = {
@@ -2878,6 +2922,26 @@ def run_teleop(env, args):
             if hasattr(input_device, "spawn_cube_requested") and input_device.spawn_cube_requested:
                 spawn_requested = True
                 input_device.spawn_cube_requested = False  # Reset flag
+            
+            # Keyboard: Check B key flag (reset all objects to pool)
+            if hasattr(input_device, "reset_pool_requested") and input_device.reset_pool_requested:
+                input_device.reset_pool_requested = False  # Reset flag
+                if active_pool_objects:
+                    print(f"[Pool] Resetting {len(active_pool_objects)} objects to pool...")
+                    for obj_info in active_pool_objects:
+                        try:
+                            deactivate_pool_object(obj_info["asset"])
+                            # Mark as inactive in pool
+                            for pool_type in ["cubes", "mugs", "fruits"]:
+                                for pool_obj in object_pool[pool_type]:
+                                    if pool_obj["asset"] == obj_info["asset"]:
+                                        pool_obj["active"] = False
+                        except Exception as e:
+                            print(f"[Pool] Failed to reset object: {e}")
+                    active_pool_objects.clear()
+                    print("[Pool] All objects returned to pool")
+                else:
+                    print("[Pool] No active objects to reset")
             
             # Keyboard: Y key to start recording
             if hasattr(input_device, "start_recording_requested") and input_device.start_recording_requested:
@@ -2962,37 +3026,40 @@ def run_teleop(env, args):
                         "render_products": {},  # Store render products for reuse
                     }
                     
-                    # Find all cameras and create render products ONCE
+                    # Find all cameras and create render products ONCE (only if --collect-video)
                     camera_status = []
                     found_cameras = 0
-                    try:
-                        from pxr import UsdGeom
-                        import omni.replicator.core as rep
-                        
-                        for prim in stage.Traverse():
-                            if prim.IsA(UsdGeom.Camera):
-                                cam_path = str(prim.GetPath())
-                                cam_name = prim.GetName()
-                                if "env_0" in cam_path:
-                                    try:
-                                        render_product = rep.create.render_product(cam_path, (640, 480))
-                                        rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
-                                        rgb_annot.attach([render_product])
-                                        # Map to LeRobot key
-                                        if "ego" in cam_name.lower() or "high" in cam_name.lower():
-                                            lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
-                                        elif "left" in cam_name.lower():
-                                            lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
-                                        elif "right" in cam_name.lower():
-                                            lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
-                                        camera_status.append(f"  {cam_name}: {cam_path} [READY]")
-                                        found_cameras += 1
-                                    except Exception as e:
-                                        camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
-                    except Exception as e:
-                        camera_status.append(f"  Error setting up cameras: {e}")
+                    if getattr(args, 'collect_video', False):
+                        try:
+                            from pxr import UsdGeom
+                            import omni.replicator.core as rep
+                            
+                            for prim in stage.Traverse():
+                                if prim.IsA(UsdGeom.Camera):
+                                    cam_path = str(prim.GetPath())
+                                    cam_name = prim.GetName()
+                                    if "env_0" in cam_path:
+                                        try:
+                                            render_product = rep.create.render_product(cam_path, (640, 480))
+                                            rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                                            rgb_annot.attach([render_product])
+                                            # Map to LeRobot key
+                                            if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.ego"] = rgb_annot
+                                            elif "left" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.left_wrist"] = rgb_annot
+                                            elif "right" in cam_name.lower():
+                                                lerobot_current_episode["render_products"]["observation.images.right_wrist"] = rgb_annot
+                                            camera_status.append(f"  {cam_name}: {cam_path} [READY]")
+                                            found_cameras += 1
+                                        except Exception as e:
+                                            camera_status.append(f"  {cam_name}: {cam_path} [FAILED: {e}]")
+                        except Exception as e:
+                            camera_status.append(f"  Error setting up cameras: {e}")
+                    else:
+                        camera_status.append("  Video collection disabled (use --collect-video to enable)")
                     
-                    if found_cameras == 0:
+                    if found_cameras == 0 and getattr(args, 'collect_video', False):
                         camera_status.append("  No cameras found in stage")
                     
                     print(f"\n{'='*60}")
@@ -3018,7 +3085,6 @@ def run_teleop(env, args):
                     if num_frames > 0:
                         # Save in LeRobot-compatible format (parquet + images)
                         import pandas as pd
-                        from PIL import Image
                         
                         fps = lerobot_current_episode["fps"]
                         ep_dir = os.path.join(lerobot_output_dir, "episodes", f"episode_{lerobot_episode_count}")
@@ -3048,24 +3114,29 @@ def run_teleop(env, args):
                                 json.dump(objects_per_frame, f)
                             print(f"[LeRobot] Saved object states for {sum(1 for o in objects_per_frame if o)} frames")
                         
-                        def save_image(args):
-                            img, path = args
-                            img.save(path)
-                        
-                        save_tasks = []
-                        for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
-                            cam_name = cam_key.split(".")[-1]
-                            cam_dir = os.path.join(ep_dir, cam_name)
-                            os.makedirs(cam_dir, exist_ok=True)
+                        # Save images in parallel for speed (only if --collect-video was used)
+                        if getattr(args, 'collect_video', False):
+                            def save_image(save_args):
+                                img, path = save_args
+                                img.save(path, quality=90)  # JPEG quality 90 for fast encoding
                             
-                            for idx, frame in enumerate(lerobot_current_episode["frames"]):
-                                if cam_key in frame and frame[cam_key] is not None:
-                                    img = frame[cam_key]
-                                    path = os.path.join(cam_dir, f"frame_{idx:06d}.png")
-                                    save_tasks.append((img, path))
-                        
-                        with ThreadPoolExecutor(max_workers=8) as executor:
-                            list(executor.map(save_image, save_tasks))
+                            save_tasks = []
+                            for cam_key in ["observation.images.ego", "observation.images.left_wrist", "observation.images.right_wrist"]:
+                                cam_name = cam_key.split(".")[-1]
+                                cam_dir = os.path.join(ep_dir, cam_name)
+                                os.makedirs(cam_dir, exist_ok=True)
+                                
+                                for idx, frame in enumerate(lerobot_current_episode["frames"]):
+                                    if cam_key in frame and frame[cam_key] is not None:
+                                        img = frame[cam_key]
+                                        path = os.path.join(cam_dir, f"frame_{idx:06d}.jpg")
+                                        save_tasks.append((img, path))
+                            
+                            with ThreadPoolExecutor(max_workers=8) as executor:
+                                list(executor.map(save_image, save_tasks))
+                            print(f"[LeRobot] Saved {len(save_tasks)} images (JPEG)")
+                        else:
+                            print(f"[LeRobot] No video collected (use --collect-video or play_teleop_data.sh --collect-video)")
                         
                         episode_metadata = {
                             "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
@@ -3445,9 +3516,8 @@ def run_teleop(env, args):
                     right_target_quat = math_utils.quat_mul(right_target_quat, right_offset_quat)
             
             # Update target markers (position + orientation, including thumbstick offset)
-            if stage is not None:
+            if stage is not None and _UsdGeom is not None:
                 try:
-                    from pxr import UsdGeom, Gf
                     markers_vis = input_device.markers_visible if hasattr(input_device, 'markers_visible') else True
                     # Use the modified quaternions (with thumbstick offset) for markers
                     left_marker_quat = left_target_quat[0].cpu().numpy()
@@ -3458,12 +3528,12 @@ def run_teleop(env, args):
                     ]:
                         m_prim = stage.GetPrimAtPath(m_path)
                         if m_prim.IsValid():
-                            xform = UsdGeom.Xformable(m_prim)
+                            xform = _UsdGeom.Xformable(m_prim)
                             ops = xform.GetOrderedXformOps()
                             if len(ops) >= 2:
-                                ops[0].Set(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
-                                ops[1].Set(Gf.Quatf(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])))
-                            img = UsdGeom.Imageable(m_prim)
+                                ops[0].Set(_Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                                ops[1].Set(_Gf.Quatf(float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])))
+                            img = _UsdGeom.Imageable(m_prim)
                             if markers_vis:
                                 img.MakeVisible()
                             else:
@@ -3557,7 +3627,6 @@ def run_teleop(env, args):
             
             # LeRobot: Capture frame if recording (only when tracking is active)
             if lerobot_recording and lerobot_current_episode is not None and vr_tracking_active:
-                from PIL import Image
                 
                 # Get current joint positions (observation state)
                 joint_pos = robot.data.joint_pos[0].cpu().numpy().astype(np.float32)
@@ -3615,16 +3684,17 @@ def run_teleop(env, args):
                     if objects_state:
                         frame["objects_state"] = objects_state
                 
-                # Capture camera images using pre-created render products (fast)
-                render_products = lerobot_current_episode.get("render_products", {})
-                for cam_key, rgb_annot in render_products.items():
-                    try:
-                        data = rgb_annot.get_data()
-                        if data is not None:
-                            img_np = data[:, :, :3].astype(np.uint8)
-                            frame[cam_key] = Image.fromarray(img_np)
-                    except Exception:
-                        pass
+                # Capture camera images only if --collect-video flag is set
+                if getattr(args, 'collect_video', False):
+                    render_products = lerobot_current_episode.get("render_products", {})
+                    for cam_key, rgb_annot in render_products.items():
+                        try:
+                            data = rgb_annot.get_data()
+                            if data is not None:
+                                img_np = data[:, :, :3].astype(np.uint8)
+                                frame[cam_key] = _PILImage.fromarray(img_np)
+                        except Exception:
+                            pass
                 
                 lerobot_current_episode["frames"].append(frame)
                 
@@ -3655,6 +3725,12 @@ def run_teleop(env, args):
                     print(f"  [IK] Pos err: L={left_err_mag:.3f}m R={right_err_mag:.3f}m")
                     print(f"  [IK] L delta: [{', '.join(f'{d:.3f}' for d in left_joint_delta)}]")
                     print(f"  [IK] R delta: [{', '.join(f'{d:.3f}' for d in right_joint_delta)}]")
+                
+                # Periodic memory cleanup to prevent slowdown
+                if step_count % 300 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
     except KeyboardInterrupt:
         print("\n[INFO] Teleoperation stopped by user")

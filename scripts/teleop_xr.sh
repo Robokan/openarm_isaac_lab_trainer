@@ -15,6 +15,7 @@ set -e
 
 INPUT_MODE="xr"
 SCRIPT_MODE=""
+COLLECT_VIDEO=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTRA_ARGS=()
 
@@ -23,6 +24,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --keyboard)
             INPUT_MODE="keyboard"
+            shift
+            ;;
+        --collect-video)
+            COLLECT_VIDEO="--collect-video"
             shift
             ;;
         --script)
@@ -206,6 +211,10 @@ TELEOP_CMD="python ./scripts/teleoperation/teleop_bimanual.py \
 
 if [[ -n "${KIT_ARGS}" ]]; then
     TELEOP_CMD="${TELEOP_CMD} --kit_args \"${KIT_ARGS}\""
+fi
+
+if [[ -n "${COLLECT_VIDEO}" ]]; then
+    TELEOP_CMD="${TELEOP_CMD} ${COLLECT_VIDEO}"
 fi
 
 # Execute the command with any extra args

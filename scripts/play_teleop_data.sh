@@ -6,6 +6,7 @@
 #   ./scripts/play_teleop_data.sh --episode 0        # Play specific episode
 #   ./scripts/play_teleop_data.sh --loop             # Loop playback
 #   ./scripts/play_teleop_data.sh --verify           # Just verify data, no simulation
+#   ./scripts/play_teleop_data.sh --no-collect-video # Skip video capture during playback
 #
 # Controls during playback:
 #   Q     - Quit

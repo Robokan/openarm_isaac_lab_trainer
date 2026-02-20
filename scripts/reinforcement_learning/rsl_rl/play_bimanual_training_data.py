@@ -281,7 +281,7 @@ def verify_hdf5_data(data_dir: str, episode_idx: int = None):
     print("\n[INFO] Verification complete!")
 
 
-def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False):
+def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False):
     """Replay VLA training data in simulation."""
     # Detect format
     format_type = detect_format(data_dir)
@@ -294,7 +294,7 @@ def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real
         print("[INFO] Or to replay in Isaac Sim, convert using the fallback format.")
         return
     elif format_type == "lerobot_fallback":
-        replay_lerobot_fallback_data(data_dir, episode_idx, loop, real_time)
+        replay_lerobot_fallback_data(data_dir, episode_idx, loop, real_time, collect_video)
         return
     elif format_type == "hdf5":
         replay_hdf5_data(data_dir, episode_idx, loop, real_time)
@@ -304,7 +304,7 @@ def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real
         return
 
 
-def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False):
+def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False):
     """Replay LeRobot fallback format data in simulation."""
     # Delayed imports for simulation
     from isaaclab.app import AppLauncher
@@ -312,7 +312,7 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     
     args = argparse.Namespace(
         headless=False,
-        enable_cameras=False,
+        enable_cameras=collect_video,  # Enable cameras if collecting video
         device="cuda:0",
         livestream=-1,
         experience="",
@@ -497,16 +497,20 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 
                 # Load camera images for this episode if available
                 camera_images = {"left_wrist": [], "ego": [], "right_wrist": []}
-                if HAS_CV2:
-                    for cam_name in camera_images.keys():
-                        cam_dir = os.path.join(ep_path, cam_name)
-                        if os.path.exists(cam_dir):
-                            frame_files = sorted([f for f in os.listdir(cam_dir) if f.endswith(".png")])
+                images_exist = False
+                for cam_name in camera_images.keys():
+                    cam_dir = os.path.join(ep_path, cam_name)
+                    if os.path.exists(cam_dir):
+                        frame_files = sorted([f for f in os.listdir(cam_dir) if f.endswith((".png", ".jpg", ".jpeg"))])
+                        if frame_files:
+                            images_exist = True
+                        if HAS_CV2:
                             for ff in frame_files:
                                 img = cv2.imread(os.path.join(cam_dir, ff))
                                 if img is not None:
                                     camera_images[cam_name].append(img)
-                    
+                
+                if HAS_CV2:
                     # Report camera availability
                     for cam_name, imgs in camera_images.items():
                         if imgs:
@@ -517,6 +521,40 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     # Create camera view window
                     cv2.namedWindow("Camera Views", cv2.WINDOW_NORMAL)
                     cv2.resizeWindow("Camera Views", 1920, 480)
+                
+                # Video collection: set up render products if --collect-video and no images exist
+                should_collect_video = collect_video and not images_exist
+                render_products = {}
+                collected_images = {"ego": [], "left_wrist": [], "right_wrist": []}
+                
+                if should_collect_video:
+                    print(f"  [VIDEO] Collecting video for this episode (no images found)")
+                    try:
+                        from pxr import UsdGeom
+                        import omni.replicator.core as rep
+                        
+                        for prim in stage.Traverse():
+                            if prim.IsA(UsdGeom.Camera):
+                                cam_path = str(prim.GetPath())
+                                cam_name = prim.GetName()
+                                if "env_0" in cam_path:
+                                    try:
+                                        render_product = rep.create.render_product(cam_path, (640, 480))
+                                        rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                                        rgb_annot.attach([render_product])
+                                        if "ego" in cam_name.lower() or "high" in cam_name.lower():
+                                            render_products["ego"] = rgb_annot
+                                        elif "left" in cam_name.lower():
+                                            render_products["left_wrist"] = rgb_annot
+                                        elif "right" in cam_name.lower():
+                                            render_products["right_wrist"] = rgb_annot
+                                        print(f"    Camera {cam_name}: {cam_path} [READY]")
+                                    except Exception as e:
+                                        print(f"    Camera {cam_name}: {cam_path} [FAILED: {e}]")
+                    except Exception as e:
+                        print(f"  [VIDEO] Failed to set up cameras: {e}")
+                elif collect_video and images_exist:
+                    print(f"  [VIDEO] Skipping video collection (images already exist)")
                 
                 # Reset environment
                 print("  [INFO] Resetting environment...", flush=True)
@@ -842,6 +880,18 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     robot.write_data_to_sim()
                     unwrapped.sim.step(render=True)
                     
+                    # Collect video frames if enabled
+                    if should_collect_video and render_products:
+                        from PIL import Image as PILImage
+                        for cam_name, rgb_annot in render_products.items():
+                            try:
+                                data = rgb_annot.get_data()
+                                if data is not None:
+                                    img_np = data[:, :, :3].astype(np.uint8)
+                                    collected_images[cam_name].append(PILImage.fromarray(img_np))
+                            except Exception:
+                                pass
+                    
                     # Update camera view window
                     if HAS_CV2:
                         # Get images for this frame (or last available if fewer frames than actions)
@@ -885,6 +935,29 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             time.sleep(sleep_time)
                 
                 print(f"  {ep_dir_name} complete.          ")
+                
+                # Save collected video if any
+                if should_collect_video and any(len(imgs) > 0 for imgs in collected_images.values()):
+                    from concurrent.futures import ThreadPoolExecutor
+                    print(f"  [VIDEO] Saving collected images...")
+                    
+                    def save_img(save_args):
+                        img, path = save_args
+                        img.save(path, quality=90)  # JPEG quality 90 for fast encoding
+                    
+                    save_tasks = []
+                    for cam_name, imgs in collected_images.items():
+                        if imgs:
+                            cam_dir = os.path.join(ep_path, cam_name)
+                            os.makedirs(cam_dir, exist_ok=True)
+                            for idx, img in enumerate(imgs):
+                                path = os.path.join(cam_dir, f"frame_{idx:06d}.jpg")
+                                save_tasks.append((img, path))
+                    
+                    if save_tasks:
+                        with ThreadPoolExecutor(max_workers=8) as executor:
+                            list(executor.map(save_img, save_tasks))
+                        print(f"  [VIDEO] Saved {len(save_tasks)} images (JPEG) to {ep_path}")
                 
                 # Close camera window after episode
                 if HAS_CV2:
@@ -1147,6 +1220,10 @@ def main():
     parser.add_argument("--episode", type=int, default=None, help="Specific episode index")
     parser.add_argument("--loop", action="store_true", help="Loop playback (replay mode)")
     parser.add_argument("--real-time", action="store_true", help="Real-time playback (replay mode)")
+    parser.add_argument("--collect-video", action="store_true", default=True,
+                        help="Capture camera images during playback (only if episode has no images) [default: on]")
+    parser.add_argument("--no-collect-video", action="store_false", dest="collect_video",
+                        help="Disable video collection during playback")
     
     args = parser.parse_args()
     
@@ -1157,7 +1234,8 @@ def main():
     if args.verify:
         verify_data(args.data_dir, args.episode)
     elif args.replay:
-        replay_data(args.data_dir, args.episode, args.loop, args.real_time)
+        replay_data(args.data_dir, args.episode, args.loop, args.real_time, 
+                    getattr(args, 'collect_video', False))
     else:
         # Default to verify
         print("[INFO] No mode specified, running --verify")
