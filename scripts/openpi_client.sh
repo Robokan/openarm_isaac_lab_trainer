@@ -11,10 +11,16 @@ set -e
 #   ./scripts/openpi_client.sh --prompt "pick up the cube"  # Custom task prompt
 #   ./scripts/openpi_client.sh --num_episodes 5             # Run 5 episodes
 #   ./scripts/openpi_client.sh --checkpoint /path/to/model.pt  # Specify checkpoint
+#   ./scripts/openpi_client.sh --spawn-objects              # Interactive object spawning before running
+#   ./scripts/openpi_client.sh --auto-spawn 3               # Auto-spawn 3 random objects
+#   ./scripts/openpi_client.sh --interactive                # Prompt for task instruction
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 cd "${REPO_ROOT}"
+
+# Activate Isaac Lab environment
+source "${REPO_ROOT}/scripts/source_me.sh"
 
 # Avoid system CUDA libs overriding Isaac Sim bundled libs
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
@@ -85,8 +91,13 @@ echo "  --max_hz HZ           Max control frequency (default: 50)"
 echo "  --num_episodes N      Number of episodes (default: 1)"
 echo "  --max_episode_steps N Max steps per episode (default: 1000)"
 echo ""
+echo "Object Spawning:"
+echo "  --spawn-objects       Interactive mode: spawn objects before running Pi"
+echo "  --auto-spawn N        Automatically spawn N random objects before running"
+echo "  --interactive         Ask for prompt before each episode"
+echo ""
 echo "Make sure the policy server is running:"
-echo "  cd ../openpi && uv run scripts/serve_policy.py --env=ALOHA"
+echo "  cd ../openpi && uv run scripts/serve_policy.py --config pi05_openarm"
 echo ""
 echo "Starting..."
 echo ""
@@ -107,4 +118,5 @@ if ! python -c "import openpi_client" 2>/dev/null; then
 fi
 
 # Run OpenPI client script
-python ./scripts/teleoperation/openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-v0 ${EXTRA_ARGS} "$@"
+# Use the Teleop task to match training environment (with objects, bins, etc.)
+python ./scripts/teleoperation/openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 ${EXTRA_ARGS} "$@"

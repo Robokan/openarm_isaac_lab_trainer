@@ -281,7 +281,7 @@ def verify_hdf5_data(data_dir: str, episode_idx: int = None):
     print("\n[INFO] Verification complete!")
 
 
-def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False):
+def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False, label_mode: bool = False, headless: bool = False):
     """Replay VLA training data in simulation."""
     # Detect format
     format_type = detect_format(data_dir)
@@ -294,7 +294,7 @@ def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real
         print("[INFO] Or to replay in Isaac Sim, convert using the fallback format.")
         return
     elif format_type == "lerobot_fallback":
-        replay_lerobot_fallback_data(data_dir, episode_idx, loop, real_time, collect_video)
+        replay_lerobot_fallback_data(data_dir, episode_idx, loop, real_time, collect_video, label_mode, headless)
         return
     elif format_type == "hdf5":
         replay_hdf5_data(data_dir, episode_idx, loop, real_time)
@@ -304,19 +304,25 @@ def replay_data(data_dir: str, episode_idx: int = None, loop: bool = False, real
         return
 
 
-def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False):
+def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: bool = False, real_time: bool = False, collect_video: bool = False, label_mode: bool = False, headless: bool = False):
     """Replay LeRobot fallback format data in simulation."""
+    # Headless mode runs at max speed (no real-time waiting)
+    if headless:
+        real_time = False
+    print(f"[DEBUG] replay_lerobot_fallback_data called with collect_video={collect_video}, label_mode={label_mode}, headless={headless}, real_time={real_time}")
+    
     # Delayed imports for simulation
     from isaaclab.app import AppLauncher
     import argparse
     
     args = argparse.Namespace(
-        headless=False,
+        headless=headless,
         enable_cameras=collect_video,  # Enable cameras if collecting video
         device="cuda:0",
         livestream=-1,
         experience="",
     )
+    print(f"[DEBUG] enable_cameras={args.enable_cameras}, headless={args.headless}")
     
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
@@ -532,7 +538,9 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     try:
                         from pxr import UsdGeom
                         import omni.replicator.core as rep
+                        import omni.usd
                         
+                        stage = omni.usd.get_context().get_stage()
                         for prim in stage.Traverse():
                             if prim.IsA(UsdGeom.Camera):
                                 cam_path = str(prim.GetPath())
@@ -962,6 +970,38 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 # Close camera window after episode
                 if HAS_CV2:
                     cv2.destroyWindow("Camera Views")
+                
+                # Label mode: prompt for task label after each episode
+                if label_mode:
+                    # Load current metadata
+                    ep_metadata_path = os.path.join(ep_path, "metadata.json")
+                    ep_metadata = {}
+                    if os.path.exists(ep_metadata_path):
+                        with open(ep_metadata_path, "r") as f:
+                            ep_metadata = json.load(f)
+                    
+                    current_label = ep_metadata.get("task_text", "")
+                    print(f"\n{'='*60}")
+                    print(f"  Episode: {ep_dir_name}")
+                    if current_label:
+                        print(f"  Current label: {current_label}")
+                    print(f"{'='*60}")
+                    print("  Enter task label/prompt (or press Enter to keep current, 's' to skip):")
+                    
+                    try:
+                        user_input = input("  > ").strip()
+                        if user_input.lower() == 's':
+                            print("  [INFO] Skipped labeling")
+                        elif user_input:
+                            ep_metadata["task_text"] = user_input
+                            with open(ep_metadata_path, "w") as f:
+                                json.dump(ep_metadata, f, indent=2)
+                            print(f"  [INFO] Saved label: {user_input}")
+                        else:
+                            print(f"  [INFO] Kept existing label: {current_label}")
+                    except EOFError:
+                        print("  [INFO] Skipped (EOF)")
+                
               except Exception as e:
                 print(f"  [ERROR] Episode processing failed: {e}", flush=True)
                 import traceback
@@ -1224,6 +1264,10 @@ def main():
                         help="Capture camera images during playback (only if episode has no images) [default: on]")
     parser.add_argument("--no-collect-video", action="store_false", dest="collect_video",
                         help="Disable video collection during playback")
+    parser.add_argument("--label", action="store_true",
+                        help="Prompt for task label/prompt after each episode and save to metadata")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run simulation without GUI (faster for batch processing)")
     
     args = parser.parse_args()
     
@@ -1234,8 +1278,12 @@ def main():
     if args.verify:
         verify_data(args.data_dir, args.episode)
     elif args.replay:
+        collect_vid = getattr(args, 'collect_video', True)  # Default to True
+        label_md = getattr(args, 'label', False)
+        headless = getattr(args, 'headless', False)
+        print(f"[DEBUG] args.collect_video={collect_vid}, args.label={label_md}, args.headless={headless}")
         replay_data(args.data_dir, args.episode, args.loop, args.real_time, 
-                    getattr(args, 'collect_video', False))
+                    collect_vid, label_md, headless)
     else:
         # Default to verify
         print("[INFO] No mode specified, running --verify")

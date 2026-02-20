@@ -7,6 +7,8 @@
 #   ./scripts/play_teleop_data.sh --loop             # Loop playback
 #   ./scripts/play_teleop_data.sh --verify           # Just verify data, no simulation
 #   ./scripts/play_teleop_data.sh --no-collect-video # Skip video capture during playback
+#   ./scripts/play_teleop_data.sh --label            # Prompt for task label after each episode
+#   ./scripts/play_teleop_data.sh --headless         # Run without GUI at max speed (no real-time limiting)
 #
 # Controls during playback:
 #   Q     - Quit
@@ -59,6 +61,7 @@ else
 fi
 
 # Run the playback script
+# Note: --headless automatically disables real-time mode for max speed
 python "${PROJECT_DIR}/scripts/reinforcement_learning/rsl_rl/play_bimanual_training_data.py" \
     "$DATA_DIR" \
     --replay \
