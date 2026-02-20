@@ -45,15 +45,25 @@ mkdir -p "$SPARK_HOME/datasets"
 rsync -av --progress "$SOURCE/vla_teleop_data_lerobot/" \
     "$SPARK_HOME/datasets/vla_teleop_data_lerobot/"
 
-# 3. Base model checkpoint to cache
+# 3. Base model checkpoints to cache (Pi 0 and Pi 0.5)
 echo ""
-echo "[3/5] Copying Pi 0.5 base model checkpoint to cache..."
+echo "[3/5] Copying base model checkpoints to cache..."
+mkdir -p "$SPARK_HOME/.cache/openpi/openpi-assets/checkpoints"
+
 if [ -d "$SOURCE/cache/checkpoints/pi05_base" ]; then
-    mkdir -p "$SPARK_HOME/.cache/openpi/openpi-assets/checkpoints"
+    echo "  Copying pi05_base..."
     rsync -av --progress "$SOURCE/cache/checkpoints/pi05_base/" \
         "$SPARK_HOME/.cache/openpi/openpi-assets/checkpoints/pi05_base/"
 else
-    echo "  Base checkpoint not on drive - will download on first run."
+    echo "  pi05_base not on drive - will download on first run."
+fi
+
+if [ -d "$SOURCE/cache/checkpoints/pi0_base" ]; then
+    echo "  Copying pi0_base..."
+    rsync -av --progress "$SOURCE/cache/checkpoints/pi0_base/" \
+        "$SPARK_HOME/.cache/openpi/openpi-assets/checkpoints/pi0_base/"
+else
+    echo "  pi0_base not on drive - will download on first run."
 fi
 
 # 4. Norm stats
