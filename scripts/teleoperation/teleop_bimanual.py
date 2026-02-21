@@ -2539,8 +2539,219 @@ def run_teleop(env, args):
     
     from PIL import Image as _PILImage
     
+    # =====================================================================
+    # Voice Control Integration (ZMQ)
+    # =====================================================================
+    voice_socket = None
+    voice_response_socket = None
+    voice_connected = False
+    voice_context = None
+    try:
+        import zmq
+        voice_context = zmq.Context()
+        
+        # Subscribe to commands from voice server
+        voice_socket = voice_context.socket(zmq.SUB)
+        voice_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        voice_socket.setsockopt(zmq.RCVTIMEO, 0)  # Non-blocking
+        voice_socket.connect("tcp://localhost:5556")
+        
+        # Publish responses back to voice server
+        voice_response_socket = voice_context.socket(zmq.PUB)
+        voice_response_socket.bind("tcp://*:5557")
+        
+        voice_connected = True
+        print("[Voice] Connected to voice server on tcp://localhost:5556")
+        print("[Voice] Publishing responses on tcp://*:5557")
+        
+        # Send initial connection message
+        import time as _time
+        _time.sleep(0.1)  # Brief delay for socket to establish
+        voice_response_socket.send_json({"response": "Teleop client connected and ready"})
+    except ImportError:
+        print("[Voice] ZMQ not installed - voice control disabled (pip install pyzmq)")
+    except Exception as e:
+        print(f"[Voice] Could not connect to voice server: {e}")
+        print("[Voice] Voice control disabled - start voice_assistant.sh to enable")
+    
+    def send_voice_response(message: str):
+        """Send a response message back to the voice assistant."""
+        if voice_response_socket:
+            try:
+                voice_response_socket.send_json({"response": message})
+            except:
+                pass
+    
+    # Mapping from fruit names to pool indices
+    FRUIT_NAME_TO_INDEX = {
+        "orange": 0,
+        "lemon": 1,
+        "lime": 2,
+        "avocado": 3,
+        "pomegranate": 4,
+        "lychee": 5,
+    }
+    
+    def spawn_specific_item(item_type: str, item_name: str = None, position: tuple = None):
+        """Spawn a specific item from the pool.
+        
+        Args:
+            item_type: "cubes", "mugs", or "fruits"
+            item_name: Specific item name (e.g., "lemon") or None for random
+            position: (x, y, z) or None for random position
+            
+        Returns:
+            (success: bool, message: str)
+        """
+        import random
+        import torch
+        
+        if position is None:
+            spawn_x = random.uniform(0.15, 0.35)
+            spawn_y = random.uniform(-0.15, 0.15)
+            spawn_z = 0.55
+            position = (spawn_x, spawn_y, spawn_z)
+        
+        pool_list = object_pool.get(item_type, [])
+        
+        if not pool_list:
+            return False, f"Unknown item type: {item_type}"
+        
+        # If specific item requested
+        if item_name and item_type == "fruits":
+            if item_name not in FRUIT_NAME_TO_INDEX:
+                return False, f"Unknown fruit: {item_name}. Available: orange, lemon, lime, avocado, pomegranate, lychee"
+            
+            target_idx = FRUIT_NAME_TO_INDEX[item_name]
+            
+            # Find the fruit in the pool
+            for obj in pool_list:
+                if obj["idx"] == target_idx:
+                    if obj["active"]:
+                        return False, f"{item_name.capitalize()} is already in use"
+                    
+                    # Activate it
+                    obj["active"] = True
+                    asset = obj["asset"]
+                    
+                    pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
+                    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
+                    vel = torch.zeros((1, 6), device=asset.device)
+                    
+                    asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+                    asset.write_root_velocity_to_sim(vel)
+                    
+                    pool_name = asset.cfg.prim_path.split("/")[-1]
+                    prim_path = f"/World/envs/env_0/{pool_name}"
+                    active_pool_objects.append({"asset": asset, "prim_path": prim_path})
+                    
+                    return True, f"Spawned {item_name}"
+            
+            return False, f"{item_name.capitalize()} not found in pool"
+        
+        # Random item from type
+        prim_path, asset = activate_pool_object(item_type, position)
+        if prim_path:
+            active_pool_objects.append({"asset": asset, "prim_path": prim_path})
+            return True, f"Spawned random {item_type[:-1]}"  # Remove 's' from type name
+        else:
+            return False, f"All {item_type} are in use"
+    
+    def handle_voice_command(cmd: dict):
+        """Handle incoming voice command."""
+        nonlocal lerobot_task_text, spawn_requested, lerobot_recording, lerobot_current_episode
+        
+        command = cmd.get("command", "")
+        
+        if command == "start_recording":
+            if hasattr(input_device, 'start_recording_requested'):
+                input_device.start_recording_requested = True
+            print("[Voice] Starting recording...")
+            send_voice_response("Recording started")
+            
+        elif command == "stop_recording":
+            if hasattr(input_device, 'stop_recording_requested'):
+                input_device.stop_recording_requested = True
+            print("[Voice] Stopping recording...")
+            send_voice_response("Recording stopped")
+            
+        elif command == "spawn_object":
+            obj_type = cmd.get("type")
+            item_name = cmd.get("item")
+            
+            if item_name or obj_type:
+                # Specific item or type requested
+                if not obj_type:
+                    # Infer type from item name
+                    if item_name in FRUIT_NAME_TO_INDEX:
+                        obj_type = "fruits"
+                    else:
+                        obj_type = "cubes"  # Default
+                
+                success, message = spawn_specific_item(obj_type, item_name)
+                print(f"[Voice] {message}")
+                send_voice_response(message)
+            else:
+                # Random object - use existing spawn logic
+                spawn_requested = True
+                print("[Voice] Spawning random object...")
+            
+        elif command == "reset_objects":
+            # Reset all active pool objects
+            count = len(active_pool_objects)
+            for obj_info in active_pool_objects[:]:
+                asset = obj_info["asset"]
+                deactivate_pool_object(asset)
+            active_pool_objects.clear()
+            print("[Voice] Reset all objects")
+            send_voice_response(f"Cleared {count} objects")
+            
+        elif command == "set_prompt":
+            prompt = cmd.get("prompt", "")
+            if prompt:
+                lerobot_task_text = prompt
+                print(f"[Voice] Task set to: {lerobot_task_text}")
+                send_voice_response(f"Task set to: {prompt}")
+                
+        elif command == "get_status":
+            # Report current status
+            status_parts = []
+            
+            # Recording status
+            if lerobot_recording:
+                frame_count = len(lerobot_current_episode.get("frames", [])) if lerobot_current_episode else 0
+                status_parts.append(f"Recording in progress, {frame_count} frames captured")
+            else:
+                status_parts.append("Not currently recording")
+            
+            # Task/prompt
+            status_parts.append(f"Current task: {lerobot_task_text}")
+            
+            # Object count
+            obj_count = len(active_pool_objects)
+            status_parts.append(f"{obj_count} objects in scene")
+            
+            status_msg = ". ".join(status_parts)
+            print(f"[Voice] Status: {status_msg}")
+            send_voice_response(status_msg)
+            
+        else:
+            print(f"[Voice] Unknown command: {command}")
+    
+    # =====================================================================
+    
     try:
         while simulation_app.is_running() and step_count < 100000:
+            # Poll for voice commands (non-blocking)
+            if voice_connected and voice_socket:
+                try:
+                    cmd = voice_socket.recv_json(zmq.NOBLOCK)
+                    handle_voice_command(cmd)
+                except zmq.Again:
+                    pass  # No message available
+                except Exception as e:
+                    print(f"[Voice] Error receiving command: {e}")
+            
             # Update input device (poll key states for keyboard)
             if hasattr(input_device, 'update'):
                 input_device.update()
@@ -3732,8 +3943,33 @@ def run_teleop(env, args):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 
+                # Send heartbeat to voice assistant (every ~5 seconds at 60fps)
+                if step_count % 300 == 0 and voice_response_socket:
+                    try:
+                        voice_response_socket.send_json({"response": ""})  # Empty heartbeat
+                    except:
+                        pass
+                
     except KeyboardInterrupt:
         print("\n[INFO] Teleoperation stopped by user")
+    finally:
+        # Cleanup voice control sockets
+        if voice_socket:
+            try:
+                voice_socket.close()
+            except:
+                pass
+        if voice_response_socket:
+            try:
+                voice_response_socket.close()
+            except:
+                pass
+        if voice_context:
+            try:
+                voice_context.term()
+                print("[Voice] Disconnected")
+            except:
+                pass
 
 
 if __name__ == "__main__":
