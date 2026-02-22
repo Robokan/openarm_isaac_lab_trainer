@@ -56,7 +56,7 @@ class RivaTTS:
         try:
             responses = self.tts_service.synthesize_online(
                 text,
-                voice_name="Magpie-Multilingual.EN-US.Male.Calm",
+                voice_name="Magpie-Multilingual.EN-US.Male.Male-1",
                 language_code="en-US",
                 sample_rate_hz=self.sample_rate,
                 encoding=riva.client.AudioEncoding.LINEAR_PCM,
