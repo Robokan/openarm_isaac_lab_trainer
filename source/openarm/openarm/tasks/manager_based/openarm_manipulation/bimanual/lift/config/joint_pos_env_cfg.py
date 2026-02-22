@@ -36,11 +36,11 @@ import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
-from source.openarm.openarm.tasks.manager_based.openarm_manipulation.bimanual.lift.lift_env_cfg import (
+from openarm.tasks.manager_based.openarm_manipulation.bimanual.lift.lift_env_cfg import (
     BimanualLiftEnvCfg,
 )
-from source.openarm.openarm.tasks.manager_based.openarm_manipulation.bimanual.lift import mdp
-from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
+from openarm.tasks.manager_based.openarm_manipulation.bimanual.lift import mdp
+from openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
     OPEN_ARM_FACTORY_HIGH_PD_CFG,
 )
 

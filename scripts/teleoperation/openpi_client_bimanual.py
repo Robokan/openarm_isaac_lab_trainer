@@ -16,24 +16,24 @@
 OpenPI Client for Bimanual OpenArm
 
 Connects to a π₀ policy server and executes VLA actions in Isaac Lab simulation.
-This is a drop-in replacement for the OpenPI ALOHA simulator.
+
+The Teleop environment config (Isaac-Reach-OpenArm-Bi-Teleop-v0) has been updated
+to accept 16 DOF actions matching the VLA output format:
+    [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+
+Arms use scale=1.0, use_default_offset=False so VLA absolute joint positions
+map directly.  Grippers use scale=0.044 so VLA [0,1] maps to sim [0, 0.044].
 
 Cameras:
     Uses the openarm_bimanual_factory.usd which has cameras mounted on:
-    - openarm_body_link (base/high camera)
-    - openarm_left_link7 (left wrist camera)
-    - openarm_right_link7 (right wrist camera)
+    - openarm_body_link (base/high camera) → cam_high
+    - openarm_left_link7 (left wrist camera) → cam_left_wrist
+    - openarm_right_link7 (right wrist camera) → cam_right_wrist
 
 Usage:
-    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --checkpoint /path/to/model.pt
-    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --checkpoint /path/to/model.pt --host localhost --port 8000
-    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --checkpoint /path/to/model.pt --prompt "pick up the cube"
-    
-    # Spawn objects before running (interactive mode)
-    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --checkpoint /path/to/model.pt --spawn-objects
-    
-    # Spawn specific number of random objects automatically
-    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --checkpoint /path/to/model.pt --auto-spawn 3
+    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0
+    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --host localhost --port 8000
+    python openpi_client_bimanual.py --task Isaac-Reach-OpenArm-Bi-Teleop-v0 --prompt "pick up the cube"
 """
 
 import argparse
@@ -41,41 +41,31 @@ import sys
 
 from isaaclab.app import AppLauncher
 
-# Parse arguments
 parser = argparse.ArgumentParser(description="OpenPI Client for Bimanual OpenArm")
-parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-Teleop-v0", help="Task name (use Teleop variant to match training environment)")
-parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained model checkpoint")
+parser.add_argument("--task", type=str, default="Isaac-Reach-OpenArm-Bi-Teleop-v0",
+                    help="Task name (use Teleop variant for 16 DOF action space)")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments")
 
-# OpenPI connection arguments
 parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
 parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
 parser.add_argument("--action_horizon", type=int, default=10, help="Action chunk size")
-parser.add_argument("--prompt", type=str, default="perform the bimanual manipulation task", 
+parser.add_argument("--prompt", type=str, default="perform the bimanual manipulation task",
                     help="Task prompt for VLA")
 parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency")
 parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to run")
 parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode")
 
-# Camera options
 parser.add_argument("--no_cameras", action="store_true", help="Disable camera capture (use black images)")
-
-# Object spawning options
-parser.add_argument("--spawn-objects", action="store_true", 
-                    help="Interactive mode: spawn objects before running Pi")
-parser.add_argument("--auto-spawn", type=int, default=0, metavar="N",
-                    help="Automatically spawn N random objects before running Pi")
 parser.add_argument("--interactive", action="store_true",
                     help="Interactive prompt mode: ask for prompt before each episode")
+parser.add_argument("--spawn-objects", action="store_true",
+                    help="Spawn random object from pool on workspace at startup")
 
-# Add AppLauncher args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# Clear sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
-# Launch Isaac Sim
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -85,17 +75,13 @@ import gymnasium as gym
 import torch
 import numpy as np
 import cv2
-import random
 import time
-
-from rsl_rl.runners import OnPolicyRunner
+import random
 
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
-from isaaclab.utils.assets import retrieve_file_path
-from isaaclab.sensors import Camera, CameraCfg
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper, RslRlBaseRunnerCfg
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -103,318 +89,279 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import openarm.tasks  # noqa: F401
 
 
-# =============================================================================
-# OpenPI Environment Wrapper for Bimanual OpenArm
-# =============================================================================
+IMAGE_SIZE = 224
+GRIPPER_OPEN_POS = 0.044
+VLA_DOF = 16  # VLA output: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+ENV_DOF = 18  # Env expects: [left_arm(7), left_grip(2), right_arm(7), right_grip(2)]
+
 
 class OpenArmBimanualEnvironment:
     """
-    OpenPI-compatible Environment wrapper for Bimanual OpenArm in Isaac Lab.
-    
-    Provides the same interface as openpi_client.runtime.Environment,
-    using ALOHA-style observation format for bimanual robots:
-    - State: [left_arm_joints(7), left_gripper(1), right_arm_joints(7), right_gripper(1)] = 16 DOF
-    - Images: cam_high, cam_left_wrist, cam_right_wrist
+    OpenPI-compatible environment wrapper for Bimanual OpenArm in Isaac Lab.
+
+    Matches OPENARM_MAPPING.md:
+    - State: 16 DOF [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+    - Images: cam_high, cam_left_wrist, cam_right_wrist  ([C, H, W], uint8, 224x224)
+    - Actions: 16 DOF passed directly to env.step()
+
+    The Teleop env config (TeleopActionsCfg) has matching 16 DOF action space:
+    - left_arm_action:     7 joints, scale=1.0, use_default_offset=False
+    - left_gripper_action: 1 joint,  scale=0.044, use_default_offset=False
+    - right_arm_action:    7 joints, scale=1.0, use_default_offset=False
+    - right_gripper_action:1 joint,  scale=0.044, use_default_offset=False
     """
 
-    # Bimanual OpenArm: 7 arm joints + 1 gripper per arm = 16 total
-    NUM_ARM_JOINTS = 7
-    TOTAL_DOF = 16  # (7+1) * 2
-    IMAGE_SIZE = 224
-
-    def __init__(self, env, policy, prompt: str = "perform the task", use_cameras: bool = True):
-        """
-        Args:
-            env: Isaac Lab wrapped environment
-            policy: Trained RL policy for low-level control (fallback)
-            prompt: Task prompt for VLA
-            use_cameras: Whether to capture camera images (False = black images)
-        """
+    def __init__(self, env, prompt: str = "perform the task", use_cameras: bool = True):
         self._env = env
-        self._policy = policy
         self._prompt = prompt
-        self._device = "cuda:0"
         self._use_cameras = use_cameras
-        
-        # Get unwrapped env for direct access
+        self._device = env.unwrapped.device
+
         self._unwrapped = env.unwrapped
         if hasattr(self._unwrapped, 'unwrapped'):
             self._unwrapped = self._unwrapped.unwrapped
-        
-        # Initialize cameras if enabled
-        self._cameras = {}
-        if self._use_cameras:
-            self._init_cameras()
-        
-        # Initialize object pool
-        self._object_pool = {"cubes": [], "mugs": [], "fruits": []}
-        self._active_objects = []
-        self._init_object_pool()
-        
-        # State
+
+        self._robot = self._unwrapped.scene["robot"]
+
+        # Find joint IDs for building 16-dim state vector
+        self._left_arm_ids, left_names = self._robot.find_joints([
+            "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3",
+            "openarm_left_joint4", "openarm_left_joint5", "openarm_left_joint6",
+            "openarm_left_joint7",
+        ])
+        self._right_arm_ids, right_names = self._robot.find_joints([
+            "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3",
+            "openarm_right_joint4", "openarm_right_joint5", "openarm_right_joint6",
+            "openarm_right_joint7",
+        ])
+        self._left_gripper_ids, _ = self._robot.find_joints("openarm_left_finger_joint.*")
+        self._right_gripper_ids, _ = self._robot.find_joints("openarm_right_finger_joint.*")
+
+        print(f"[INFO] Left arm joint IDs:  {list(self._left_arm_ids)} = {left_names}")
+        print(f"[INFO] Right arm joint IDs: {list(self._right_arm_ids)} = {right_names}")
+        print(f"[INFO] Left gripper IDs:    {list(self._left_gripper_ids)}")
+        print(f"[INFO] Right gripper IDs:   {list(self._right_gripper_ids)}")
+
+        # Verify action space matches VLA output
+        num_actions = env.unwrapped.num_actions if hasattr(env.unwrapped, 'num_actions') else None
+        print(f"[INFO] Environment action space: {num_actions} DOF (expected {ENV_DOF})")
+        if num_actions is not None and num_actions != ENV_DOF:
+            print(f"[WARN] Action space mismatch! Expected {ENV_DOF}, got {num_actions}")
+            print(f"[WARN] Make sure to use Isaac-Reach-OpenArm-Bi-Teleop-v0 (TeleopActionsCfg)")
+
+        # Camera render products (initialized lazily after first sim step)
+        self._render_products = {}
+        self._cameras_initialized = False
+
         self._obs = None
         self._done = True
         self._step_count = 0
-    
+
+        # Object pool for spawning
+        self._object_pool = {"cubes": [], "mugs": [], "fruits": []}
+        self._active_objects = []
+        self._init_object_pool()
+
     def _init_object_pool(self):
-        """Initialize object pool from scene assets (cubes, mugs, fruits)."""
-        scene_keys = list(self._unwrapped.scene.keys())
+        """Initialize object pool from scene assets (TeleopSceneCfg)."""
+        scene_keys = list(self._unwrapped.scene.keys()) if hasattr(self._unwrapped.scene, 'keys') else []
         
-        # Load cubes (5 total)
         for i in range(5):
             cube_name = f"pool_cube_{i}"
             if cube_name in scene_keys:
-                cube_asset = self._unwrapped.scene[cube_name]
-                self._object_pool["cubes"].append({"asset": cube_asset, "active": False, "idx": i})
+                self._object_pool["cubes"].append({
+                    "asset": self._unwrapped.scene[cube_name],
+                    "active": False, "idx": i
+                })
         
-        # Load mugs (4 total)
         for i in range(4):
             mug_name = f"pool_mug_{i}"
             if mug_name in scene_keys:
-                mug_asset = self._unwrapped.scene[mug_name]
-                self._object_pool["mugs"].append({"asset": mug_asset, "active": False, "idx": i})
+                self._object_pool["mugs"].append({
+                    "asset": self._unwrapped.scene[mug_name],
+                    "active": False, "idx": i
+                })
         
-        # Load fruits (6 total)
         for i in range(6):
             fruit_name = f"pool_fruit_{i}"
             if fruit_name in scene_keys:
-                fruit_asset = self._unwrapped.scene[fruit_name]
-                self._object_pool["fruits"].append({"asset": fruit_asset, "active": False, "idx": i})
+                self._object_pool["fruits"].append({
+                    "asset": self._unwrapped.scene[fruit_name],
+                    "active": False, "idx": i
+                })
         
-        print(f"[Pool] Found {len(self._object_pool['cubes'])} cubes, "
-              f"{len(self._object_pool['mugs'])} mugs, {len(self._object_pool['fruits'])} fruits")
-    
+        total = len(self._object_pool['cubes']) + len(self._object_pool['mugs']) + len(self._object_pool['fruits'])
+        if total > 0:
+            print(f"[Pool] Found {len(self._object_pool['cubes'])} cubes, "
+                  f"{len(self._object_pool['mugs'])} mugs, {len(self._object_pool['fruits'])} fruits")
+        else:
+            print("[Pool] No pool objects found - ensure using TeleopSceneCfg")
+
     def spawn_random_object(self, position=None):
-        """Spawn a random object from the pool at the given position.
-        
-        Args:
-            position: (x, y, z) tuple or None for random position near table center
-            
-        Returns:
-            (prim_path, pool_type) or (None, None) if all pools exhausted
-        """
+        """Spawn a random object from the pool onto the workspace."""
         if position is None:
-            # Random position on table
-            spawn_x = random.uniform(0.15, 0.35)
+            spawn_x = random.uniform(0.20, 0.35)
             spawn_y = random.uniform(-0.15, 0.15)
-            spawn_z = 0.55  # Table height + small offset
+            spawn_z = 0.32  # Slightly above table surface
             position = (spawn_x, spawn_y, spawn_z)
         
-        # Try random pool type
         pool_types = ["cubes", "mugs", "fruits"]
         random.shuffle(pool_types)
         
         for pool_type in pool_types:
-            result = self._activate_pool_object(pool_type, position)
-            if result[0] is not None:
-                return result[0], pool_type
+            for obj in self._object_pool[pool_type]:
+                if not obj["active"]:
+                    obj["active"] = True
+                    asset = obj["asset"]
+                    
+                    pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
+                    quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
+                    vel = torch.zeros((1, 6), device=asset.device)
+                    
+                    asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+                    asset.write_root_velocity_to_sim(vel)
+                    
+                    self._active_objects.append({"asset": asset, "type": pool_type})
+                    print(f"[Pool] Spawned {pool_type[:-1]} at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+                    return True
         
-        print("[Pool] All object pools exhausted!")
-        return None, None
-    
-    def spawn_object_by_type(self, pool_type: str, position=None):
-        """Spawn a specific type of object from the pool.
-        
-        Args:
-            pool_type: "cubes", "mugs", or "fruits"
-            position: (x, y, z) tuple or None for random position
-            
-        Returns:
-            prim_path or None if pool exhausted
-        """
-        if position is None:
-            spawn_x = random.uniform(0.15, 0.35)
-            spawn_y = random.uniform(-0.15, 0.15)
-            spawn_z = 0.55
-            position = (spawn_x, spawn_y, spawn_z)
-        
-        result = self._activate_pool_object(pool_type, position)
-        return result[0]
-    
-    def _activate_pool_object(self, pool_type: str, position: tuple):
-        """Activate an object from the pool at the given position."""
-        pool_list = self._object_pool.get(pool_type, [])
-        
-        for obj in pool_list:
-            if not obj["active"]:
-                obj["active"] = True
-                asset = obj["asset"]
-                
-                # Teleport to position
-                pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
-                quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
-                vel = torch.zeros((1, 6), device=asset.device)
-                
-                asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
-                asset.write_root_velocity_to_sim(vel)
-                
-                # Get prim path
-                pool_name = asset.cfg.prim_path.split("/")[-1]
-                prim_path = f"/World/envs/env_0/{pool_name}"
-                
-                self._active_objects.append({"asset": asset, "prim_path": prim_path, "type": pool_type})
-                print(f"[Pool] Spawned {pool_type[:-1]} at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
-                return prim_path, asset
-        
-        return None, None
-    
+        print("[Pool] All pools exhausted!")
+        return False
+
     def reset_all_objects(self):
-        """Return all active objects to the pool."""
+        """Return all active objects to their pool positions."""
         for obj_info in self._active_objects:
             asset = obj_info["asset"]
-            
-            # Move back to floor
             pos = torch.tensor([[-2.0, 0.0, 0.03]], device=asset.device)
             quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
             vel = torch.zeros((1, 6), device=asset.device)
-            
             asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
             asset.write_root_velocity_to_sim(vel)
             
-            # Mark as inactive
             for pool_type in ["cubes", "mugs", "fruits"]:
                 for pool_obj in self._object_pool[pool_type]:
                     if pool_obj["asset"] is asset:
                         pool_obj["active"] = False
         
-        count = len(self._active_objects)
         self._active_objects.clear()
-        if count > 0:
-            print(f"[Pool] Reset {count} objects to pool")
-    
-    def get_pool_status(self):
-        """Get status of object pools."""
-        status = {}
-        for pool_type, pool_list in self._object_pool.items():
-            total = len(pool_list)
-            active = sum(1 for obj in pool_list if obj["active"])
-            status[pool_type] = {"total": total, "active": active, "available": total - active}
-        return status
-    
-    def set_prompt(self, prompt: str):
-        """Update the task prompt."""
-        self._prompt = prompt
-        print(f"[INFO] Prompt set to: {prompt}")
+        print("[Pool] All objects returned to pool")
 
-    def _init_cameras(self):
-        """Initialize camera sensors attached to the robot."""
+    def _init_cameras_replicator(self):
+        """Initialize cameras using omni.replicator render products (matches data collection)."""
+        if self._cameras_initialized:
+            return
+
         try:
-            import omni.isaac.core.utils.prims as prim_utils
-            
-            # Camera prim paths (relative to robot)
-            # These cameras should exist in the openarm_bimanual_factory.usd
-            camera_configs = {
-                "cam_high": "{ENV_REGEX_NS}/Robot/openarm_body_link/Camera",
-                "cam_left_wrist": "{ENV_REGEX_NS}/Robot/openarm_left_link7/Camera", 
-                "cam_right_wrist": "{ENV_REGEX_NS}/Robot/openarm_right_link7/Camera",
-            }
-            
-            # Check if cameras exist in the USD
-            for name, prim_path in camera_configs.items():
-                # Replace ENV_REGEX_NS with env_0 for the first environment
-                resolved_path = prim_path.replace("{ENV_REGEX_NS}", "/World/envs/env_0")
-                if prim_utils.is_prim_path_valid(resolved_path):
-                    print(f"[INFO] Found camera: {name} at {resolved_path}")
-                    self._cameras[name] = resolved_path
-                else:
-                    print(f"[WARN] Camera not found: {name} at {resolved_path}")
-            
-            if not self._cameras:
-                print("[WARN] No cameras found in USD. Using black images.")
-                print("[INFO] Make sure to use the factory USD with cameras:")
-                print("       openarm_bimanual_factory.usd")
+            from pxr import UsdGeom
+            import omni.replicator.core as rep
+            import omni.usd
+
+            stage = omni.usd.get_context().get_stage()
+            found = 0
+
+            for prim in stage.Traverse():
+                if prim.IsA(UsdGeom.Camera):
+                    cam_path = str(prim.GetPath())
+                    cam_name = prim.GetName()
+                    if "env_0" not in cam_path:
+                        continue
+                    try:
+                        render_product = rep.create.render_product(cam_path, (640, 480))
+                        rgb_annot = rep.AnnotatorRegistry.get_annotator("rgb")
+                        rgb_annot.attach([render_product])
+
+                        if "ego" in cam_name.lower() or "high" in cam_name.lower() or "body" in cam_name.lower():
+                            self._render_products["cam_high"] = rgb_annot
+                        elif "left" in cam_name.lower():
+                            self._render_products["cam_left_wrist"] = rgb_annot
+                        elif "right" in cam_name.lower():
+                            self._render_products["cam_right_wrist"] = rgb_annot
+
+                        print(f"[CAM] {cam_name}: {cam_path} [READY]")
+                        found += 1
+                    except Exception as e:
+                        print(f"[CAM] {cam_name}: {cam_path} [FAILED: {e}]")
+
+            if found == 0:
+                print("[WARN] No cameras found in USD stage. Using black images.")
+                print("[WARN] Make sure to use the factory USD (openarm_bimanual_factory.usd)")
                 self._use_cameras = False
-                
+            else:
+                print(f"[CAM] Initialized {found} cameras via replicator render products")
+
         except Exception as e:
             print(f"[WARN] Failed to initialize cameras: {e}")
             self._use_cameras = False
 
-    def _capture_camera(self, camera_name: str) -> np.ndarray:
-        """Capture image from a camera sensor."""
-        if not self._use_cameras or camera_name not in self._cameras:
-            return np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
-        
+        self._cameras_initialized = True
+
+    def _capture_camera(self, cam_key: str) -> np.ndarray:
+        """Capture and resize a camera image to [C, H, W] uint8 224x224."""
+        black = np.zeros((3, IMAGE_SIZE, IMAGE_SIZE), dtype=np.uint8)
+
+        if cam_key not in self._render_products:
+            return black
+
         try:
-            import omni.replicator.core as rep
-            from omni.isaac.sensor import Camera as IsaacCamera
-            
-            prim_path = self._cameras[camera_name]
-            
-            # Get camera render product
-            camera = IsaacCamera(prim_path)
-            camera.initialize()
-            
-            # Get RGBA image
-            rgba = camera.get_rgba()
-            
-            if rgba is not None:
-                # Convert RGBA to RGB, resize, and transpose to [C, H, W]
-                rgb = rgba[:, :, :3]
-                rgb_resized = cv2.resize(rgb, (self.IMAGE_SIZE, self.IMAGE_SIZE))
-                rgb_chw = np.transpose(rgb_resized, (2, 0, 1))  # [H, W, C] -> [C, H, W]
-                return rgb_chw.astype(np.uint8)
-            
-        except Exception as e:
-            # Silently fall back to black image
-            pass
-        
-        return np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
+            data = self._render_products[cam_key].get_data()
+            if data is None:
+                return black
+
+            rgb = data[:, :, :3].astype(np.uint8)
+
+            # Resize with padding to 224x224 (matches training preprocessing)
+            h, w = rgb.shape[:2]
+            ratio = max(w / IMAGE_SIZE, h / IMAGE_SIZE)
+            new_h, new_w = int(h / ratio), int(w / ratio)
+            resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            canvas = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
+            pad_y = (IMAGE_SIZE - new_h) // 2
+            pad_x = (IMAGE_SIZE - new_w) // 2
+            canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+
+            # [H, W, C] → [C, H, W]
+            return np.transpose(canvas, (2, 0, 1))
+
+        except Exception:
+            return black
+
+    def set_prompt(self, prompt: str):
+        self._prompt = prompt
+        print(f"[INFO] Prompt set to: {prompt}")
 
     def reset(self) -> None:
-        """Reset the environment."""
+        print("[DEBUG] Environment reset() called")
         self._obs, _ = self._env.reset()
         self._done = False
         self._step_count = 0
+        print(f"[DEBUG] After reset: _done={self._done}, _step_count={self._step_count}")
+
+        if self._use_cameras and not self._cameras_initialized:
+            self._init_cameras_replicator()
 
     def is_episode_complete(self) -> bool:
-        """Check if episode is complete."""
+        if self._done:
+            print(f"[DEBUG] is_episode_complete() returning True at step {self._step_count}")
         return self._done
 
     def get_observation(self) -> dict:
         """
-        Get observation in ALOHA-compatible format for OpenPI.
-        
-        Returns:
-            dict with:
-                - state: [16] array (left_arm(7), left_gripper(1), right_arm(7), right_gripper(1))
-                - images: dict with camera images in [C, H, W] format
-                - prompt: task instruction
+        Build observation matching OPENARM_MAPPING.md:
+        - state: 16-dim [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+        - images: cam_high, cam_left_wrist, cam_right_wrist  [C, H, W] uint8
+        - prompt: task instruction string
         """
-        if self._obs is None:
-            raise RuntimeError("Observation not set. Call reset() first.")
-        
-        robot = self._unwrapped.scene["robot"]
-        joint_pos = robot.data.joint_pos[0].cpu().numpy()
-        
-        # Extract left and right arm joints + grippers
-        # Joint ordering based on openarm_bimanual.py:
-        # left_joint1-7, left_finger_joint, right_joint1-7, right_finger_joint
-        num_joints = len(joint_pos)
-        
-        if num_joints >= 16:
-            # Full bimanual: 7 left arm + 1 left gripper + 7 right arm + 1 right gripper
-            left_arm = joint_pos[0:7]
-            left_gripper = np.clip(joint_pos[7:8] / 0.044, 0.0, 1.0)
-            right_arm = joint_pos[8:15]
-            right_gripper = np.clip(joint_pos[15:16] / 0.044, 0.0, 1.0)
-        else:
-            # Fallback: split evenly
-            half = num_joints // 2
-            left_arm = joint_pos[0:min(7, half-1)]
-            left_gripper = np.clip(joint_pos[half-1:half] / 0.044, 0.0, 1.0) if half > 0 else np.array([0.0])
-            right_arm = joint_pos[half:half+7] if num_joints > half else np.zeros(7)
-            right_gripper = np.clip(joint_pos[-1:] / 0.044, 0.0, 1.0)
-        
-        # Pad to correct sizes if needed
-        left_arm = np.pad(left_arm, (0, max(0, 7 - len(left_arm))), mode='constant')
-        right_arm = np.pad(right_arm, (0, max(0, 7 - len(right_arm))), mode='constant')
-        left_gripper = left_gripper if len(left_gripper) == 1 else np.array([0.0])
-        right_gripper = right_gripper if len(right_gripper) == 1 else np.array([0.0])
-        
-        # Combine into ALOHA-style state: [left_arm, left_gripper, right_arm, right_gripper]
-        state = np.concatenate([left_arm, left_gripper, right_arm, right_gripper]).astype(np.float32)
-        
-        # Capture camera images
+        joint_pos = self._robot.data.joint_pos[0].cpu().numpy()
+
+        left_arm = joint_pos[list(self._left_arm_ids)]
+        right_arm = joint_pos[list(self._right_arm_ids)]
+
+        left_grip = np.array([joint_pos[self._left_gripper_ids[0]]], dtype=np.float32) if self._left_gripper_ids else np.array([0.0], dtype=np.float32)
+        right_grip = np.array([joint_pos[self._right_gripper_ids[0]]], dtype=np.float32) if self._right_gripper_ids else np.array([0.0], dtype=np.float32)
+
+        state = np.concatenate([left_arm, left_grip, right_arm, right_grip]).astype(np.float32)
+
         if self._use_cameras:
             images = {
                 "cam_high": self._capture_camera("cam_high"),
@@ -422,14 +369,13 @@ class OpenArmBimanualEnvironment:
                 "cam_right_wrist": self._capture_camera("cam_right_wrist"),
             }
         else:
-            # Placeholder black images
-            black_image = np.zeros((3, self.IMAGE_SIZE, self.IMAGE_SIZE), dtype=np.uint8)
+            black = np.zeros((3, IMAGE_SIZE, IMAGE_SIZE), dtype=np.uint8)
             images = {
-                "cam_high": black_image.copy(),
-                "cam_left_wrist": black_image.copy(),
-                "cam_right_wrist": black_image.copy(),
+                "cam_high": black.copy(),
+                "cam_left_wrist": black.copy(),
+                "cam_right_wrist": black.copy(),
             }
-        
+
         return {
             "state": state,
             "images": images,
@@ -438,60 +384,57 @@ class OpenArmBimanualEnvironment:
 
     def apply_action(self, action: dict) -> None:
         """
-        Apply action from OpenPI policy.
+        Apply VLA action via env.step().
+
+        VLA outputs 16 DOF: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+        Env expects 18 DOF: [left_arm(7), left_grip(2), right_arm(7), right_grip(2)]
         
-        The VLA returns actions in ALOHA format:
-        [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)] = 16 DOF
-        
-        These are applied directly as joint position targets to the simulation.
+        Each gripper has 2 finger joints that move together (mimic), so we
+        duplicate the single gripper value for both fingers.
         """
         vla_actions = action.get("actions")
-        
+
         if vla_actions is not None:
-            # Convert VLA actions to tensor
-            vla_actions = np.asarray(vla_actions)
-            
-            # Handle action chunks - VLA may return [action_horizon, 16] or [16]
+            vla_actions = np.asarray(vla_actions, dtype=np.float32)
             if vla_actions.ndim == 2:
-                # Action chunk - ActionChunkBroker already slices, but just in case
                 vla_actions = vla_actions[0]
+
+            # Expand 16 DOF to 18 DOF by duplicating gripper values
+            # VLA: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+            # Env: [left_arm(7), left_grip(2), right_arm(7), right_grip(2)]
+            left_arm = vla_actions[0:7]
+            left_grip = vla_actions[7]  # Single value, duplicate for 2 fingers
+            right_arm = vla_actions[8:15]
+            right_grip = vla_actions[15]  # Single value, duplicate for 2 fingers
             
-            # VLA actions are in ALOHA format: [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
-            # Convert to tensor for the environment
-            joint_targets = torch.tensor(
-                vla_actions, dtype=torch.float32, device=self._device
-            ).unsqueeze(0)  # Add batch dimension
+            expanded_actions = np.concatenate([
+                left_arm,
+                [left_grip, left_grip],  # Duplicate for both finger joints
+                right_arm,
+                [right_grip, right_grip],  # Duplicate for both finger joints
+            ])
             
-            # Denormalize gripper values (VLA uses 0-1, sim uses 0-0.044)
-            # Indices 7 and 15 are the grippers
-            if joint_targets.shape[1] >= 16:
-                joint_targets[0, 7] = joint_targets[0, 7] * 0.044  # Left gripper
-                joint_targets[0, 15] = joint_targets[0, 15] * 0.044  # Right gripper
-            
-            # Apply VLA joint targets directly to the simulation
-            self._obs, _, dones, _ = self._env.step(joint_targets)
+            action_tensor = torch.tensor(expanded_actions, dtype=torch.float32, device=self._device).unsqueeze(0)
+            self._obs, _, dones, _ = self._env.step(action_tensor)
         else:
-            # Fallback: use trained RL policy if no VLA actions
-            with torch.inference_mode():
-                actions = self._policy(self._obs)
-            self._obs, _, dones, _ = self._env.step(actions)
-        
+            action_tensor = torch.zeros((1, ENV_DOF), device=self._device)
+            self._obs, _, dones, _ = self._env.step(action_tensor)
+
         self._step_count += 1
-        
+
         if hasattr(dones, 'any'):
             self._done = dones.any().item()
         else:
             self._done = bool(dones)
         
-        if self._done:
-            self._obs, _ = self._env.get_observations()
+        if self._step_count <= 5 or self._done:
+            print(f"[DEBUG] Step {self._step_count}: done={self._done}, dones_raw={dones}")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Main entry point for OpenPI client."""
-    
-    # Import OpenPI client components
+
     try:
         from openpi_client import action_chunk_broker
         from openpi_client import websocket_client_policy
@@ -500,124 +443,47 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     except ImportError as e:
         print(f"\n[ERROR] OpenPI client not installed: {e}")
         print("[INFO] Install with: pip install -e /path/to/openpi/packages/openpi-client")
-        print("[INFO] For example: pip install -e ../openpi/packages/openpi-client")
         return
-    
-    # Configure environment
+
     env_cfg.scene.num_envs = args_cli.num_envs
-    env_cfg.sim.device = "cuda:0"
-    
-    # Disable randomization for stable control
+    env_cfg.sim.device = agent_cfg.device
+
     if hasattr(env_cfg, 'observations') and hasattr(env_cfg.observations, 'policy'):
         env_cfg.observations.policy.enable_corruption = False
-    
-    # Create environment
+
     print(f"\n[INFO] Creating environment: {args_cli.task}")
     env = gym.make(args_cli.task, cfg=env_cfg)
-    
-    # Wrap for RSL-RL
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
-    
-    # Load checkpoint (used as fallback policy)
-    print(f"[INFO] Loading checkpoint: {args_cli.checkpoint}")
-    checkpoint_path = retrieve_file_path(args_cli.checkpoint)
-    
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    runner.load(checkpoint_path)
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
-    print("[INFO] Policy loaded successfully!")
-    
+
     use_cameras = not args_cli.no_cameras
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("OPENARM BIMANUAL - OPENPI CLIENT")
-    print("="*60)
-    print(f"Connecting to π₀ server at {args_cli.host}:{args_cli.port}")
+    print("=" * 60)
+    print(f"Server:         {args_cli.host}:{args_cli.port}")
     print(f"Action horizon: {args_cli.action_horizon}")
-    print(f"Max Hz: {args_cli.max_hz}")
-    print(f"Episodes: {args_cli.num_episodes}")
-    print(f"Max steps/episode: {args_cli.max_episode_steps}")
-    print(f"Prompt: {args_cli.prompt}")
-    print(f"Cameras: {'enabled' if use_cameras else 'disabled (black images)'}")
-    print("="*60 + "\n")
-    
-    # Create OpenPI-compatible environment wrapper
+    print(f"Max Hz:         {args_cli.max_hz}")
+    print(f"Episodes:       {args_cli.num_episodes}")
+    print(f"Max steps:      {args_cli.max_episode_steps}")
+    print(f"Prompt:         {args_cli.prompt}")
+    print(f"Cameras:        {'enabled' if use_cameras else 'disabled (black images)'}")
+    print("=" * 60 + "\n")
+
     openpi_env = OpenArmBimanualEnvironment(
         env=env,
-        policy=policy,
         prompt=args_cli.prompt,
         use_cameras=use_cameras,
     )
-    
-    # Reset environment to initialize
-    openpi_env.reset()
-    
-    # Wait a moment for physics to settle
-    for _ in range(10):
-        env.step(torch.zeros((1, 16), device="cuda:0"))
-    
-    # Auto-spawn objects if requested
-    if args_cli.auto_spawn > 0:
-        print(f"\n[INFO] Auto-spawning {args_cli.auto_spawn} random objects...")
-        for i in range(args_cli.auto_spawn):
-            prim_path, obj_type = openpi_env.spawn_random_object()
-            if prim_path is None:
-                print(f"[WARN] Could not spawn object {i+1} - pools exhausted")
-                break
-        # Let physics settle
+
+    # Spawn objects if requested
+    if getattr(args_cli, 'spawn_objects', False):
+        print("\n[INFO] Spawning object on workspace...")
+        openpi_env.spawn_random_object()
+        # Step simulation to let object settle
         for _ in range(30):
-            env.step(torch.zeros((1, 16), device="cuda:0"))
-        print()
-    
-    # Interactive object spawning mode
-    if args_cli.spawn_objects:
-        print("\n" + "="*60)
-        print("INTERACTIVE OBJECT SPAWNING")
-        print("="*60)
-        print("Commands:")
-        print("  c - Spawn cube")
-        print("  m - Spawn mug")
-        print("  f - Spawn fruit")
-        print("  r - Spawn random object")
-        print("  x - Reset all objects to pool")
-        print("  s - Show pool status")
-        print("  p - Set prompt")
-        print("  ENTER - Done, start Pi")
-        print("="*60 + "\n")
-        
-        while True:
-            cmd = input("Spawn> ").strip().lower()
-            
-            if cmd == "" or cmd == "done" or cmd == "start":
-                break
-            elif cmd == "c" or cmd == "cube":
-                openpi_env.spawn_object_by_type("cubes")
-            elif cmd == "m" or cmd == "mug":
-                openpi_env.spawn_object_by_type("mugs")
-            elif cmd == "f" or cmd == "fruit":
-                openpi_env.spawn_object_by_type("fruits")
-            elif cmd == "r" or cmd == "random":
-                openpi_env.spawn_random_object()
-            elif cmd == "x" or cmd == "reset":
-                openpi_env.reset_all_objects()
-            elif cmd == "s" or cmd == "status":
-                status = openpi_env.get_pool_status()
-                for pool_type, info in status.items():
-                    print(f"  {pool_type}: {info['active']}/{info['total']} active, {info['available']} available")
-            elif cmd == "p" or cmd == "prompt":
-                new_prompt = input("Enter prompt: ").strip()
-                if new_prompt:
-                    openpi_env.set_prompt(new_prompt)
-            else:
-                print(f"  Unknown command: {cmd}")
-            
-            # Step physics to let objects settle
-            for _ in range(10):
-                env.step(torch.zeros((1, 16), device="cuda:0"))
-        
-        print()
-    
-    # Interactive prompt mode
+            openpi_env._env.step(torch.zeros((1, ENV_DOF), device=openpi_env._device))
+        print("[INFO] Object spawned and settled\n")
+
     if args_cli.interactive:
         print("\n[PROMPT] Enter task instruction for Pi (or press Enter to keep default):")
         print(f"[PROMPT] Current: {openpi_env._prompt}")
@@ -625,8 +491,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if new_prompt:
             openpi_env.set_prompt(new_prompt)
         print()
-    
-    # Create OpenPI runtime
+
     runtime = openpi_runtime.Runtime(
         environment=openpi_env,
         agent=policy_agent.PolicyAgent(
@@ -643,16 +508,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         num_episodes=args_cli.num_episodes,
         max_episode_steps=args_cli.max_episode_steps,
     )
-    
+
     print("[INFO] Starting OpenPI client loop...")
     print(f"[INFO] Prompt: {openpi_env._prompt}")
     print("[INFO] Press Ctrl+C to stop\n")
-    
+
     try:
         runtime.run()
     except KeyboardInterrupt:
         print("\n[INFO] Client stopped by user")
-    
+
     print("[INFO] OpenPI client finished")
     env.close()
     print("[INFO] Environment closed")

@@ -502,6 +502,7 @@ class VoiceServer:
     def __init__(
         self,
         riva_server: str = "localhost:50051",
+        tts_server: str = None,
         zmq_port: int = 5556,
         llm_device: str = "cuda:0",
         use_llm: bool = True,
@@ -511,6 +512,8 @@ class VoiceServer:
         self.zmq_port = zmq_port
         self.running = False
         self.enable_tts = enable_tts
+        if tts_server is None:
+            tts_server = riva_server
         
         # Initialize components
         print("\n" + "=" * 50)
@@ -537,7 +540,7 @@ class VoiceServer:
         self.asr = RivaASR(server=riva_server)
         
         print("\n[4/5] Initializing TTS...")
-        self.tts = RivaTTS(server=riva_server) if enable_tts else None
+        self.tts = RivaTTS(server=tts_server) if enable_tts else None
         
         print("\n[5/5] Initializing audio capture...")
         self.audio = AudioCapture()
@@ -692,7 +695,9 @@ class VoiceServer:
 def main():
     parser = argparse.ArgumentParser(description="JAX - Spark Pack Voice Assistant")
     parser.add_argument("--riva-server", type=str, default="localhost:50051",
-                        help="Riva gRPC server address")
+                        help="Riva ASR gRPC server address")
+    parser.add_argument("--tts-server", type=str, default=None,
+                        help="Riva TTS gRPC server address (defaults to --riva-server)")
     parser.add_argument("--zmq-port", type=int, default=5556,
                         help="ZMQ publisher port")
     parser.add_argument("--llm-device", type=str, default="cuda:0",
@@ -707,6 +712,7 @@ def main():
     
     server = VoiceServer(
         riva_server=args.riva_server,
+        tts_server=args.tts_server,
         zmq_port=args.zmq_port,
         llm_device=args.llm_device,
         nim_url=args.nim_url,

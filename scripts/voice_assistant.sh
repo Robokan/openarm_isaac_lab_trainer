@@ -47,12 +47,15 @@ fi
 
 # Check if NIM is running (unless --no-llm)
 if [[ "$*" != *"--no-llm"* ]]; then
-    if docker ps 2>/dev/null | grep -q nim-llama; then
-        echo "[OK] NIM server is running (LLM)"
+    if docker ps 2>/dev/null | grep -qE "nim-llama|trtllm-llama"; then
+        echo "[OK] LLM server is running"
     else
-        echo "[WARN] NIM server (LLM) may not be running"
+        echo "[WARN] LLM server may not be running"
         echo ""
-        echo "To start NIM:"
+        echo "To start LLM (DGX Spark 70B):"
+        echo "  ${SCRIPT_DIR}/voice_assistant/nim_start_70b_spark.sh"
+        echo ""
+        echo "To start LLM (8B):"
         echo "  ${SCRIPT_DIR}/voice_assistant/nim_start.sh"
         echo ""
         echo "Or run without LLM using keyword matching:"

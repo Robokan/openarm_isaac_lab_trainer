@@ -46,11 +46,12 @@ fi
 
 # Check if NIM is running locally (skip if using remote)
 if [[ "$*" != *"--nim-url"* ]]; then
-    if docker ps 2>/dev/null | grep -q nim-llama; then
-        echo "[OK] NIM server is running locally"
+    if docker ps 2>/dev/null | grep -qE "nim-llama|trtllm-llama"; then
+        echo "[OK] LLM server is running locally"
     else
-        echo "[INFO] NIM not running locally - using keyword matching"
-        echo "  For LLM: ./scripts/voice_assistant/nim_start.sh"
+        echo "[INFO] LLM not running locally - using keyword matching"
+        echo "  For LLM (DGX Spark): ./scripts/voice_assistant/nim_start_70b_spark.sh"
+        echo "  For LLM (8B):        ./scripts/voice_assistant/nim_start.sh"
         echo ""
     fi
 fi

@@ -2883,8 +2883,8 @@ def run_teleop(env, args):
                         lerobot_recording = True
                         os.makedirs(lerobot_output_dir, exist_ok=True)
                         
-                        # Initialize episode frame buffer
-                        num_joints = robot.data.joint_pos.shape[1]
+                        # Initialize episode frame buffer (16-dim ALOHA format)
+                        num_joints = 16
                         fps = int(1.0 / unwrapped.sim.get_physics_dt())
                         
                         # Capture initial conditions
@@ -3161,8 +3161,8 @@ def run_teleop(env, args):
                     lerobot_recording = True
                     os.makedirs(lerobot_output_dir, exist_ok=True)
                     
-                    # Initialize episode frame buffer
-                    num_joints = robot.data.joint_pos.shape[1]
+                    # Initialize episode frame buffer (16-dim ALOHA format)
+                    num_joints = 16
                     fps = int(1.0 / unwrapped.sim.get_physics_dt())
                     
                     # Capture initial conditions
@@ -3839,31 +3839,25 @@ def run_teleop(env, args):
             # LeRobot: Capture frame if recording (only when tracking is active)
             if lerobot_recording and lerobot_current_episode is not None and vr_tracking_active:
                 
-                # Get current joint positions (observation state)
+                # Build 16-dim ALOHA-style state: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
                 joint_pos = robot.data.joint_pos[0].cpu().numpy().astype(np.float32)
+                left_arm_state = joint_pos[list(left_arm_joint_ids)]
+                right_arm_state = joint_pos[list(right_arm_joint_ids)]
+                left_grip_state = np.array([joint_pos[left_gripper_ids[0]]], dtype=np.float32)
+                right_grip_state = np.array([joint_pos[right_gripper_ids[0]]], dtype=np.float32)
+                state_16 = np.concatenate([left_arm_state, left_grip_state, right_arm_state, right_grip_state])
                 
-                # Action = commanded joint targets from IK + gripper targets
-                # Build full action array with the same shape as observation
-                action = joint_pos.copy()  # Start with current state
-                
-                # Overwrite arm joints with the IK-computed targets (what we commanded)
-                action[left_arm_joint_ids] = left_joint_des[0].cpu().numpy().astype(np.float32)
-                action[right_arm_joint_ids] = right_joint_des[0].cpu().numpy().astype(np.float32)
-                
-                # Overwrite gripper joints with gripper targets
-                if left_gripper_ids:
-                    left_gripper_target = gripper_open_pos * (1.0 - left_trigger)
-                    for gid in left_gripper_ids:
-                        action[gid] = left_gripper_target
-                if right_gripper_ids:
-                    right_gripper_target = gripper_open_pos * (1.0 - right_trigger)
-                    for gid in right_gripper_ids:
-                        action[gid] = right_gripper_target
+                # Build 16-dim action: IK targets for arms, gripper targets for grippers
+                left_arm_action = left_joint_des[0].cpu().numpy().astype(np.float32)
+                right_arm_action = right_joint_des[0].cpu().numpy().astype(np.float32)
+                left_grip_action = np.array([gripper_open_pos * (1.0 - left_trigger)], dtype=np.float32)
+                right_grip_action = np.array([gripper_open_pos * (1.0 - right_trigger)], dtype=np.float32)
+                action_16 = np.concatenate([left_arm_action, left_grip_action, right_arm_action, right_grip_action])
                 
                 # Build frame dict
                 frame = {
-                    "observation.state": joint_pos.copy(),
-                    "action": action.copy(),
+                    "observation.state": state_16.copy(),
+                    "action": action_16.copy(),
                 }
                 
                 # Record object positions/orientations using Isaac Lab RigidObject API

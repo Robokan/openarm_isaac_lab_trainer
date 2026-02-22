@@ -25,37 +25,45 @@ if ! docker ps --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     exit 1
 fi
 
-# Data directory inside container
-DATA_DIR="/workspace/sparkpack/openarm_isaac_lab_trainer/vla_teleop_data"
-
-# Check if data exists
-docker exec ${CONTAINER_NAME} bash -c "
-    if [ ! -d '$DATA_DIR' ]; then
-        # Check alternate location
-        ALT_DIR='/workspace/sparkpack/vla_teleop_data'
-        if [ -d \"\$ALT_DIR\" ]; then
-            DATA_DIR=\"\$ALT_DIR\"
-        else
-            echo 'Error: No data directory found at:'
-            echo '  $DATA_DIR'
-            echo '  \$ALT_DIR'
-            echo 'Record some teleoperation data first.'
-            exit 1
+# Data directory - check multiple locations (host paths mapped into container)
+# Priority: 1) LeRobot format in repo, 2) raw teleop in repo, 3) home datasets dir
+find_data_dir() {
+    local candidates=(
+        "/workspace/sparkpack/openarm_isaac_lab_trainer/vla_teleop_data"
+        "/workspace/sparkpack/vla_teleop_data"
+    )
+    for dir in "${candidates[@]}"; do
+        # LeRobot native format (meta/info.json)
+        if docker exec ${CONTAINER_NAME} test -f "${dir}/meta/info.json" 2>/dev/null; then
+            echo "$dir"
+            return
         fi
-    fi
-    
-    # List available episodes
-    EPISODES_DIR=\"\${DATA_DIR:-$DATA_DIR}/episodes\"
-    if [ -d \"\$EPISODES_DIR\" ]; then
-        echo 'Available episodes:'
-        for ep in \"\$EPISODES_DIR\"/episode_*; do
-            if [ -d \"\$ep\" ]; then
-                echo \"  - \$(basename \$ep)\"
-            fi
-        done
-        echo ''
-    fi
-"
+        # Fallback format (episodes/ directory)
+        if docker exec ${CONTAINER_NAME} test -d "${dir}/episodes" 2>/dev/null; then
+            echo "$dir"
+            return
+        fi
+    done
+    echo ""
+}
+
+DATA_DIR="$(find_data_dir)"
+if [ -z "$DATA_DIR" ]; then
+    echo "Error: No teleop data found. Searched:"
+    echo "  /workspace/sparkpack/openarm_isaac_lab_trainer/vla_teleop_data"
+    echo "  /workspace/sparkpack/vla_teleop_data"
+    echo ""
+    echo "Record some teleoperation data first with teleop_xr.sh"
+    exit 1
+fi
+
+echo "Using data: ${DATA_DIR}"
+
+# Build extra args string with proper quoting
+EXTRA_ARGS=""
+for arg in "$@"; do
+    EXTRA_ARGS="${EXTRA_ARGS} $(printf '%q' "$arg")"
+done
 
 # Run the playback script
 docker exec -it ${CONTAINER_NAME} bash -c "
@@ -71,5 +79,5 @@ docker exec -it ${CONTAINER_NAME} bash -c "
         \"\$DATA_DIR\" \
         --replay \
         --real-time \
-        $@
+        ${EXTRA_ARGS}
 "
