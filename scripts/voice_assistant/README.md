@@ -21,21 +21,24 @@ JAX is an AI voice assistant for controlling OpenArm robots through natural lang
 ### 1. Install NVIDIA Riva (ASR/TTS)
 
 ```bash
-# Download Riva quickstart
-ngc registry resource download-version nvidia/riva/riva_quickstart:2.18.0
+# Download Riva quickstart (2.19 has Magpie TTS - more natural voices)
+ngc registry resource download-version nvidia/riva/riva_quickstart:2.19.0
 
 # Navigate to Riva directory
-cd riva_quickstart_v2.18.0
+cd ~/riva/riva_quickstart_v2.19.0
 
-# Configure Riva (edit config.sh if needed)
-# Default enables ASR and TTS for en-US
+# Configure for Magpie TTS (already configured if using our setup):
+# tts_model=("magpie")
+# tts_language_code=("multi")
 
-# Initialize (downloads models - takes a while)
+# Initialize (downloads Magpie models - takes a while)
 bash riva_init.sh
 
 # Start Riva server
 bash riva_start.sh
 ```
+
+**Note:** Magpie TTS provides more natural, expressive voices with emotional tones (Calm, Happy, Neutral, etc.).
 
 Verify Riva is running:
 ```bash
@@ -197,7 +200,7 @@ For systems with 40GB+ VRAM (e.g., NVIDIA Thor):
 
 | Component | VRAM |
 |-----------|------|
-| Riva ASR/TTS | ~2-4 GB |
+| Riva ASR/TTS (Magpie) | ~4-6 GB |
 | NIM 8B (FP8) | ~10 GB |
 | NIM 70B | ~40 GB |
 
@@ -217,7 +220,7 @@ sudo apt install portaudio19-dev
 # Check Riva is running
 docker ps | grep riva
 # Restart if needed
-cd ~/riva/riva_quickstart_v2.18.0
+cd ~/riva/riva_quickstart_v2.19.0
 bash riva_stop.sh && bash riva_start.sh
 ```
 
@@ -225,7 +228,7 @@ bash riva_stop.sh && bash riva_start.sh
 ```bash
 # Check NIM is running
 curl http://localhost:8000/v1/models
-# Restart if needed
+# Restart if neededEE
 ./nim_start.sh
 ```
 

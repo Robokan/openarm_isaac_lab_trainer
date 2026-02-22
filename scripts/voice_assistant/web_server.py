@@ -392,7 +392,7 @@ class JAXWebServer:
             
             responses = self.tts_service.synthesize_online(
                 text,
-                voice_name="English-US.Male-1",
+                voice_name="Magpie-Multilingual.EN-US.Male.Calm",
                 language_code="en-US",
                 sample_rate_hz=22050,
                 encoding=riva.client.AudioEncoding.LINEAR_PCM,
