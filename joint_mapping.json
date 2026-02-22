@@ -1,0 +1,65 @@
+{
+  "total_joints": 22,
+  "note": "Runtime ordering groups joints by actuator (arms first, then grippers), NOT by USD scene graph traversal",
+  "all_joint_names": [
+    "openarm_left_joint1",
+    "openarm_left_joint2",
+    "openarm_left_joint3",
+    "openarm_left_joint4",
+    "openarm_left_joint5",
+    "openarm_left_joint6",
+    "openarm_left_joint7",
+    "openarm_right_joint1",
+    "openarm_right_joint2",
+    "openarm_right_joint3",
+    "openarm_right_joint4",
+    "openarm_right_joint5",
+    "openarm_right_joint6",
+    "openarm_right_joint7",
+    "openarm_left_finger_joint1",
+    "openarm_left_finger_joint2",
+    "openarm_left_hand",
+    "openarm_right_finger_joint1",
+    "openarm_right_finger_joint2",
+    "openarm_right_hand",
+    "openarm_left_ee_tcp_joint",
+    "openarm_right_ee_tcp_joint"
+  ],
+  "left_arm_ids": [0, 1, 2, 3, 4, 5, 6],
+  "right_arm_ids": [7, 8, 9, 10, 11, 12, 13],
+  "left_gripper_ids": [14, 15],
+  "right_gripper_ids": [17, 18],
+  "left_arm_names": [
+    "openarm_left_joint1",
+    "openarm_left_joint2",
+    "openarm_left_joint3",
+    "openarm_left_joint4",
+    "openarm_left_joint5",
+    "openarm_left_joint6",
+    "openarm_left_joint7"
+  ],
+  "right_arm_names": [
+    "openarm_right_joint1",
+    "openarm_right_joint2",
+    "openarm_right_joint3",
+    "openarm_right_joint4",
+    "openarm_right_joint5",
+    "openarm_right_joint6",
+    "openarm_right_joint7"
+  ],
+  "left_gripper_names": [
+    "openarm_left_finger_joint1",
+    "openarm_left_finger_joint2"
+  ],
+  "right_gripper_names": [
+    "openarm_right_finger_joint1",
+    "openarm_right_finger_joint2"
+  ],
+  "aloha_16_mapping": {
+    "description": "[left_arm(7), left_grip(1), right_arm(7), right_grip(1)]",
+    "left_arm_indices": [0, 1, 2, 3, 4, 5, 6],
+    "left_grip_index": 14,
+    "right_arm_indices": [7, 8, 9, 10, 11, 12, 13],
+    "right_grip_index": 17
+  }
+}

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+from dataclasses import MISSING
 
 from isaaclab.assets import AssetBaseCfg, RigidObjectCfg
 from isaaclab.managers import SceneEntityCfg
@@ -23,12 +24,14 @@ import isaaclab.sim as sim_utils
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 
+from isaaclab.managers import ActionTermCfg as ActionTerm
+
 from .. import mdp
 from ..reach_env_cfg import (
     ReachEnvCfg,
 )
 
-from source.openarm.openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
+from openarm.tasks.manager_based.openarm_manipulation.assets.openarm_bimanual import (
     OPEN_ARM_HIGH_PD_CFG,
     OPEN_ARM_FACTORY_HIGH_PD_CFG,
 )
@@ -242,6 +245,28 @@ class TeleopSceneCfg(ReachSceneCfg):
 
 
 ##
+# VLA-compatible 16 DOF action config
+##
+
+
+@configclass
+class TeleopActionsCfg:
+    """16 DOF action config matching VLA output format.
+
+    Order: [left_arm(7), left_gripper(1), right_arm(7), right_gripper(1)]
+
+    Arms use scale=1.0, use_default_offset=False so VLA absolute joint
+    positions map directly.  Grippers use scale=0.044 so VLA [0,1] maps
+    to sim [0, 0.044].
+    """
+
+    left_arm_action: ActionTerm = MISSING
+    left_gripper_action: ActionTerm = MISSING
+    right_arm_action: ActionTerm = MISSING
+    right_gripper_action: ActionTerm = MISSING
+
+
+##
 # Environment configuration
 ##
 
@@ -442,6 +467,53 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
                 pitch=(math.pi - math.pi / 4, math.pi + math.pi / 4),
                 yaw=(math.pi - math.pi / 4, math.pi + math.pi / 4),
             ),
+        )
+
+        # 16 DOF actions for VLA compatibility (absolute positions, no offset)
+        self.actions = TeleopActionsCfg()
+
+        self.actions.left_arm_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=[
+                "openarm_left_joint1",
+                "openarm_left_joint2",
+                "openarm_left_joint3",
+                "openarm_left_joint4",
+                "openarm_left_joint5",
+                "openarm_left_joint6",
+                "openarm_left_joint7",
+            ],
+            scale=1.0,
+            use_default_offset=False,
+        )
+
+        self.actions.left_gripper_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=["openarm_left_finger_joint.*"],
+            scale=1.0,
+            use_default_offset=False,
+        )
+
+        self.actions.right_arm_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=[
+                "openarm_right_joint1",
+                "openarm_right_joint2",
+                "openarm_right_joint3",
+                "openarm_right_joint4",
+                "openarm_right_joint5",
+                "openarm_right_joint6",
+                "openarm_right_joint7",
+            ],
+            scale=1.0,
+            use_default_offset=False,
+        )
+
+        self.actions.right_gripper_action = mdp.JointPositionActionCfg(
+            asset_name="robot",
+            joint_names=["openarm_right_finger_joint.*"],
+            scale=1.0,
+            use_default_offset=False,
         )
 
         # Randomize starting joint pose (arms only, smaller offsets)

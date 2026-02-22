@@ -93,9 +93,10 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
 class JAXWebServer:
     """Web server for JAX voice interface."""
     
-    def __init__(self, port: int = 8080, riva_server: str = "localhost:50051", nim_url: str = "http://localhost:8000"):
+    def __init__(self, port: int = 8080, riva_server: str = "localhost:50051", tts_server: str = None, nim_url: str = "http://localhost:8000"):
         self.port = port
         self.riva_server = riva_server
+        self.tts_server = tts_server if tts_server else riva_server
         self.nim_url = nim_url
         self.nim_available = False
         self.app = web.Application()
@@ -145,10 +146,12 @@ class JAXWebServer:
         try:
             import riva.client
             
-            auth = riva.client.Auth(uri=self.riva_server)
-            self.asr_service = riva.client.ASRService(auth)
-            self.tts_service = riva.client.SpeechSynthesisService(auth)
-            print(f"[Riva] Connected to {self.riva_server}")
+            auth_asr = riva.client.Auth(uri=self.riva_server)
+            self.asr_service = riva.client.ASRService(auth_asr)
+            print(f"[Riva] ASR connected to {self.riva_server}")
+            auth_tts = riva.client.Auth(uri=self.tts_server)
+            self.tts_service = riva.client.SpeechSynthesisService(auth_tts)
+            print(f"[Riva] TTS connected to {self.tts_server}")
         except Exception as e:
             print(f"[Riva] Could not connect: {e}")
             print("[Riva] ASR/TTS will not work until Riva is running")
@@ -827,12 +830,14 @@ def main():
     parser = argparse.ArgumentParser(description="JAX Web Interface")
     parser.add_argument("--port", type=int, default=8080, help="Web server port")
     parser.add_argument("--riva-server", type=str, default="localhost:50051",
-                        help="Riva gRPC server address")
+                        help="Riva ASR gRPC server address")
+    parser.add_argument("--tts-server", type=str, default=None,
+                        help="Riva TTS gRPC server address (defaults to --riva-server)")
     parser.add_argument("--nim-url", type=str, default="http://localhost:8000",
                         help="NIM server URL for Llama inference")
     args = parser.parse_args()
     
-    server = JAXWebServer(port=args.port, riva_server=args.riva_server, nim_url=args.nim_url)
+    server = JAXWebServer(port=args.port, riva_server=args.riva_server, tts_server=args.tts_server, nim_url=args.nim_url)
     server.run()
 
 

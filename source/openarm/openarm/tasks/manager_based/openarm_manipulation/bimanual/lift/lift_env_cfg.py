@@ -49,7 +49,7 @@ from . import mdp
 import math
 
 # Local mug assets (with collision meshes)
-from source.openarm.openarm.tasks.manager_based.openarm_manipulation import OPENARM_ROOT_DIR
+from openarm.tasks.manager_based.openarm_manipulation import OPENARM_ROOT_DIR
 MUG_ASSETS = [
     f"{OPENARM_ROOT_DIR}/usds/mugs/1.usd",
     f"{OPENARM_ROOT_DIR}/usds/mugs/2.usd",
