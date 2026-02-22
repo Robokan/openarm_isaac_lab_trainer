@@ -14,7 +14,7 @@ Commands recognized:
     - "stop recording" / "end recording" -> stop_recording  
     - "drop object" / "spawn" -> spawn_object
     - "reset" / "clear objects" -> reset_objects
-    - "the task is ..." / "set prompt ..." -> set_prompt
+    - "the task is ..." / "set prompt ..." / "set label to ..." -> set_prompt
 """
 
 import argparse
@@ -57,7 +57,10 @@ Valid commands:
   - type: "cubes", "mugs", or "fruits" (category)
   - item: specific item name (e.g., "lemon", "orange", "cube", "mug")
 - reset_objects: User wants to clear/reset all objects
+- reset_teleop: User wants to reset the teleop/robot to initial position (requires VR recalibration)
 - set_prompt: User wants to set the task description (extract the task text)
+- get_episode_count: User wants to know how many episodes have been recorded
+  - date_filter: optional, "today", "yesterday", "this_week", or "all" (default: "all")
 - unknown: Command not recognized
 
 Available items:
@@ -110,6 +113,36 @@ User: "the task is pick up the red apple"
 
 User: "set the prompt to sort items by color"
 {"command": "set_prompt", "prompt": "sort items by color"}
+
+User: "set label to pick up arms and find lemon"
+{"command": "set_prompt", "prompt": "pick up arms and find lemon"}
+
+User: "the label is grasp the orange"
+{"command": "set_prompt", "prompt": "grasp the orange"}
+
+User: "reset teleop"
+{"command": "reset_teleop"}
+
+User: "reset robot"
+{"command": "reset_teleop"}
+
+User: "go back to initial position"
+{"command": "reset_teleop"}
+
+User: "how many episodes"
+{"command": "get_episode_count"}
+
+User: "episode count"
+{"command": "get_episode_count"}
+
+User: "how many episodes recorded today"
+{"command": "get_episode_count", "date_filter": "today"}
+
+User: "episodes recorded yesterday"
+{"command": "get_episode_count", "date_filter": "yesterday"}
+
+User: "how many recordings this week"
+{"command": "get_episode_count", "date_filter": "this_week"}
 
 User: "hello how are you"
 {"command": "unknown"}
@@ -247,6 +280,18 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
                                       "what's the prompt", "what is the prompt"]):
             return VoiceCommand(command="get_status", raw_text=text)
         
+        # Episode count (with optional date filter)
+        if any(kw in text for kw in ["how many episode", "episode count", "number of episode",
+                                      "total episode", "episodes recorded", "how many recording"]):
+            args = {}
+            if "today" in text:
+                args["date_filter"] = "today"
+            elif "yesterday" in text:
+                args["date_filter"] = "yesterday"
+            elif "this week" in text or "week" in text:
+                args["date_filter"] = "this_week"
+            return VoiceCommand(command="get_episode_count", args=args if args else None, raw_text=text)
+        
         # Object commands
         if any(kw in text for kw in ["drop", "spawn", "place", "add", "give me", "get me"]):
             obj_type = None
@@ -269,19 +314,36 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
                 elif "fruit" in text:
                     obj_type = "fruits"
             
-            args = {}
-            if obj_type:
-                args["type"] = obj_type
-            if item:
-                args["item"] = item
-            
-            return VoiceCommand(command="spawn_object", args=args if args else None, raw_text=text)
+            # Only send spawn command if we recognized a valid object
+            if obj_type or item:
+                args = {}
+                if obj_type:
+                    args["type"] = obj_type
+                if item:
+                    args["item"] = item
+                return VoiceCommand(command="spawn_object", args=args, raw_text=text)
+            else:
+                # Unknown object - return error response instead of sending to teleop
+                return VoiceCommand(command="invalid_object", raw_text=text)
         
-        if any(kw in text for kw in ["reset", "clear", "remove all", "clean"]):
+        # Reset teleop (back to initial position) - check before reset_objects
+        if any(kw in text for kw in ["reset teleop", "reset robot", "reset position", 
+                                      "initial position", "restart teleop", "recalibrate"]):
+            return VoiceCommand(command="reset_teleop", raw_text=text)
+        
+        # Reset objects (clear scene)
+        if any(kw in text for kw in ["reset objects", "clear objects", "clear the table",
+                                      "remove all", "clean up", "clear scene"]):
             return VoiceCommand(command="reset_objects", raw_text=text)
         
-        # Prompt commands
-        prompt_triggers = ["task is", "set prompt", "the prompt is", "set task"]
+        # Generic "reset" or "clear" defaults to reset_objects for backward compatibility
+        if text.strip() in ["reset", "clear"]:
+            return VoiceCommand(command="reset_objects", raw_text=text)
+        
+        # Prompt/Label commands
+        prompt_triggers = ["task is", "set the prompt to", "set prompt to", "set prompt", 
+                          "the prompt is", "set task", "set label to", "label is", 
+                          "the label is", "set the label to"]
         for trigger in prompt_triggers:
             if trigger in text:
                 idx = text.find(trigger) + len(trigger)
@@ -298,7 +360,7 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
     def chat(self, text: str) -> str:
         """Generate conversational response using NIM."""
         if not self.nim_available:
-            return "I didn't understand that. Try saying start recording, drop a lemon, or status."
+            return "I didn't catch that."
         
         try:
             response = requests.post(
@@ -322,7 +384,7 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
         except Exception as e:
             print(f"[NIM] Chat error: {e}")
         
-        return "I didn't understand that. Try saying start recording, drop a lemon, or status."
+        return "I didn't catch that."
 
 
 class RivaASR:
@@ -448,22 +510,52 @@ class AudioCapture:
 
 
 class RivaTTS:
-    """NVIDIA Riva Text-to-Speech."""
+    """NVIDIA Riva Text-to-Speech with auto-detection of Riva version."""
     
     def __init__(self, server: str = "localhost:50051"):
         self.server = server
         self.sample_rate = 22050
         self.tts_service = None
+        self.voice_name = "English-US.Male-1"  # Default for Riva 2.18
         
         try:
             import riva.client
             
             self.auth = riva.client.Auth(uri=server)
             self.tts_service = riva.client.SpeechSynthesisService(self.auth)
-            print(f"[TTS] Connected to Riva TTS")
+            
+            # Auto-detect Riva version by checking available voices
+            self._detect_voice()
+            print(f"[TTS] Connected to Riva TTS, using voice: {self.voice_name}")
             
         except Exception as e:
             print(f"[TTS] Could not connect: {e}")
+    
+    def _detect_voice(self):
+        """Detect available voices and select appropriate one."""
+        try:
+            # Try Magpie voice first (Riva 2.19)
+            import riva.client
+            test_voices = [
+                "Magpie-Multilingual.EN-US.Male.Male-1",  # Riva 2.19 Magpie
+                "English-US.Male-1",  # Riva 2.18 FastPitch
+            ]
+            # We'll try the first one and fall back if it fails
+            # For now, check Docker to determine version
+            import subprocess
+            result = subprocess.run(
+                ["docker", "ps", "--format", "{{.Image}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "2.19" in result.stdout:
+                self.voice_name = "Magpie-Multilingual.EN-US.Male.Male-1"
+                print("[TTS] Detected Riva 2.19 (Magpie)")
+            else:
+                self.voice_name = "English-US.Male-1"
+                print("[TTS] Detected Riva 2.18 (FastPitch)")
+        except Exception as e:
+            print(f"[TTS] Voice detection failed, using default: {e}")
+            self.voice_name = "English-US.Male-1"
     
     def speak(self, text: str):
         """Synthesize and play speech."""
@@ -477,7 +569,7 @@ class RivaTTS:
             
             responses = self.tts_service.synthesize_online(
                 text,
-                voice_name="Magpie-Multilingual.EN-US.Male.Male-1",
+                voice_name=self.voice_name,
                 language_code="en-US",
                 sample_rate_hz=self.sample_rate,
                 encoding=riva.client.AudioEncoding.LINEAR_PCM,
@@ -562,8 +654,11 @@ class VoiceServer:
         print("  - 'Start recording' / 'Stop recording'")
         print("  - 'Drop a lemon' / 'Spawn an orange'")
         print("  - 'Drop a cube' / 'Spawn a mug'")
-        print("  - 'Reset objects'")
-        print("  - 'The task is sort fruit into bins'")
+        print("  - 'Reset objects' / 'Clear the table'")
+        print("  - 'Reset teleop' / 'Reset robot' (back to initial position)")
+        print("  - 'Set label to pick up the lemon' / 'The task is sort fruit'")
+        print("  - 'Status' / 'Am I recording?'")
+        print("  - 'How many episodes?' / 'Episodes recorded today/yesterday'")
         print("\nAvailable fruits: orange, lemon, lime, avocado, pomegranate, lychee")
         print("\nPress Ctrl+C to quit\n")
     
@@ -583,8 +678,14 @@ class VoiceServer:
                     print(f" {cmd.args}", end="")
                 print()
                 
+                # Handle invalid object command locally (don't send to teleop)
+                if cmd.command == "invalid_object":
+                    response = "I don't recognize that object. Available: orange, lemon, lime, avocado, pomegranate, lychee, cube, or mug."
+                    print(f"[JAX] {response}")
+                    if self.tts:
+                        self.tts.speak(response)
                 # Check if this is a robot command
-                if self._is_robot_command(cmd.command):
+                elif self._is_robot_command(cmd.command):
                     # Send via ZMQ and track that we're waiting for response
                     self.zmq_socket.send_json(cmd.to_json())
                     self.pending_command_time = time.time()
@@ -649,7 +750,8 @@ class VoiceServer:
     def _is_robot_command(self, command: str) -> bool:
         """Check if command requires teleop to be running."""
         return command in ["start_recording", "stop_recording", "spawn_object", 
-                          "reset_objects", "set_prompt", "get_status"]
+                          "reset_objects", "reset_teleop", "set_prompt", "get_status",
+                          "get_episode_count"]
     
     def run(self):
         """Run the voice server."""

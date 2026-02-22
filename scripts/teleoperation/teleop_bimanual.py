@@ -2713,6 +2713,74 @@ def run_teleop(env, args):
                 print(f"[Voice] Task set to: {lerobot_task_text}")
                 send_voice_response(f"Task set to: {prompt}")
                 
+        elif command == "reset_teleop":
+            # Reset teleop to initial position
+            nonlocal vr_tracking_active
+            
+            # Reset robot joints to default positions
+            all_joint_pos = robot.data.default_joint_pos.clone()
+            all_joint_vel = torch.zeros_like(robot.data.default_joint_vel)
+            robot.write_joint_state_to_sim(all_joint_pos, all_joint_vel)
+            robot.set_joint_position_target(all_joint_pos)
+            robot.write_data_to_sim()
+            
+            # Open grippers
+            if left_gripper_ids:
+                left_open = torch.full((1, len(left_gripper_ids)), gripper_open_pos, device=sim_device)
+                robot.write_joint_position_to_sim(left_open, joint_ids=left_gripper_ids)
+                robot.set_joint_position_target(left_open, joint_ids=left_gripper_ids)
+            if right_gripper_ids:
+                right_open = torch.full((1, len(right_gripper_ids)), gripper_open_pos, device=sim_device)
+                robot.write_joint_position_to_sim(right_open, joint_ids=right_gripper_ids)
+                robot.set_joint_position_target(right_open, joint_ids=right_gripper_ids)
+            
+            # Step sim to let reset settle
+            for _ in range(5):
+                unwrapped.sim.step(render=False)
+                robot.update(unwrapped.sim.get_physics_dt())
+            unwrapped.sim.step(render=True)
+            robot.update(unwrapped.sim.get_physics_dt())
+            
+            # Read back actual EE positions and sync input device (target markers)
+            _left_ee_w = robot.data.body_pos_w[:, left_body_idx]
+            _left_eq_w = robot.data.body_quat_w[:, left_body_idx]
+            _right_ee_w = robot.data.body_pos_w[:, right_body_idx]
+            _right_eq_w = robot.data.body_quat_w[:, right_body_idx]
+            
+            if hasattr(input_device, 'left_pose'):
+                input_device.left_pose[:3] = _left_ee_w[0].cpu().numpy()
+                input_device.left_pose[3:7] = _left_eq_w[0].cpu().numpy()
+                input_device.right_pose[:3] = _right_ee_w[0].cpu().numpy()
+                input_device.right_pose[3:7] = _right_eq_w[0].cpu().numpy()
+            if hasattr(input_device, 'left_euler'):
+                def _quat_to_euler_voice(q):
+                    w, x, y, z = q[0], q[1], q[2], q[3]
+                    roll = np.arctan2(2.0*(w*x + y*z), 1.0 - 2.0*(x*x + y*y))
+                    pitch = np.arcsin(np.clip(2.0*(w*y - z*x), -1.0, 1.0))
+                    yaw = np.arctan2(2.0*(w*z + x*y), 1.0 - 2.0*(y*y + z*z))
+                    return np.array([roll, pitch, yaw])
+                input_device.left_euler[:] = _quat_to_euler_voice(input_device.left_pose[3:7])
+                input_device.right_euler[:] = _quat_to_euler_voice(input_device.right_pose[3:7])
+            if hasattr(input_device, 'left_gripper'):
+                input_device.left_gripper = 0.0
+                input_device.right_gripper = 0.0
+            
+            # Reset IK controllers
+            left_ik_controller.reset()
+            right_ik_controller.reset()
+            
+            # Only deactivate tracking in VR mode (requires recalibration)
+            if args.input == "xr":
+                vr_tracking_active = False
+                print(f"\n{'='*60}")
+                print("[VR] TELEOP RESET - Arms returned to initial position")
+                print("[VR] Press any button or move joystick to reactivate tracking")
+                print(f"{'='*60}\n")
+                send_voice_response("Robot reset. Press a button to reactivate tracking.")
+            else:
+                print("[TELEOP] Robot reset to initial position")
+                send_voice_response("Robot reset to initial position.")
+            
         elif command == "get_status":
             # Report current status
             status_parts = []
@@ -2734,6 +2802,72 @@ def run_teleop(env, args):
             status_msg = ". ".join(status_parts)
             print(f"[Voice] Status: {status_msg}")
             send_voice_response(status_msg)
+            
+        elif command == "get_episode_count":
+            # Report episode count (optionally filtered by date)
+            date_filter = cmd.get("date_filter", "all")
+            
+            # Count episodes, optionally filtering by date
+            episodes_dir = os.path.join(lerobot_output_dir, "episodes")
+            count = 0
+            filter_label = ""
+            
+            if date_filter == "all":
+                count = lerobot_episode_count
+                filter_label = ""
+            else:
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                
+                if date_filter == "today":
+                    target_date = now.date()
+                    filter_label = " today"
+                elif date_filter == "yesterday":
+                    target_date = (now - timedelta(days=1)).date()
+                    filter_label = " yesterday"
+                elif date_filter == "this_week":
+                    week_start = (now - timedelta(days=now.weekday())).date()
+                    filter_label = " this week"
+                else:
+                    target_date = None
+                    filter_label = ""
+                
+                # Scan episode directories and check recorded_at
+                if os.path.exists(episodes_dir):
+                    for ep_name in os.listdir(episodes_dir):
+                        ep_path = os.path.join(episodes_dir, ep_name)
+                        meta_path = os.path.join(ep_path, "metadata.json")
+                        if os.path.isdir(ep_path) and os.path.exists(meta_path):
+                            try:
+                                with open(meta_path, "r") as f:
+                                    meta = json.load(f)
+                                recorded_at = meta.get("recorded_at")
+                                if recorded_at:
+                                    ep_date = datetime.fromisoformat(recorded_at).date()
+                                    if date_filter == "this_week":
+                                        if ep_date >= week_start:
+                                            count += 1
+                                    elif target_date and ep_date == target_date:
+                                        count += 1
+                                else:
+                                    # No timestamp, use file modification time as fallback
+                                    mtime = os.path.getmtime(meta_path)
+                                    ep_date = datetime.fromtimestamp(mtime).date()
+                                    if date_filter == "this_week":
+                                        if ep_date >= week_start:
+                                            count += 1
+                                    elif target_date and ep_date == target_date:
+                                        count += 1
+                            except Exception:
+                                pass
+            
+            print(f"[Voice] Episode count{filter_label}: {count}")
+            if count == 0:
+                send_voice_response(f"No episodes recorded{filter_label}.")
+            elif count == 1:
+                send_voice_response(f"1 episode recorded{filter_label}.")
+            else:
+                send_voice_response(f"{count} episodes recorded{filter_label}.")
             
         else:
             print(f"[Voice] Unknown command: {command}")
@@ -3077,6 +3211,7 @@ def run_teleop(env, args):
                                 print(f"[LeRobot] No video collected (use --collect-video or play_teleop_data.sh --collect-video)")
                             
                             # Save metadata
+                            from datetime import datetime
                             episode_metadata = {
                                 "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
                                 "task_text": lerobot_task_text,
@@ -3084,6 +3219,7 @@ def run_teleop(env, args):
                                 "num_frames": num_frames,
                                 "duration_seconds": num_frames / fps,
                                 "num_joints": lerobot_current_episode["num_joints"],
+                                "recorded_at": datetime.now().isoformat(),
                             }
                             with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
                                 json.dump(episode_metadata, f, indent=2)
@@ -3349,6 +3485,7 @@ def run_teleop(env, args):
                         else:
                             print(f"[LeRobot] No video collected (use --collect-video or play_teleop_data.sh --collect-video)")
                         
+                        from datetime import datetime
                         episode_metadata = {
                             "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
                             "task_text": lerobot_task_text,
@@ -3356,6 +3493,7 @@ def run_teleop(env, args):
                             "num_frames": num_frames,
                             "duration_seconds": num_frames / fps,
                             "num_joints": lerobot_current_episode["num_joints"],
+                            "recorded_at": datetime.now().isoformat(),
                         }
                         with open(os.path.join(ep_dir, "metadata.json"), "w") as f:
                             json.dump(episode_metadata, f, indent=2)

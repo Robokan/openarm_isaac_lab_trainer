@@ -50,7 +50,10 @@ Valid commands:
   - type: "cubes", "mugs", or "fruits" (category)
   - item: specific item name (e.g., "lemon", "orange", "cube", "mug")
 - reset_objects: User wants to clear/reset all objects
+- reset_teleop: User wants to reset the teleop/robot to initial position (requires VR recalibration)
 - set_prompt: User wants to set the task description (extract the task text)
+- get_episode_count: User wants to know how many episodes have been recorded
+  - date_filter: optional, "today", "yesterday", "this_week", or "all" (default: "all")
 - unknown: Command not recognized
 
 Available items:
@@ -63,6 +66,11 @@ User: "start recording" -> {"command": "start_recording"}
 User: "drop a lemon" -> {"command": "spawn_object", "type": "fruits", "item": "lemon"}
 User: "status" -> {"command": "get_status"}
 User: "the task is pick up the apple" -> {"command": "set_prompt", "prompt": "pick up the apple"}
+User: "set label to grasp the orange" -> {"command": "set_prompt", "prompt": "grasp the orange"}
+User: "reset teleop" -> {"command": "reset_teleop"}
+User: "reset robot" -> {"command": "reset_teleop"}
+User: "how many episodes" -> {"command": "get_episode_count"}
+User: "episode count" -> {"command": "get_episode_count"}
 
 Return ONLY the JSON object, no other text."""
 
@@ -143,6 +151,7 @@ class JAXWebServer:
     
     def _init_riva(self):
         """Initialize Riva ASR and TTS."""
+        self.voice_name = "English-US.Male-1"  # Default for Riva 2.18
         try:
             import riva.client
             
@@ -152,9 +161,29 @@ class JAXWebServer:
             auth_tts = riva.client.Auth(uri=self.tts_server)
             self.tts_service = riva.client.SpeechSynthesisService(auth_tts)
             print(f"[Riva] TTS connected to {self.tts_server}")
+            
+            # Auto-detect Riva version
+            self._detect_voice()
         except Exception as e:
             print(f"[Riva] Could not connect: {e}")
             print("[Riva] ASR/TTS will not work until Riva is running")
+    
+    def _detect_voice(self):
+        """Detect Riva version and select appropriate voice."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["docker", "ps", "--format", "{{.Image}}"],
+                capture_output=True, text=True, timeout=5
+            )
+            if "2.19" in result.stdout:
+                self.voice_name = "Magpie-Multilingual.EN-US.Male.Male-1"
+                print("[Riva] Detected 2.19 (Magpie voice)")
+            else:
+                self.voice_name = "English-US.Male-1"
+                print("[Riva] Detected 2.18 (FastPitch voice)")
+        except Exception as e:
+            print(f"[Riva] Voice detection failed: {e}")
     
     async def handle_index(self, request):
         """Serve the main HTML page."""
@@ -243,6 +272,13 @@ class JAXWebServer:
         cmd = self._parse_command(text)
         
         if cmd["command"] != "unknown":
+            # Handle invalid object locally
+            if cmd["command"] == "invalid_object":
+                msg = "I don't recognize that object. Available: orange, lemon, lime, avocado, pomegranate, lychee, cube, or mug."
+                await ws.send_json({"type": "response", "message": msg})
+                await self._speak(ws, msg)
+                return
+            
             # Send to teleop
             self.zmq_pub.send_json(cmd)
             await ws.send_json({"type": "command", "command": cmd})
@@ -261,7 +297,7 @@ class JAXWebServer:
             if self.nim_available:
                 msg = self._chat_with_nim(text)
             else:
-                msg = "I didn't understand that. Try: start recording, drop a lemon, status"
+                msg = "I didn't catch that."
             await ws.send_json({"type": "response", "message": msg})
             await self._speak(ws, msg)
     
@@ -289,7 +325,7 @@ class JAXWebServer:
         except Exception as e:
             print(f"[NIM] Chat error: {e}")
         
-        return "I didn't understand that. Try: start recording, drop a lemon, status"
+        return "I didn't catch that."
     
     def _parse_command(self, text: str) -> dict:
         """Parse text into command using NIM or keyword fallback."""
@@ -356,18 +392,46 @@ class JAXWebServer:
                 return {"command": "spawn_object", "type": "cubes"}
             if "mug" in text or "cup" in text:
                 return {"command": "spawn_object", "type": "mugs"}
-            return {"command": "spawn_object"}
+            if "fruit" in text:
+                return {"command": "spawn_object", "type": "fruits"}
+            # Unknown object
+            return {"command": "invalid_object"}
         
-        if any(kw in text for kw in ["reset", "clear"]):
+        # Reset teleop (back to initial position)
+        if any(kw in text for kw in ["reset teleop", "reset robot", "reset position", 
+                                      "initial position", "restart teleop", "recalibrate"]):
+            return {"command": "reset_teleop"}
+        
+        # Reset objects (clear scene)
+        if any(kw in text for kw in ["reset objects", "clear objects", "clear the table",
+                                      "remove all", "clean up", "clear scene"]):
             return {"command": "reset_objects"}
         
-        # Prompt
-        for trigger in ["task is", "set prompt", "prompt is"]:
+        # Generic "reset" or "clear" defaults to reset_objects
+        if text.strip() in ["reset", "clear"]:
+            return {"command": "reset_objects"}
+        
+        # Prompt/Label
+        for trigger in ["task is", "set the prompt to", "set prompt to", "set prompt", 
+                        "prompt is", "set task", "set label to", "label is", 
+                        "the label is", "set the label to"]:
             if trigger in text:
                 idx = text.find(trigger) + len(trigger)
                 prompt = text[idx:].strip()
                 if prompt:
                     return {"command": "set_prompt", "prompt": prompt}
+        
+        # Episode count (with optional date filter)
+        if any(kw in text for kw in ["how many episode", "episode count", "number of episode",
+                                      "total episode", "episodes recorded", "how many recording"]):
+            result = {"command": "get_episode_count"}
+            if "today" in text:
+                result["date_filter"] = "today"
+            elif "yesterday" in text:
+                result["date_filter"] = "yesterday"
+            elif "this week" in text or "week" in text:
+                result["date_filter"] = "this_week"
+            return result
         
         return {"command": "unknown"}
     
@@ -395,7 +459,7 @@ class JAXWebServer:
             
             responses = self.tts_service.synthesize_online(
                 text,
-                voice_name="Magpie-Multilingual.EN-US.Male.Male-1",
+                voice_name=self.voice_name,
                 language_code="en-US",
                 sample_rate_hz=22050,
                 encoding=riva.client.AudioEncoding.LINEAR_PCM,
