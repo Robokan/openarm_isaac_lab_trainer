@@ -379,17 +379,28 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
     episode_dirs = sorted([d for d in os.listdir(episodes_dir) if d.startswith("episode_")])
     
     if episode_idx is not None:
-        # Find episode by name (episode_N) rather than list index
-        target_name = f"episode_{episode_idx}"
-        if target_name in episode_dirs:
-            episode_dirs = [target_name]
-        elif episode_idx < len(episode_dirs):
-            # Fall back to list index if name not found
-            episode_dirs = [episode_dirs[episode_idx]]
-        else:
-            print(f"[ERROR] Episode {episode_idx} not found. Available: {episode_dirs}")
+        # episode_idx can be a list of indices or a single int
+        if isinstance(episode_idx, int):
+            episode_idx = [episode_idx]
+        
+        # Filter to requested episodes
+        filtered_dirs = []
+        for idx in episode_idx:
+            target_name = f"episode_{idx}"
+            if target_name in episode_dirs:
+                filtered_dirs.append(target_name)
+            elif idx < len(episode_dirs):
+                filtered_dirs.append(episode_dirs[idx])
+            else:
+                print(f"[WARN] Episode {idx} not found, skipping")
+        
+        if not filtered_dirs:
+            print(f"[ERROR] No valid episodes found. Available: {episode_dirs}")
             simulation_app.close()
             return
+        
+        episode_dirs = filtered_dirs
+        print(f"[INFO] Playing {len(episode_dirs)} episodes: {episode_dirs}")
     
     # Load environment config
     from isaaclab_tasks.utils import parse_env_cfg
@@ -715,7 +726,45 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                 
                 robot = unwrapped.scene["robot"]
                 num_robot_joints = robot.num_joints
-                print(f"  [INFO] Action dim: {actions.shape[1]}, Robot joints: {num_robot_joints}")
+                action_dim = actions.shape[1]
+                print(f"  [INFO] Action dim: {action_dim}, Robot joints: {num_robot_joints}")
+                
+                # Create joint mapping for 16-dim ALOHA -> 22-dim robot
+                # ALOHA format: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+                need_joint_mapping = (action_dim == 16 and num_robot_joints != 16)
+                if need_joint_mapping:
+                    # Find joint IDs dynamically (same as teleop does)
+                    left_arm_joint_ids, _ = robot.find_joints([
+                        "openarm_left_joint1", "openarm_left_joint2", "openarm_left_joint3", "openarm_left_joint4",
+                        "openarm_left_joint5", "openarm_left_joint6", "openarm_left_joint7"
+                    ])
+                    right_arm_joint_ids, _ = robot.find_joints([
+                        "openarm_right_joint1", "openarm_right_joint2", "openarm_right_joint3", "openarm_right_joint4",
+                        "openarm_right_joint5", "openarm_right_joint6", "openarm_right_joint7"
+                    ])
+                    left_gripper_ids, _ = robot.find_joints("openarm_left_finger_joint.*")
+                    right_gripper_ids, _ = robot.find_joints("openarm_right_finger_joint.*")
+                    
+                    print(f"  [INFO] Using ALOHA->OpenArm joint mapping (16 -> {num_robot_joints})")
+                    print(f"  [INFO] Left arm IDs: {list(left_arm_joint_ids)}, Right arm IDs: {list(right_arm_joint_ids)}")
+                    print(f"  [INFO] Left grip IDs: {list(left_gripper_ids)}, Right grip IDs: {list(right_gripper_ids)}")
+                    
+                    def expand_to_robot_joints(aloha_16):
+                        """Expand 16-dim ALOHA state to full robot joints."""
+                        robot_joints = robot.data.default_joint_pos[0].cpu().numpy().copy()
+                        # Left arm: ALOHA[0:7]
+                        for i, jid in enumerate(left_arm_joint_ids):
+                            robot_joints[jid] = aloha_16[i]
+                        # Left gripper: ALOHA[7] (all gripper joints get same value)
+                        for jid in left_gripper_ids:
+                            robot_joints[jid] = aloha_16[7]
+                        # Right arm: ALOHA[8:15]
+                        for i, jid in enumerate(right_arm_joint_ids):
+                            robot_joints[jid] = aloha_16[8 + i]
+                        # Right gripper: ALOHA[15]
+                        for jid in right_gripper_ids:
+                            robot_joints[jid] = aloha_16[15]
+                        return robot_joints
                 
                 # Load spawn events (objects spawned during recording)
                 spawn_events = init_cond.get("spawn_events", []) if init_cond else []
@@ -822,16 +871,23 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     # Kinematic replay: set states directly instead of targets
                     # Use observation.state (recorded joint positions) for exact replay
                     if states is not None and step_idx < len(states):
+                        state_data = states[step_idx]
+                        # Apply joint mapping if needed
+                        if need_joint_mapping:
+                            state_data = expand_to_robot_joints(state_data)
                         state_tensor = torch.tensor(
-                            states[step_idx], device=unwrapped.device, dtype=torch.float32
+                            state_data, device=unwrapped.device, dtype=torch.float32
                         ).unsqueeze(0).expand(unwrapped.num_envs, -1)
                         qvel = torch.zeros_like(state_tensor)
                         robot.write_joint_state_to_sim(state_tensor, qvel)
                         robot.set_joint_position_target(state_tensor)  # Prevent PD fight
                     else:
                         # Fallback to action-based
+                        action_data = action
+                        if need_joint_mapping:
+                            action_data = expand_to_robot_joints(action)
                         action_tensor = torch.tensor(
-                            action, device=unwrapped.device, dtype=torch.float32
+                            action_data, device=unwrapped.device, dtype=torch.float32
                         ).unsqueeze(0).expand(unwrapped.num_envs, -1)
                         robot.set_joint_position_target(action_tensor)
                     
@@ -1252,12 +1308,38 @@ def replay_hdf5_data(data_dir: str, episode_idx: int = None, loop: bool = False,
         simulation_app.close()
 
 
+def parse_episode_spec(spec: str):
+    """Parse episode specification into a list of episode indices.
+    
+    Supports: "5" (single), "2-4" (range), "1,3,6" (list), "1,3-5,8" (mixed)
+    Returns list of indices, or None if spec is None.
+    """
+    if spec is None:
+        return None
+    
+    import re
+    episodes = set()
+    parts = spec.replace(" ", "").split(",")
+    
+    for part in parts:
+        if "-" in part:
+            match = re.match(r"(\d+)-(\d+)", part)
+            if match:
+                start, end = int(match.group(1)), int(match.group(2))
+                episodes.update(range(start, end + 1))
+        else:
+            episodes.add(int(part))
+    
+    return sorted(episodes)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Verify or replay VLA training data for Pi 0.5")
     parser.add_argument("data_dir", type=str, help="Path to VLA training data directory")
     parser.add_argument("--verify", action="store_true", help="Verify data (show images and stats)")
     parser.add_argument("--replay", action="store_true", help="Replay data in simulation")
-    parser.add_argument("--episode", type=int, default=None, help="Specific episode index")
+    parser.add_argument("--episode", type=str, default=None, 
+                        help="Episode(s): single (5), range (2-4), or list (1,3,6)")
     parser.add_argument("--loop", action="store_true", help="Loop playback (replay mode)")
     parser.add_argument("--real-time", action="store_true", help="Real-time playback (replay mode)")
     parser.add_argument("--collect-video", action="store_true", default=True,
@@ -1275,19 +1357,26 @@ def main():
         print(f"[ERROR] Not a directory: {args.data_dir}")
         sys.exit(1)
     
+    # Parse episode specification (supports ranges like 2-4 and lists like 1,3,6)
+    episode_list = parse_episode_spec(args.episode)
+    
     if args.verify:
-        verify_data(args.data_dir, args.episode)
+        # For verify, pass the list (or single value for backwards compat)
+        verify_data(args.data_dir, episode_list)
     elif args.replay:
         collect_vid = getattr(args, 'collect_video', True)  # Default to True
         label_md = getattr(args, 'label', False)
         headless = getattr(args, 'headless', False)
         print(f"[DEBUG] args.collect_video={collect_vid}, args.label={label_md}, args.headless={headless}")
-        replay_data(args.data_dir, args.episode, args.loop, args.real_time, 
+        # Pass episode list to replay - it will handle multiple episodes in one session
+        if episode_list:
+            print(f"[INFO] Episodes to play: {episode_list}")
+        replay_data(args.data_dir, episode_list, args.loop, args.real_time, 
                     collect_vid, label_md, headless)
     else:
         # Default to verify
         print("[INFO] No mode specified, running --verify")
-        verify_data(args.data_dir, args.episode)
+        verify_data(args.data_dir, episode_list)
 
 
 if __name__ == "__main__":

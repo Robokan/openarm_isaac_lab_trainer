@@ -1,8 +1,8 @@
 {
   "task": "Isaac-Reach-OpenArm-Bi-Teleop-v0",
-  "task_text": "bimanual teleoperation",
+  "task_text": "lift arms on the table.",
   "fps": 60,
-  "num_joints": 22,
+  "num_joints": 16,
   "robot_type": "openarm_bimanual",
-  "episode_count": 7
+  "episode_count": 97
 }

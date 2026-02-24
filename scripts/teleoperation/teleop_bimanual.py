@@ -327,6 +327,9 @@ class GamepadDevice:
         self.left_pose = np.array([0.2, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self._reset_pressed = False
+        # Voice command flags (for recording control via voice)
+        self.start_recording_requested = False
+        self.stop_recording_requested = False
         
         # Try to use pygame for gamepad
         try:
@@ -449,6 +452,9 @@ class ViveDevice:
         self.right_pose = np.array([0.2, -0.2, 0.4, 1.0, 0.0, 0.0, 0.0])
         self.left_id = None
         self.right_id = None
+        # Voice command flags (for recording control via voice)
+        self.start_recording_requested = False
+        self.stop_recording_requested = False
         
         try:
             import openvr
@@ -542,6 +548,9 @@ class XRDevice:
         self._input = None
         self._keyboard = None
         self._sub_keyboard = None
+        # Voice command flags (for recording control via voice)
+        self.start_recording_requested = False
+        self.stop_recording_requested = False
         try:
             with open(self._xr_log_path, "w", encoding="utf-8") as f:
                 f.write("")
@@ -2659,7 +2668,7 @@ def run_teleop(env, args):
     
     def handle_voice_command(cmd: dict):
         """Handle incoming voice command."""
-        nonlocal lerobot_task_text, spawn_requested, lerobot_recording, lerobot_current_episode
+        nonlocal lerobot_task_text, spawn_requested, lerobot_recording, lerobot_current_episode, vr_tracking_active
         
         command = cmd.get("command", "")
         
@@ -2667,19 +2676,27 @@ def run_teleop(env, args):
             if hasattr(input_device, 'start_recording_requested'):
                 input_device.start_recording_requested = True
             print("[Voice] Starting recording...")
-            send_voice_response("Recording started")
+            # Check if VR tracking is active (for XR mode)
+            if args.input == "xr" and not vr_tracking_active:
+                send_voice_response("Recording started. Note: activate VR tracking to capture frames.")
+            else:
+                send_voice_response("Recording started")
             
         elif command == "stop_recording":
             if hasattr(input_device, 'stop_recording_requested'):
                 input_device.stop_recording_requested = True
             print("[Voice] Stopping recording...")
-            send_voice_response("Recording stopped")
             
         elif command == "spawn_object":
             obj_type = cmd.get("type")
             item_name = cmd.get("item")
             
-            if item_name or obj_type:
+            # Handle random object request
+            if obj_type == "random" or (not item_name and not obj_type):
+                spawn_requested = True
+                print("[Voice] Spawning random object...")
+                send_voice_response("Spawning random object")
+            elif item_name or obj_type:
                 # Specific item or type requested
                 if not obj_type:
                     # Infer type from item name
@@ -2691,10 +2708,6 @@ def run_teleop(env, args):
                 success, message = spawn_specific_item(obj_type, item_name)
                 print(f"[Voice] {message}")
                 send_voice_response(message)
-            else:
-                # Random object - use existing spawn logic
-                spawn_requested = True
-                print("[Voice] Spawning random object...")
             
         elif command == "reset_objects":
             # Reset all active pool objects
@@ -2715,7 +2728,6 @@ def run_teleop(env, args):
                 
         elif command == "reset_teleop":
             # Reset teleop to initial position
-            nonlocal vr_tracking_active
             
             # Reset robot joints to default positions
             all_joint_pos = robot.data.default_joint_pos.clone()
@@ -3525,12 +3537,18 @@ def run_teleop(env, args):
                         print(f"{'='*60}\n")
                         
                         lerobot_episode_count += 1
+                        send_voice_response(f"Recording saved. Episode {lerobot_episode_count - 1}, {num_frames} frames.")
                     else:
                         print("[LeRobot] No frames recorded, discarding episode")
+                        if args.input == "xr" and not vr_tracking_active:
+                            send_voice_response("No frames recorded. Activate VR tracking first.")
+                        else:
+                            send_voice_response("No frames recorded. Episode discarded.")
                     
                     lerobot_current_episode = None
                 else:
                     print("[LeRobot] Not currently recording")
+                    send_voice_response("Not currently recording.")
             
             # Spawn random object from pool if requested
             if spawn_requested:
@@ -4075,8 +4093,8 @@ def run_teleop(env, args):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 
-                # Send heartbeat to voice assistant (every ~5 seconds at 60fps)
-                if step_count % 300 == 0 and voice_response_socket:
+                # Send heartbeat to voice assistant (every ~2 seconds at 60fps)
+                if step_count % 120 == 0 and voice_response_socket:
                     try:
                         voice_response_socket.send_json({"response": ""})  # Empty heartbeat
                     except:

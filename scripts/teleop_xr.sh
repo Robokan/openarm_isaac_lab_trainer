@@ -12,10 +12,12 @@ set -e
 # Usage:
 #   ./scripts/teleop_xr.sh              # XR teleoperation with VR controllers
 #   ./scripts/teleop_xr.sh --keyboard   # Test with keyboard (no XR)
+#   ./scripts/teleop_xr.sh --gpu 0      # Force specific GPU (useful when other GPUs are busy)
 
 INPUT_MODE="xr"
 SCRIPT_MODE=""
 COLLECT_VIDEO=""
+GPU_ID=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXTRA_ARGS=()
 
@@ -28,6 +30,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --collect-video)
             COLLECT_VIDEO="--collect-video"
+            shift
+            ;;
+        --gpu)
+            GPU_ID="$2"
+            shift 2
+            ;;
+        --gpu=*)
+            GPU_ID="${1#*=}"
             shift
             ;;
         --script)
@@ -201,6 +211,15 @@ EOF
 --/app/renderer/resolution/height=${XR_RENDER_HEIGHT} \
 --/app/window/width=${XR_RENDER_WIDTH} \
 --/app/window/height=${XR_RENDER_HEIGHT}"
+fi
+
+# Set GPU if specified (for CUDA compute - Vulkan still needs display GPU)
+if [[ -n "${GPU_ID}" ]]; then
+    # Note: Can't restrict Vulkan to a GPU without display attached
+    # This primarily affects PyTorch/PhysX device selection
+    export CUDA_DEVICE_ORDER="PCI_BUS_ID"
+    export CUDA_PREFERRED_DEVICE="${GPU_ID}"
+    echo "Preferred GPU: ${GPU_ID} (display GPU still needed for rendering)"
 fi
 
 # Build command

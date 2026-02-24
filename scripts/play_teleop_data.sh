@@ -3,7 +3,9 @@
 #
 # Usage:
 #   ./scripts/play_teleop_data.sh                    # Play all episodes
-#   ./scripts/play_teleop_data.sh --episode 0        # Play specific episode
+#   ./scripts/play_teleop_data.sh --episode 5        # Play specific episode
+#   ./scripts/play_teleop_data.sh --episode 2-4      # Play range (2, 3, 4)
+#   ./scripts/play_teleop_data.sh --episode 1,3,6    # Play list (1, 3, 6)
 #   ./scripts/play_teleop_data.sh --loop             # Loop playback
 #   ./scripts/play_teleop_data.sh --verify           # Just verify data, no simulation
 #   ./scripts/play_teleop_data.sh --no-collect-video # Skip video capture during playback

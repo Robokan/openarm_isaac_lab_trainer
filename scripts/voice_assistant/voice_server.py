@@ -88,7 +88,13 @@ User: "status"
 {"command": "get_status"}
 
 User: "drop an object"
-{"command": "spawn_object"}
+{"command": "spawn_object", "type": "random"}
+
+User: "drop random object"
+{"command": "spawn_object", "type": "random"}
+
+User: "drop something"
+{"command": "spawn_object", "type": "random"}
 
 User: "spawn a cube"
 {"command": "spawn_object", "type": "cubes"}
@@ -313,6 +319,9 @@ Keep responses BRIEF (1-2 sentences) and natural for voice synthesis."""
                     obj_type = "mugs"
                 elif "fruit" in text:
                     obj_type = "fruits"
+                elif any(kw in text for kw in ["random", "object", "something", "anything"]):
+                    # Random object - pick a random type
+                    obj_type = "random"
             
             # Only send spawn command if we recognized a valid object
             if obj_type or item:
@@ -418,50 +427,64 @@ class RivaASR:
             raise
     
     def transcribe_stream(self, audio_queue: queue.Queue, result_callback):
-        """Stream audio to Riva and get transcriptions."""
+        """Stream audio to Riva and get transcriptions with auto-reconnect."""
         import riva.client
         
-        config = riva.client.StreamingRecognitionConfig(
-            config=riva.client.RecognitionConfig(
-                encoding=riva.client.AudioEncoding.LINEAR_PCM,
-                sample_rate_hertz=self.sample_rate,
-                language_code="en-US",
-                max_alternatives=1,
-                enable_automatic_punctuation=True,
-                verbatim_transcripts=False,
-            ),
-            interim_results=True,
-        )
-        
-        def audio_generator():
-            while True:
-                try:
-                    chunk = audio_queue.get(timeout=0.1)
-                    if chunk is None:
-                        break
-                    yield chunk
-                except queue.Empty:
-                    continue
-        
-        try:
-            responses = self.asr_service.streaming_response_generator(
-                audio_chunks=audio_generator(),
-                streaming_config=config,
+        while True:
+            config = riva.client.StreamingRecognitionConfig(
+                config=riva.client.RecognitionConfig(
+                    encoding=riva.client.AudioEncoding.LINEAR_PCM,
+                    sample_rate_hertz=self.sample_rate,
+                    language_code="en-US",
+                    max_alternatives=1,
+                    enable_automatic_punctuation=True,
+                    verbatim_transcripts=False,
+                ),
+                interim_results=True,
             )
             
-            for response in responses:
-                if not response.results:
-                    continue
+            # Track if we should stop
+            should_stop = False
+            
+            def audio_generator():
+                nonlocal should_stop
+                while True:
+                    try:
+                        chunk = audio_queue.get(timeout=0.1)
+                        if chunk is None:
+                            should_stop = True
+                            break
+                        yield chunk
+                    except queue.Empty:
+                        continue
+            
+            try:
+                responses = self.asr_service.streaming_response_generator(
+                    audio_chunks=audio_generator(),
+                    streaming_config=config,
+                )
                 
-                for result in response.results:
-                    if result.alternatives:
-                        transcript = result.alternatives[0].transcript
-                        is_final = result.is_final
-                        
-                        result_callback(transcript, is_final)
-                        
-        except Exception as e:
-            print(f"[RivaASR] Stream error: {e}")
+                for response in responses:
+                    if not response.results:
+                        continue
+                    
+                    for result in response.results:
+                        if result.alternatives:
+                            transcript = result.alternatives[0].transcript
+                            is_final = result.is_final
+                            
+                            result_callback(transcript, is_final)
+                            
+            except Exception as e:
+                print(f"[RivaASR] Stream error: {e}")
+                if should_stop:
+                    break
+                print("[RivaASR] Reconnecting in 2 seconds...")
+                time.sleep(2)
+                continue
+            
+            if should_stop:
+                break
 
 
 class AudioCapture:
@@ -738,9 +761,9 @@ class VoiceServer:
                     if self.tts:
                         self.tts.speak("Teleop client is not running. Please start it first.")
             
-            # Check for connection timeout (no heartbeat in 10 seconds)
+            # Check for connection timeout (no heartbeat in 30 seconds)
             if self.teleop_connected and self.last_teleop_response_time > 0:
-                if time.time() - self.last_teleop_response_time > 10.0:
+                if time.time() - self.last_teleop_response_time > 30.0:
                     self.teleop_connected = False
                     print("[WARN] Lost connection to teleop")
                     

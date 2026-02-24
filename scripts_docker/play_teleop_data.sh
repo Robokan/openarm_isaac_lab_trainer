@@ -3,9 +3,14 @@
 #
 # Usage:
 #   ./scripts_docker/play_teleop_data.sh                    # Play all episodes
-#   ./scripts_docker/play_teleop_data.sh --episode 0        # Play specific episode
+#   ./scripts_docker/play_teleop_data.sh --episode 5        # Play specific episode
+#   ./scripts_docker/play_teleop_data.sh --episode 2-4      # Play range (2, 3, 4)
+#   ./scripts_docker/play_teleop_data.sh --episode 1,3,6    # Play list (1, 3, 6)
 #   ./scripts_docker/play_teleop_data.sh --loop             # Loop playback
 #   ./scripts_docker/play_teleop_data.sh --verify           # Just verify data, no simulation
+#   ./scripts_docker/play_teleop_data.sh --no-collect-video # Skip video capture during playback
+#   ./scripts_docker/play_teleop_data.sh --label            # Prompt for task label after each episode
+#   ./scripts_docker/play_teleop_data.sh --headless         # Run without GUI at max speed
 #
 # Controls during playback:
 #   Q     - Quit

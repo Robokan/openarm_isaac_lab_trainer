@@ -394,6 +394,8 @@ class JAXWebServer:
                 return {"command": "spawn_object", "type": "mugs"}
             if "fruit" in text:
                 return {"command": "spawn_object", "type": "fruits"}
+            if any(kw in text for kw in ["random", "object", "something", "anything"]):
+                return {"command": "spawn_object", "type": "random"}
             # Unknown object
             return {"command": "invalid_object"}
         
