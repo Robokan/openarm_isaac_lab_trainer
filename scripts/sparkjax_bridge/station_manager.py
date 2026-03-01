@@ -48,6 +48,25 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": args_cli.headless})
 
 # ---------------------------------------------------------------------------
+# Reduce rendering cost for off-screen camera render products.
+# These mirror settings from isaaclab.python.rendering.kit that make
+# camera captures lightweight without affecting the main viewport much.
+# ---------------------------------------------------------------------------
+import carb  # available after SimulationApp init
+
+_cs = carb.settings.get_settings()
+_cs.set_bool("/rtx/translucency/enabled", False)
+_cs.set_bool("/rtx/reflections/enabled", False)
+_cs.set_bool("/rtx/indirectDiffuse/enabled", False)
+_cs.set_bool("/rtx/raytracing/cached/enabled", False)
+_cs.set_bool("/rtx/ambientOcclusion/enabled", False)
+_cs.set_bool("/rtx/directLighting/sampledLighting/enabled", True)
+_cs.set_int("/rtx/directLighting/sampledLighting/samplesPerPixel", 1)
+_cs.set_int("/rtx/post/dlss/execMode", 0)  # Performance mode
+_cs.set_bool("/omni/replicator/asyncRendering", False)
+del _cs
+
+# ---------------------------------------------------------------------------
 # All heavy imports AFTER Isaac Sim has initialised
 # ---------------------------------------------------------------------------
 import json
@@ -373,12 +392,12 @@ class StationPair:
 
     def __init__(self, prim_name: str, prim_path: str,
                  articulation: Articulation,
-                 leader: ArmBridge, follower: ArmBridge):
+                 left: ArmBridge, right: ArmBridge):
         self.prim_name = prim_name
         self.prim_path = prim_path
         self.articulation = articulation
-        self.leader = leader
-        self.follower = follower
+        self.left = left
+        self.right = right
 
 
 class CameraInfo:
@@ -390,6 +409,7 @@ class CameraInfo:
         self.prim_path = prim_path
         self.role = role  # "ego", "left_wrist", "right_wrist"
         self.pair_name = pair_name
+        self.render_product = None
         self.annotator = None
         self.publisher = None
 
@@ -470,18 +490,18 @@ def _discover_pairs(world: World, robots_xform_path: str,
                   f"skipping (dofs={dof_names})")
             continue
 
-        leader = ArmBridge(can_interface=f"can{can_idx}",
-                           side="left", joint_indices=left_indices)
-        follower = ArmBridge(can_interface=f"can{can_idx + 1}",
-                             side="right", joint_indices=right_indices)
+        left_arm = ArmBridge(can_interface=f"can{can_idx}",
+                             side="left", joint_indices=left_indices)
+        right_arm = ArmBridge(can_interface=f"can{can_idx + 1}",
+                              side="right", joint_indices=right_indices)
         can_idx += 2
 
         pairs.append(StationPair(
             prim_name=prim_name, prim_path=prim_path,
-            articulation=art, leader=leader, follower=follower))
+            articulation=art, left=left_arm, right=right_arm))
         print(f"[INFO] Station '{prim_name}': "
-              f"leader={leader.can_interface}, "
-              f"follower={follower.can_interface}, "
+              f"left={left_arm.can_interface}, "
+              f"right={right_arm.can_interface}, "
               f"left_dofs={len(left_indices)}, "
               f"right_dofs={len(right_indices)}")
 
@@ -527,7 +547,7 @@ def _discover_cameras() -> list[CameraInfo]:
 
 def _setup_camera_annotators(cameras: list[CameraInfo],
                              pair_name: str,
-                             resolution: tuple[int, int] = (640, 480)):
+                             resolution: tuple[int, int] = (320, 240)):
     """Create replicator render products for cameras belonging to one pair.
 
     Only call this when teleop starts for a specific pair, to avoid
@@ -549,12 +569,34 @@ def _setup_camera_annotators(cameras: list[CameraInfo],
             rp = rep.create.render_product(cam.prim_path, resolution)
             annot = rep.AnnotatorRegistry.get_annotator("rgb")
             annot.attach([rp])
+            cam.render_product = rp
             cam.annotator = annot
             count += 1
             print(f"[INFO] Camera {cam.name} render product ready")
         except Exception as e:
             print(f"[WARN] Camera {cam.name} setup failed: {e}")
     print(f"[INFO] Activated {count} camera render products for {pair_name}")
+
+
+def _teardown_camera_annotators(cameras: list[CameraInfo]):
+    """Destroy render products so they stop consuming GPU each frame."""
+    try:
+        import omni.replicator.core as rep
+    except ImportError:
+        pass
+
+    count = 0
+    for cam in cameras:
+        if cam.render_product is not None:
+            try:
+                cam.render_product.destroy()
+            except Exception:
+                pass
+            cam.render_product = None
+            count += 1
+        cam.annotator = None
+    if count:
+        print(f"[INFO] Destroyed {count} camera render products")
 
 
 # ---------------------------------------------------------------------------
@@ -613,8 +655,8 @@ class StationManagerNode(Node):
         self._cameras = cameras
         self._all_arms: dict[str, ArmBridge] = {}
         for pair in pairs:
-            self._all_arms[pair.leader.can_interface] = pair.leader
-            self._all_arms[pair.follower.can_interface] = pair.follower
+            self._all_arms[pair.left.can_interface] = pair.left
+            self._all_arms[pair.right.can_interface] = pair.right
 
         latched_qos = QoSProfile(
             depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -634,6 +676,7 @@ class StationManagerNode(Node):
             self._on_stop_teleop, 10)
 
         self._teleop_pair_name: str | None = None
+        self._teleop_follower_name: str = ""
         self._teleop_requested = False
         self._stop_teleop_requested = False
 
@@ -641,6 +684,19 @@ class StationManagerNode(Node):
 
         self._publish_available_hardware()
         self._publish_available_cameras()
+
+        # Auto-activate all arms with default namespaces so joint states
+        # are always published, even before SparkJAX registration.
+        ns_idx = 1
+        for pair in pairs:
+            for arm in (pair.left, pair.right):
+                if not arm.active:
+                    arm.namespace = f"/openarm{ns_idx}"
+                    topic = f"{arm.namespace}/joint_states"
+                    arm.publisher = self.create_publisher(JointState, topic, 10)
+                    arm.active = True
+                ns_idx += 1
+
         self.get_logger().info(
             f"Station manager ready: {len(pairs)} pair(s), "
             f"{len(self._all_arms)} virtual CAN(s), "
@@ -697,20 +753,38 @@ class StationManagerNode(Node):
         self._teleop_pair_name = data.get("pair_name", "")
         leader_can = data.get("leader_can", "")
         follower_can = data.get("follower_can", "")
+        self._teleop_follower_name = ""
+
+        leader_station = None
+        follower_station = None
+        for pair in self._pairs:
+            if (pair.left.can_interface == leader_can
+                    or pair.right.can_interface == leader_can):
+                leader_station = pair.prim_name
+            if (pair.left.can_interface == follower_can
+                    or pair.right.can_interface == follower_can):
+                follower_station = pair.prim_name
 
         if not self._teleop_pair_name:
+            self._teleop_pair_name = leader_station or ""
+
+        if follower_station and follower_station != leader_station:
+            self._teleop_follower_name = follower_station
+        elif len(self._pairs) > 1:
             for pair in self._pairs:
-                if pair.leader.can_interface == leader_can:
-                    self._teleop_pair_name = pair.prim_name
+                if pair.prim_name != self._teleop_pair_name:
+                    self._teleop_follower_name = pair.prim_name
                     break
 
         self._teleop_requested = True
         self.get_logger().info(
-            f"Teleop start requested: pair={self._teleop_pair_name}")
+            f"Teleop start requested: leader={self._teleop_pair_name} "
+            f"follower={self._teleop_follower_name}")
 
     def _on_stop_teleop(self, msg: String):
         self._stop_teleop_requested = True
         self.get_logger().info("Teleop stop requested")
+
 
     def get_or_create_camera_pub(self, topic: str):
         if topic not in self._camera_publishers:
@@ -850,20 +924,20 @@ def main():
                   f"left_joints={left_arm_ids}, right_joints={right_arm_ids}")
 
     pub_period = 1.0 / args_cli.pub_rate
+    cam_pub_period = 1.0 / 10.0  # 10 Hz for camera images
     idle_frame_period = 1.0 / 30.0
     last_pub = 0.0
+    last_cam_pub = 0.0
     teleop_active = False
     teleop_pair: StationPair | None = None
     step_count = 0
 
     follower_pair: StationPair | None = None
+    follower_mirroring = False
+    cameras_active = False
 
     if keyboard:
         teleop_pair = pairs[0]
-        teleop_active = True
-
-        if len(pairs) > 1:
-            follower_pair = pairs[1]
 
         # Initialize keyboard poses to current EE positions on leader station
         ik_info = pair_ik_info.get(teleop_pair.prim_name)
@@ -890,12 +964,10 @@ def main():
         initial_left_euler = keyboard.left_euler.copy()
         initial_right_euler = keyboard.right_euler.copy()
 
-        print(f"[INFO] Leader station: {teleop_pair.prim_name}")
-        if follower_pair:
-            print(f"[INFO] Follower station: {follower_pair.prim_name} "
-                  f"(mirrors leader's joints)")
-        else:
-            print("[INFO] No follower station (only 1 robot found)")
+        print(f"[INFO] Keyboard controls leader station: "
+              f"{teleop_pair.prim_name}")
+        print("[INFO] Follower mirroring will activate when "
+              "SparkJAX starts teleoperation")
 
     # Create IK target marker for leader arm
     left_marker_path = "/ik_target_leader"
@@ -934,29 +1006,40 @@ def main():
         while simulation_app.is_running():
             if ros_node._teleop_requested:
                 ros_node._teleop_requested = False
-                name = ros_node._teleop_pair_name
+                f_name = ros_node._teleop_follower_name
+                follower_pair = None
                 for p in pairs:
-                    if p.prim_name == name:
-                        teleop_pair = p
-                        teleop_active = True
-                        print(f"[INFO] Teleop activated: {name}")
+                    if p.prim_name == f_name:
+                        follower_pair = p
                         break
+                if follower_pair is None and len(pairs) > 1:
+                    for p in pairs:
+                        if p.prim_name != teleop_pair.prim_name:
+                            follower_pair = p
+                            break
+                follower_mirroring = follower_pair is not None
+                teleop_active = True
+
+                if follower_pair is not None:
+                    _setup_camera_annotators(
+                        cameras, follower_pair.prim_name)
+                    cameras_active = True
+
+                print(f"[INFO] Teleop activated: leader={teleop_pair.prim_name}"
+                      f" follower={follower_pair.prim_name if follower_pair else 'none'}"
+                      f" mirroring={follower_mirroring}")
 
             if ros_node._stop_teleop_requested:
                 ros_node._stop_teleop_requested = False
                 teleop_active = False
-                teleop_pair = None
-                print("[INFO] Teleop deactivated, returning to idle")
+                follower_mirroring = False
+                follower_pair = None
+                _teardown_camera_annotators(cameras)
+                cameras_active = False
+                print("[INFO] Teleop stopped, follower mirroring disabled")
 
-            if (keyboard and not teleop_active
-                    and keyboard.start_recording_requested):
-                keyboard.start_recording_requested = False
-                teleop_pair = pairs[0]
-                teleop_active = True
-                print(f"[INFO] Teleop activated via keyboard: "
-                      f"{teleop_pair.prim_name}")
-
-            if teleop_active and teleop_pair and keyboard:
+            if keyboard and teleop_pair:
+                teleop_frame_start = time.monotonic()
                 keyboard.update()
 
                 if keyboard.reset_requested:
@@ -971,13 +1054,17 @@ def main():
                         pair_positions[name] = init_pos.copy()
                         for p in pairs:
                             if p.prim_name == name:
-                                targets = init_pos.reshape(1, -1)
+                                pos = init_pos.reshape(1, -1)
                                 if _HAS_TORCH:
-                                    targets = torch.tensor(
-                                        targets, dtype=torch.float32,
+                                    pos = torch.tensor(
+                                        pos, dtype=torch.float32,
                                         device="cpu")
-                                p.articulation._articulation_view\
-                                    .set_joint_position_targets(targets)
+                                view = p.articulation._articulation_view
+                                view.set_joint_positions(pos)
+                                view.set_joint_velocities(
+                                    torch.zeros_like(pos) if _HAS_TORCH
+                                    else np.zeros_like(pos))
+                                view.set_joint_position_targets(pos)
                                 break
                     for _ in range(5):
                         world.step(render=False)
@@ -1027,8 +1114,9 @@ def main():
                             targets, dtype=torch.float32, device="cpu")
                     art_view.set_joint_position_targets(targets)
 
-                    # Mirror leader station joints to follower station
-                    if follower_pair is not None:
+                    # Mirror leader joints to follower station (only when
+                    # SparkJAX has started a teleop session)
+                    if follower_mirroring and follower_pair is not None:
                         f_view = follower_pair.articulation._articulation_view
                         f_targets = positions.reshape(1, -1)
                         if _HAS_TORCH:
@@ -1074,8 +1162,7 @@ def main():
                 else:
                     pair_positions[teleop_pair.prim_name] = positions
 
-                # Update follower station actual positions
-                if follower_pair is not None:
+                if follower_mirroring and follower_pair is not None:
                     f_actual = follower_pair.articulation.get_joint_positions()
                     if f_actual is not None:
                         if hasattr(f_actual, 'cpu'):
@@ -1092,7 +1179,14 @@ def main():
                           f"L=[{lp[0]:.3f},{lp[1]:.3f},{lp[2]:.3f}] "
                           f"R=[{rp[0]:.3f},{rp[1]:.3f},{rp[2]:.3f}] "
                           f"hand={keyboard.active_hand} "
-                          f"follower={'yes' if follower_pair else 'none'}")
+                          f"mirror={'ON' if follower_mirroring else 'off'}"
+                          f" cam={'ON' if cameras_active else 'off'}")
+
+                # Cap teleop loop at 30 fps
+                teleop_elapsed = time.monotonic() - teleop_frame_start
+                teleop_sleep = idle_frame_period - teleop_elapsed
+                if teleop_sleep > 0:
+                    time.sleep(teleop_sleep)
             else:
                 frame_start = time.monotonic()
                 simulation_app.update()
@@ -1112,17 +1206,36 @@ def main():
                 positions = pair_positions[pair.prim_name]
                 dof_names = pair_dof_names[pair.prim_name]
 
-                if pair.leader.active and pair.leader.publisher:
+                if pair.left.active and pair.left.publisher:
                     msg = _build_joint_state_msg(
                         stamp, positions, dof_names,
-                        pair.leader.joint_indices, _LEFT_PREFIX)
-                    pair.leader.publisher.publish(msg)
+                        pair.left.joint_indices, _LEFT_PREFIX)
+                    pair.left.publisher.publish(msg)
 
-                if pair.follower.active and pair.follower.publisher:
+                if pair.right.active and pair.right.publisher:
                     msg = _build_joint_state_msg(
                         stamp, positions, dof_names,
-                        pair.follower.joint_indices, _RIGHT_PREFIX)
-                    pair.follower.publisher.publish(msg)
+                        pair.right.joint_indices, _RIGHT_PREFIX)
+                    pair.right.publisher.publish(msg)
+
+            # Publish camera images from the follower pair (throttled)
+            if cameras_active and follower_pair is not None and now - last_cam_pub >= cam_pub_period:
+                last_cam_pub = now
+                for cam in cameras:
+                    if cam.pair_name != follower_pair.prim_name:
+                        continue
+                    if cam.annotator is None:
+                        continue
+                    try:
+                        data = cam.annotator.get_data()
+                        if data is not None and data.size > 0:
+                            rgb = np.array(data[:, :, :3], dtype=np.uint8,
+                                           copy=True)
+                            topic = f'/isaac_sim/camera/{cam.role}'
+                            pub = ros_node.get_or_create_camera_pub(topic)
+                            pub.publish(_build_image_msg(stamp, rgb))
+                    except Exception:
+                        pass
 
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...")
