@@ -49,7 +49,7 @@ parser.add_argument("--num_envs", type=int, default=1, help="Number of environme
 parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
 parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
 parser.add_argument("--action_horizon", type=int, default=10, help="Action chunk size")
-parser.add_argument("--prompt", type=str, default="perform the bimanual manipulation task",
+parser.add_argument("--prompt", type=str, default="put your hands on the table",
                     help="Task prompt for VLA")
 parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency")
 parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to run")
@@ -95,6 +95,105 @@ VLA_DOF = 16  # VLA output: [left_arm(7), left_grip(1), right_arm(7), right_grip
 ENV_DOF = 18  # Env expects: [left_arm(7), left_grip(2), right_arm(7), right_grip(2)]
 
 
+class KeyboardListener:
+    """Keyboard listener using Isaac Sim's input system.
+    
+    Press 'P' to pause and enter a new prompt.
+    Press 'Q' to quit.
+    Press 'C' to spawn an object.
+    Press 'B' to reset objects to pool.
+    """
+    
+    def __init__(self):
+        import carb.input
+        import omni.appwindow
+        
+        self._carb_input = carb.input
+        self._pause_requested = False
+        self._quit_requested = False
+        self._spawn_requested = False
+        self._reset_pool_requested = False
+        
+        # Set up keyboard input using Isaac Sim's system
+        self._input = carb.input.acquire_input_interface()
+        self._app_window = omni.appwindow.get_default_app_window()
+        self._keyboard = self._app_window.get_keyboard()
+        self._sub_keyboard = self._input.subscribe_to_keyboard_events(
+            self._keyboard, self._on_keyboard_event
+        )
+        
+        print("\n" + "="*60)
+        print("KEYBOARD CONTROLS (OpenPI Client)")
+        print("="*60)
+        print("  P: Pause and enter new prompt")
+        print("  Q: Quit current episode")
+        print("  C: Spawn object on workspace")
+        print("  B: Reset all objects to pool")
+        print("  Ctrl+C: Exit completely")
+        print("="*60 + "\n")
+        
+    def _on_keyboard_event(self, event, *args, **kwargs):
+        """Handle keyboard events from Isaac Sim."""
+        if event.type != self._carb_input.KeyboardEventType.KEY_PRESS:
+            return True
+            
+        key = event.input
+        
+        if key == self._carb_input.KeyboardInput.P:
+            self._pause_requested = True
+            print("[KEYBOARD] Pause requested")
+            return False
+        elif key == self._carb_input.KeyboardInput.Q:
+            self._quit_requested = True
+            print("[KEYBOARD] Quit requested")
+            return False
+        elif key == self._carb_input.KeyboardInput.C:
+            self._spawn_requested = True
+            print("[KEYBOARD] Spawn object requested")
+            return False
+        elif key == self._carb_input.KeyboardInput.B:
+            self._reset_pool_requested = True
+            print("[KEYBOARD] Reset pool requested")
+            return False
+            
+        return True
+        
+    def start(self):
+        """Start method for compatibility (Isaac Sim handles events automatically)."""
+        pass
+        
+    def stop(self):
+        """Stop the keyboard listener."""
+        if hasattr(self, '_sub_keyboard') and self._sub_keyboard:
+            self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub_keyboard)
+            self._sub_keyboard = None
+            
+    def check_pause(self) -> bool:
+        """Check if pause was requested. Clears the flag after reading."""
+        if self._pause_requested:
+            self._pause_requested = False
+            return True
+        return False
+            
+    def check_quit(self) -> bool:
+        """Check if quit was requested."""
+        return self._quit_requested
+    
+    def check_spawn(self) -> bool:
+        """Check if spawn was requested. Clears the flag after reading."""
+        if self._spawn_requested:
+            self._spawn_requested = False
+            return True
+        return False
+    
+    def check_reset_pool(self) -> bool:
+        """Check if reset pool was requested. Clears the flag after reading."""
+        if self._reset_pool_requested:
+            self._reset_pool_requested = False
+            return True
+        return False
+
+
 class OpenArmBimanualEnvironment:
     """
     OpenPI-compatible environment wrapper for Bimanual OpenArm in Isaac Lab.
@@ -111,11 +210,13 @@ class OpenArmBimanualEnvironment:
     - right_gripper_action:1 joint,  scale=0.044, use_default_offset=False
     """
 
-    def __init__(self, env, prompt: str = "perform the task", use_cameras: bool = True):
+    def __init__(self, env, prompt: str = "perform the task", use_cameras: bool = True, 
+                 keyboard_listener: KeyboardListener = None):
         self._env = env
         self._prompt = prompt
         self._use_cameras = use_cameras
         self._device = env.unwrapped.device
+        self._keyboard_listener = keyboard_listener
 
         self._unwrapped = env.unwrapped
         if hasattr(self._unwrapped, 'unwrapped'):
@@ -392,6 +493,22 @@ class OpenArmBimanualEnvironment:
         Each gripper has 2 finger joints that move together (mimic), so we
         duplicate the single gripper value for both fingers.
         """
+        # Check for keyboard commands
+        if self._keyboard_listener:
+            if self._keyboard_listener.check_quit():
+                print("\n[KEYBOARD] Quit requested. Ending episode...")
+                self._done = True
+                return
+                
+            if self._keyboard_listener.check_pause():
+                self._handle_pause()
+                
+            if self._keyboard_listener.check_spawn():
+                self.spawn_random_object()
+                
+            if self._keyboard_listener.check_reset_pool():
+                self.reset_all_objects()
+        
         vla_actions = action.get("actions")
 
         if vla_actions is not None:
@@ -429,6 +546,27 @@ class OpenArmBimanualEnvironment:
         
         if self._step_count <= 5 or self._done:
             print(f"[DEBUG] Step {self._step_count}: done={self._done}, dones_raw={dones}")
+    
+    def _handle_pause(self):
+        """Handle pause: prompt for new instruction and resume."""
+        print("\n" + "=" * 50)
+        print("[PAUSED] Robot paused.")
+        print(f"Current prompt: {self._prompt}")
+        print("=" * 50)
+        print("Enter new prompt in the terminal (or press Enter to keep current):")
+        
+        try:
+            new_prompt = input("> ").strip()
+            if new_prompt:
+                self._prompt = new_prompt
+                print(f"[INFO] Prompt updated to: {self._prompt}")
+            else:
+                print("[INFO] Keeping current prompt.")
+        except EOFError:
+            print("[INFO] Keeping current prompt.")
+        
+        print("[RESUMED] Continuing execution...")
+        print("=" * 50 + "\n")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -467,12 +605,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"Max steps:      {args_cli.max_episode_steps}")
     print(f"Prompt:         {args_cli.prompt}")
     print(f"Cameras:        {'enabled' if use_cameras else 'disabled (black images)'}")
+    print("=" * 60)
+    print("KEYBOARD CONTROLS:")
+    print("  P - Pause and enter new prompt")
+    print("  Q - Quit current episode")
     print("=" * 60 + "\n")
+
+    # Start keyboard listener for pause/prompt functionality
+    keyboard_listener = KeyboardListener()
+    keyboard_listener.start()
 
     openpi_env = OpenArmBimanualEnvironment(
         env=env,
         prompt=args_cli.prompt,
         use_cameras=use_cameras,
+        keyboard_listener=keyboard_listener,
     )
 
     # Spawn objects if requested
@@ -517,6 +664,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runtime.run()
     except KeyboardInterrupt:
         print("\n[INFO] Client stopped by user")
+    finally:
+        keyboard_listener.stop()
 
     print("[INFO] OpenPI client finished")
     env.close()

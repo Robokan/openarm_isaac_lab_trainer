@@ -6,7 +6,7 @@ set -e
 
 IMAGE="openarm-isaac-lab:latest"
 CONTAINER_NAME="isaac-lab"
-DISPLAY_NUM="${DISPLAY:-:1}"
+DISPLAY_NUM="${DISPLAY:-:0}"
 
 # Get repo root and sparkpack root (parent of repo)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +32,10 @@ mkdir -p ~/docker/isaac-sim/{logs,data,documents}
 
 # Enable X11 forwarding
 xhost +local:docker >/dev/null 2>&1
+xhost +local:root >/dev/null 2>&1
+
+# Ensure .Xauthority exists as a file (Docker mounts missing files as directories)
+touch "$HOME/.Xauthority" 2>/dev/null || true
 
 echo "Starting Isaac Lab container with X11 forwarding..."
 

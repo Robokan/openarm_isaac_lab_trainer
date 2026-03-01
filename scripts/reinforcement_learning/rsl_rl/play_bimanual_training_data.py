@@ -539,13 +539,16 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                     cv2.namedWindow("Camera Views", cv2.WINDOW_NORMAL)
                     cv2.resizeWindow("Camera Views", 1920, 480)
                 
-                # Video collection: set up render products if --collect-video and no images exist
-                should_collect_video = collect_video and not images_exist
+                # Video collection: always collect when --collect-video is set
+                should_collect_video = collect_video
                 render_products = {}
                 collected_images = {"ego": [], "left_wrist": [], "right_wrist": []}
                 
                 if should_collect_video:
-                    print(f"  [VIDEO] Collecting video for this episode (no images found)")
+                    if images_exist:
+                        print(f"  [VIDEO] Re-collecting video (overwriting existing images)")
+                    else:
+                        print(f"  [VIDEO] Collecting video for this episode (no images found)")
                     try:
                         from pxr import UsdGeom
                         import omni.replicator.core as rep
@@ -572,8 +575,6 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                                         print(f"    Camera {cam_name}: {cam_path} [FAILED: {e}]")
                     except Exception as e:
                         print(f"  [VIDEO] Failed to set up cameras: {e}")
-                elif collect_video and images_exist:
-                    print(f"  [VIDEO] Skipping video collection (images already exist)")
                 
                 # Reset environment
                 print("  [INFO] Resetting environment...", flush=True)
@@ -991,14 +992,14 @@ def replay_lerobot_fallback_data(data_dir: str, episode_idx: int = None, loop: b
                             cv2.waitKey(1)  # Required to update window
                     
                     if step_idx % 50 == 0:
-                        print(f"  Step {step_idx}/{len(actions)}", end="\r")
+                        print(f"  [{ep_dir_name}] Step {step_idx}/{len(actions)}", end="\r")
                     
                     if real_time:
                         sleep_time = dt - (time.time() - start_time)
                         if sleep_time > 0:
                             time.sleep(sleep_time)
                 
-                print(f"  {ep_dir_name} complete.          ")
+                print(f"  [{ep_dir_name}] complete ({len(actions)} steps)          ")
                 
                 # Save collected video if any
                 if should_collect_video and any(len(imgs) > 0 for imgs in collected_images.values()):

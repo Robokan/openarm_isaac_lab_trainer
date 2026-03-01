@@ -52,6 +52,10 @@ find_data_dir() {
     echo ""
 }
 
+# Ensure X11 forwarding is enabled (may have been lost after reboot)
+xhost +local:docker >/dev/null 2>&1 || true
+xhost +local:root >/dev/null 2>&1 || true
+
 DATA_DIR="$(find_data_dir)"
 if [ -z "$DATA_DIR" ]; then
     echo "Error: No teleop data found. Searched:"
@@ -73,6 +77,9 @@ done
 # Run the playback script
 docker exec -it ${CONTAINER_NAME} bash -c "
     cd /workspace/isaaclab && source /workspace/isaaclab/_isaac_sim/setup_conda_env.sh
+    
+    # CUDA 13 libs needed for Blackwell/GB10 GPUs
+    export LD_LIBRARY_PATH=/isaac-sim/kit/python/lib/python3.11/site-packages/nvidia/cu13/lib:\${LD_LIBRARY_PATH}
     
     DATA_DIR='$DATA_DIR'
     if [ ! -d \"\$DATA_DIR\" ]; then
