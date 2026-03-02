@@ -490,9 +490,9 @@ def _discover_pairs(world: World, robots_xform_path: str,
                   f"skipping (dofs={dof_names})")
             continue
 
-        left_arm = ArmBridge(can_interface=f"bus{can_idx}",
+        left_arm = ArmBridge(can_interface=f"can{can_idx}",
                              side="left", joint_indices=left_indices)
-        right_arm = ArmBridge(can_interface=f"bus{can_idx + 1}",
+        right_arm = ArmBridge(can_interface=f"can{can_idx + 1}",
                               side="right", joint_indices=right_indices)
         can_idx += 2
 
@@ -577,53 +577,47 @@ def _setup_camera_annotators(cameras: list[CameraInfo],
 
 
 def _snapshot_cameras(cameras: list[CameraInfo], world,
+                      pair_name: str = "",
                       resolution: tuple[int, int] = (320, 240)
                       ) -> dict[str, str]:
     """Take a one-shot JPEG snapshot of each camera, return {name: base64_jpeg}.
 
-    Creates temporary render products, renders a few frames to let them
-    warm up, grabs the data, then destroys everything.
+    Uses _setup_camera_annotators to create persistent render products
+    (stored on the CameraInfo objects). They are NOT destroyed so they
+    remain valid for teleop camera publishing later.
     """
     import base64 as b64mod
-    try:
-        import omni.replicator.core as rep
-    except ImportError:
+
+    target_cams = [c for c in cameras
+                   if not pair_name or c.pair_name == pair_name]
+    if not target_cams:
         return {}
 
-    temps: list[tuple[CameraInfo, object, object]] = []
-    for cam in cameras:
-        try:
-            rp = rep.create.render_product(cam.prim_path, resolution)
-            annot = rep.AnnotatorRegistry.get_annotator("rgb")
-            annot.attach([rp])
-            temps.append((cam, rp, annot))
-        except Exception:
-            pass
-
-    if not temps:
-        return {}
+    _setup_camera_annotators(cameras, pair_name or target_cams[0].pair_name,
+                             resolution)
 
     for _ in range(5):
         world.step(render=True)
 
     snapshots: dict[str, str] = {}
-    for cam, rp, annot in temps:
+    for cam in target_cams:
+        if cam.annotator is None:
+            continue
         try:
-            data = annot.get_data()
-            if data is not None and data.size > 0:
-                rgb = np.array(data[:, :, :3], dtype=np.uint8, copy=True)
+            data = cam.annotator.get_data()
+            if data is not None and hasattr(data, 'shape') and data.size > 0:
+                rgb = data[:, :, :3].astype(np.uint8).copy()
                 bgr = rgb[:, :, ::-1]
                 import cv2
-                _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                snapshots[cam.name] = b64mod.b64encode(buf.tobytes()).decode()
-        except Exception:
-            pass
-        try:
-            rp.destroy()
+                _, buf = cv2.imencode('.jpg', bgr,
+                                      [cv2.IMWRITE_JPEG_QUALITY, 70])
+                snapshots[cam.name] = b64mod.b64encode(
+                    buf.tobytes()).decode()
         except Exception:
             pass
 
-    print(f"[INFO] Captured {len(snapshots)} camera snapshots")
+    print(f"[INFO] Captured {len(snapshots)} camera snapshots "
+          f"for {pair_name or 'all'}")
     return snapshots
 
 
@@ -762,9 +756,12 @@ class StationManagerNode(Node):
 
     def _publish_available_cameras(self):
         snapshots: dict[str, str] = {}
-        # Skip startup snapshots — destroying temp render products
-        # corrupts subsequent render_product creation for the same prims.
-        # Snapshots will be taken on-demand by the camera wizard instead.
+        if self._world is not None and self._cameras:
+            self.get_logger().info("Taking camera snapshots for wizard...")
+            for pair in self._pairs:
+                s = _snapshot_cameras(
+                    self._cameras, self._world, pair_name=pair.prim_name)
+                snapshots.update(s)
 
         cam_info = []
         for cam in self._cameras:
