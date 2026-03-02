@@ -490,9 +490,9 @@ def _discover_pairs(world: World, robots_xform_path: str,
                   f"skipping (dofs={dof_names})")
             continue
 
-        left_arm = ArmBridge(can_interface=f"can{can_idx}",
+        left_arm = ArmBridge(can_interface=f"bus{can_idx}",
                              side="left", joint_indices=left_indices)
-        right_arm = ArmBridge(can_interface=f"can{can_idx + 1}",
+        right_arm = ArmBridge(can_interface=f"bus{can_idx + 1}",
                               side="right", joint_indices=right_indices)
         can_idx += 2
 
@@ -508,39 +508,37 @@ def _discover_pairs(world: World, robots_xform_path: str,
     return pairs
 
 
-def _discover_cameras() -> list[CameraInfo]:
-    """Find all Camera prims in the USD stage."""
+def _discover_cameras(pairs: list[StationPair]) -> list[CameraInfo]:
+    """Find Camera prims by walking each station's USD subtree."""
     stage = omni.usd.get_context().get_stage()
     cameras: list[CameraInfo] = []
 
-    for prim in stage.Traverse():
-        if not prim.IsA(UsdGeom.Camera):
-            continue
-        cam_path = str(prim.GetPath())
-        cam_name = prim.GetName()
-        name_lower = cam_name.lower()
-        path_lower = cam_path.lower()
-
-        if "ego" in name_lower or "high" in name_lower or "body" in name_lower:
-            role = "ego"
-        elif "left" in name_lower:
-            role = "left_wrist"
-        elif "right" in name_lower:
-            role = "right_wrist"
-        else:
+    for pair in pairs:
+        root = stage.GetPrimAtPath(pair.prim_path)
+        if not root or not root.IsValid():
             continue
 
-        pair_name = ""
-        parts = cam_path.split("/")
-        for part in parts:
-            if part.startswith("openarm") or part.startswith("station"):
-                pair_name = part
-                break
+        for prim in Usd.PrimRange(root):
+            if not prim.IsA(UsdGeom.Camera):
+                continue
+            cam_path = str(prim.GetPath())
+            cam_name = prim.GetName()
+            name_lower = cam_name.lower()
 
-        cameras.append(CameraInfo(
-            name=cam_name, prim_path=cam_path,
-            role=role, pair_name=pair_name))
-        print(f"[INFO] Camera: {cam_name} ({role}) at {cam_path}")
+            if "ego" in name_lower or "high" in name_lower or "body" in name_lower:
+                role = "ego"
+            elif "left" in name_lower:
+                role = "left_wrist"
+            elif "right" in name_lower:
+                role = "right_wrist"
+            else:
+                continue
+
+            cameras.append(CameraInfo(
+                name=cam_name, prim_path=cam_path,
+                role=role, pair_name=pair.prim_name))
+            print(f"[INFO] Camera: {cam_name} ({role}) "
+                  f"station={pair.prim_name} at {cam_path}")
 
     return cameras
 
@@ -576,6 +574,57 @@ def _setup_camera_annotators(cameras: list[CameraInfo],
         except Exception as e:
             print(f"[WARN] Camera {cam.name} setup failed: {e}")
     print(f"[INFO] Activated {count} camera render products for {pair_name}")
+
+
+def _snapshot_cameras(cameras: list[CameraInfo], world,
+                      resolution: tuple[int, int] = (320, 240)
+                      ) -> dict[str, str]:
+    """Take a one-shot JPEG snapshot of each camera, return {name: base64_jpeg}.
+
+    Creates temporary render products, renders a few frames to let them
+    warm up, grabs the data, then destroys everything.
+    """
+    import base64 as b64mod
+    try:
+        import omni.replicator.core as rep
+    except ImportError:
+        return {}
+
+    temps: list[tuple[CameraInfo, object, object]] = []
+    for cam in cameras:
+        try:
+            rp = rep.create.render_product(cam.prim_path, resolution)
+            annot = rep.AnnotatorRegistry.get_annotator("rgb")
+            annot.attach([rp])
+            temps.append((cam, rp, annot))
+        except Exception:
+            pass
+
+    if not temps:
+        return {}
+
+    for _ in range(5):
+        world.step(render=True)
+
+    snapshots: dict[str, str] = {}
+    for cam, rp, annot in temps:
+        try:
+            data = annot.get_data()
+            if data is not None and data.size > 0:
+                rgb = np.array(data[:, :, :3], dtype=np.uint8, copy=True)
+                bgr = rgb[:, :, ::-1]
+                import cv2
+                _, buf = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                snapshots[cam.name] = b64mod.b64encode(buf.tobytes()).decode()
+        except Exception:
+            pass
+        try:
+            rp.destroy()
+        except Exception:
+            pass
+
+    print(f"[INFO] Captured {len(snapshots)} camera snapshots")
+    return snapshots
 
 
 def _teardown_camera_annotators(cameras: list[CameraInfo]):
@@ -649,10 +698,12 @@ class StationManagerNode(Node):
     """ROS2 node for hardware advertising, teleop signalling, and publishing."""
 
     def __init__(self, pairs: list[StationPair],
-                 cameras: list[CameraInfo]):
+                 cameras: list[CameraInfo],
+                 world=None):
         super().__init__("isaac_station_manager")
         self._pairs = pairs
         self._cameras = cameras
+        self._world = world
         self._all_arms: dict[str, ArmBridge] = {}
         for pair in pairs:
             self._all_arms[pair.left.can_interface] = pair.left
@@ -710,13 +761,21 @@ class StationManagerNode(Node):
         self.get_logger().info(f"Advertised virtual CAN: {cans}")
 
     def _publish_available_cameras(self):
+        snapshots: dict[str, str] = {}
+        # Skip startup snapshots — destroying temp render products
+        # corrupts subsequent render_product creation for the same prims.
+        # Snapshots will be taken on-demand by the camera wizard instead.
+
         cam_info = []
         for cam in self._cameras:
-            cam_info.append({
+            entry = {
                 "name": cam.name, "role": cam.role,
                 "prim_path": cam.prim_path,
                 "pair_name": cam.pair_name,
-            })
+            }
+            if cam.name in snapshots:
+                entry["snapshot_b64"] = snapshots[cam.name]
+            cam_info.append(entry)
         msg = String()
         msg.data = json.dumps(cam_info)
         self._cam_pub.publish(msg)
@@ -765,10 +824,12 @@ class StationManagerNode(Node):
                     or pair.right.can_interface == follower_can):
                 follower_station = pair.prim_name
 
-        if not self._teleop_pair_name:
-            self._teleop_pair_name = leader_station or ""
+        if leader_station:
+            self._teleop_pair_name = leader_station
+        elif not self._teleop_pair_name:
+            self._teleop_pair_name = self._pairs[0].prim_name if self._pairs else ""
 
-        if follower_station and follower_station != leader_station:
+        if follower_station and follower_station != self._teleop_pair_name:
             self._teleop_follower_name = follower_station
         elif len(self._pairs) > 1:
             for pair in self._pairs:
@@ -847,7 +908,7 @@ def main():
     print(f"[INFO] Found {len(pairs)} pair(s) ({total_arms} arms)")
 
     print("[INFO] Discovering cameras...")
-    cameras = _discover_cameras()
+    cameras = _discover_cameras(pairs)
 
     keyboard = None
     if args_cli.keyboard:
@@ -855,7 +916,7 @@ def main():
         keyboard = KeyboardDevice()
 
     rclpy.init()
-    ros_node = StationManagerNode(pairs, cameras)
+    ros_node = StationManagerNode(pairs, cameras, world=world)
     spin_thread = threading.Thread(
         target=rclpy.spin, args=(ros_node,), daemon=True)
     spin_thread.start()
@@ -1023,6 +1084,8 @@ def main():
                 if follower_pair is not None:
                     _setup_camera_annotators(
                         cameras, follower_pair.prim_name)
+                    for _ in range(5):
+                        world.step(render=True)
                     cameras_active = True
 
                 print(f"[INFO] Teleop activated: leader={teleop_pair.prim_name}"
@@ -1221,6 +1284,7 @@ def main():
             # Publish camera images from the follower pair (throttled)
             if cameras_active and follower_pair is not None and now - last_cam_pub >= cam_pub_period:
                 last_cam_pub = now
+                cam_pub_count = 0
                 for cam in cameras:
                     if cam.pair_name != follower_pair.prim_name:
                         continue
@@ -1228,14 +1292,24 @@ def main():
                         continue
                     try:
                         data = cam.annotator.get_data()
-                        if data is not None and data.size > 0:
-                            rgb = np.array(data[:, :, :3], dtype=np.uint8,
-                                           copy=True)
+                        if (data is not None and hasattr(data, 'shape')
+                                and len(data.shape) == 3
+                                and data.shape[2] >= 3
+                                and data.size > 0):
+                            if data.dtype in (np.float32, np.float64):
+                                rgb = (data[:, :, :3] * 255).clip(0, 255).astype(np.uint8).copy()
+                            else:
+                                rgb = data[:, :, :3].astype(np.uint8).copy()
                             topic = f'/isaac_sim/camera/{cam.role}'
                             pub = ros_node.get_or_create_camera_pub(topic)
                             pub.publish(_build_image_msg(stamp, rgb))
+                            cam_pub_count += 1
                     except Exception:
                         pass
+                if cam_pub_count > 0 and not hasattr(ros_node, '_cam_pub_logged'):
+                    ros_node._cam_pub_logged = True
+                    print(f"[INFO] Publishing {cam_pub_count} camera feed(s) "
+                          f"from {follower_pair.prim_name}")
 
     except KeyboardInterrupt:
         print("\n[INFO] Shutting down...")
