@@ -49,11 +49,11 @@ parser.add_argument("--num_envs", type=int, default=1, help="Number of environme
 parser.add_argument("--host", type=str, default="localhost", help="OpenPI policy server host")
 parser.add_argument("--port", type=int, default=8000, help="OpenPI policy server port")
 parser.add_argument("--action_horizon", type=int, default=10, help="Action chunk size")
-parser.add_argument("--prompt", type=str, default="put your hands on the table",
+parser.add_argument("--prompt", type=str, default="lift arms on the table.",
                     help="Task prompt for VLA")
 parser.add_argument("--max_hz", type=float, default=50.0, help="Max control frequency")
-parser.add_argument("--num_episodes", type=int, default=1, help="Number of episodes to run")
-parser.add_argument("--max_episode_steps", type=int, default=1000, help="Max steps per episode")
+parser.add_argument("--num_episodes", type=int, default=999999, help="Number of episodes to run")
+parser.add_argument("--max_episode_steps", type=int, default=999999, help="Max steps per episode")
 
 parser.add_argument("--no_cameras", action="store_true", help="Disable camera capture (use black images)")
 parser.add_argument("--interactive", action="store_true",
@@ -113,6 +113,10 @@ class KeyboardListener:
         self._quit_requested = False
         self._spawn_requested = False
         self._reset_pool_requested = False
+        self._spawn_avocado_requested = False
+        self._spawn_mug_requested = False
+        self._reset_arms_requested = False
+        self._input_disabled = False  # Disable keyboard handling while entering prompt
         
         # Set up keyboard input using Isaac Sim's system
         self._input = carb.input.acquire_input_interface()
@@ -127,14 +131,21 @@ class KeyboardListener:
         print("="*60)
         print("  P: Pause and enter new prompt")
         print("  Q: Quit current episode")
-        print("  C: Spawn object on workspace")
+        print("  C: Spawn random object on workspace")
+        print("  A: Spawn avocado on workspace")
+        print("  M: Spawn mug on workspace")
         print("  B: Reset all objects to pool")
+        print("  R: Reset arms to initial position")
         print("  Ctrl+C: Exit completely")
         print("="*60 + "\n")
         
     def _on_keyboard_event(self, event, *args, **kwargs):
         """Handle keyboard events from Isaac Sim."""
         if event.type != self._carb_input.KeyboardEventType.KEY_PRESS:
+            return True
+        
+        # Skip keyboard handling when input is disabled (e.g., during prompt entry)
+        if self._input_disabled:
             return True
             
         key = event.input
@@ -155,6 +166,18 @@ class KeyboardListener:
             self._reset_pool_requested = True
             print("[KEYBOARD] Reset pool requested")
             return False
+        elif key == self._carb_input.KeyboardInput.A:
+            self._spawn_avocado_requested = True
+            print("[KEYBOARD] Spawn avocado requested")
+            return False
+        elif key == self._carb_input.KeyboardInput.R:
+            self._reset_arms_requested = True
+            print("[KEYBOARD] Reset arms requested")
+            return False
+        elif key == self._carb_input.KeyboardInput.M:
+            self._spawn_mug_requested = True
+            print("[KEYBOARD] Spawn mug requested")
+            return False
             
         return True
         
@@ -167,6 +190,24 @@ class KeyboardListener:
         if hasattr(self, '_sub_keyboard') and self._sub_keyboard:
             self._input.unsubscribe_to_keyboard_events(self._keyboard, self._sub_keyboard)
             self._sub_keyboard = None
+    
+    def disable_input(self):
+        """Disable keyboard event handling (e.g., during prompt entry)."""
+        self._input_disabled = True
+    
+    def enable_input(self):
+        """Re-enable keyboard event handling."""
+        self._input_disabled = False
+    
+    def clear_all_flags(self):
+        """Clear all pending keyboard flags (use after re-enabling input)."""
+        self._pause_requested = False
+        self._spawn_requested = False
+        self._reset_pool_requested = False
+        self._spawn_avocado_requested = False
+        self._spawn_mug_requested = False
+        self._reset_arms_requested = False
+        # Note: don't clear _quit_requested as that should persist
             
     def check_pause(self) -> bool:
         """Check if pause was requested. Clears the flag after reading."""
@@ -192,6 +233,27 @@ class KeyboardListener:
             self._reset_pool_requested = False
             return True
         return False
+    
+    def check_spawn_avocado(self) -> bool:
+        """Check if spawn avocado was requested. Clears the flag after reading."""
+        if self._spawn_avocado_requested:
+            self._spawn_avocado_requested = False
+            return True
+        return False
+    
+    def check_spawn_mug(self) -> bool:
+        """Check if spawn mug was requested. Clears the flag after reading."""
+        if self._spawn_mug_requested:
+            self._spawn_mug_requested = False
+            return True
+        return False
+    
+    def check_reset_arms(self) -> bool:
+        """Check if reset arms was requested. Clears the flag after reading."""
+        if self._reset_arms_requested:
+            self._reset_arms_requested = False
+            return True
+        return False
 
 
 class OpenArmBimanualEnvironment:
@@ -211,12 +273,13 @@ class OpenArmBimanualEnvironment:
     """
 
     def __init__(self, env, prompt: str = "perform the task", use_cameras: bool = True, 
-                 keyboard_listener: KeyboardListener = None):
+                 keyboard_listener: KeyboardListener = None, policy=None):
         self._env = env
         self._prompt = prompt
         self._use_cameras = use_cameras
         self._device = env.unwrapped.device
         self._keyboard_listener = keyboard_listener
+        self._policy = policy  # Reference to ActionChunkBroker to reset cache on prompt change
 
         self._unwrapped = env.unwrapped
         if hasattr(self._unwrapped, 'unwrapped'):
@@ -329,6 +392,24 @@ class OpenArmBimanualEnvironment:
         print("[Pool] All pools exhausted!")
         return False
 
+    def reset_arms(self):
+        """Reset robot arms to their initial/default positions."""
+        # Get default joint positions from robot
+        default_joint_pos = self._robot.data.default_joint_pos.clone()
+        default_joint_vel = torch.zeros_like(self._robot.data.default_joint_vel)
+        
+        # Write to simulation
+        self._robot.write_joint_state_to_sim(default_joint_pos, default_joint_vel)
+        self._robot.set_joint_position_target(default_joint_pos)
+        self._robot.write_data_to_sim()
+        
+        # Step simulation to let reset settle
+        for _ in range(10):
+            self._unwrapped.sim.step(render=False)
+            self._robot.update(self._unwrapped.sim.get_physics_dt())
+        
+        print("[Robot] Arms reset to initial position")
+
     def reset_all_objects(self):
         """Return all active objects to their pool positions."""
         for obj_info in self._active_objects:
@@ -346,6 +427,69 @@ class OpenArmBimanualEnvironment:
         
         self._active_objects.clear()
         print("[Pool] All objects returned to pool")
+
+    def spawn_mug(self, position=None):
+        """Spawn a mug from the mugs pool onto the workspace."""
+        if position is None:
+            spawn_x = random.uniform(0.20, 0.35)
+            spawn_y = random.uniform(-0.15, 0.15)
+            spawn_z = 0.32
+            position = (spawn_x, spawn_y, spawn_z)
+        
+        # Spawn first available mug
+        for obj in self._object_pool["mugs"]:
+            if not obj["active"]:
+                obj["active"] = True
+                asset = obj["asset"]
+                
+                pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
+                quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
+                vel = torch.zeros((1, 6), device=asset.device)
+                
+                asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+                asset.write_root_velocity_to_sim(vel)
+                
+                self._active_objects.append({"asset": asset, "type": "mugs"})
+                print(f"[Pool] Spawned mug at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+                return True
+        
+        print("[Pool] No mug available in pool!")
+        return False
+
+    def spawn_avocado(self, position=None):
+        """Spawn the avocado (pool_fruit_3, index 3) onto the workspace."""
+        if position is None:
+            spawn_x = random.uniform(0.20, 0.35)
+            spawn_y = random.uniform(-0.15, 0.15)
+            spawn_z = 0.32
+            position = (spawn_x, spawn_y, spawn_z)
+        
+        # Avocado is specifically at index 3 in the fruits pool
+        # (pool_fruit_0=orange, pool_fruit_1=lemon, pool_fruit_2=lime, pool_fruit_3=avocado)
+        AVOCADO_INDEX = 3
+        
+        for obj in self._object_pool["fruits"]:
+            if obj["idx"] == AVOCADO_INDEX:
+                if obj["active"]:
+                    print("[Pool] Avocado is already on the workspace!")
+                    return False
+                    
+                obj["active"] = True
+                asset = obj["asset"]
+                
+                pos = torch.tensor([[position[0], position[1], position[2]]], device=asset.device)
+                quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=asset.device)
+                vel = torch.zeros((1, 6), device=asset.device)
+                
+                asset.write_root_pose_to_sim(torch.cat([pos, quat], dim=-1))
+                asset.write_root_velocity_to_sim(vel)
+                
+                self._active_objects.append({"asset": asset, "type": "fruits"})
+                print(f"[Pool] Spawned avocado at ({position[0]:.2f}, {position[1]:.2f}, {position[2]:.2f})")
+                return True
+        
+        print("[Pool] Avocado not found in pool!")
+        return False
 
     def _init_cameras_replicator(self):
         """Initialize cameras using omni.replicator render products (matches data collection)."""
@@ -430,13 +574,15 @@ class OpenArmBimanualEnvironment:
     def set_prompt(self, prompt: str):
         self._prompt = prompt
         print(f"[INFO] Prompt set to: {prompt}")
+        # Reset the action chunk broker's cache so it immediately infers with new prompt
+        if self._policy is not None:
+            self._policy.reset()
+            print("[INFO] Action cache cleared - new actions will use updated prompt")
 
     def reset(self) -> None:
-        print("[DEBUG] Environment reset() called")
         self._obs, _ = self._env.reset()
         self._done = False
         self._step_count = 0
-        print(f"[DEBUG] After reset: _done={self._done}, _step_count={self._step_count}")
 
         if self._use_cameras and not self._cameras_initialized:
             self._init_cameras_replicator()
@@ -505,9 +651,18 @@ class OpenArmBimanualEnvironment:
                 
             if self._keyboard_listener.check_spawn():
                 self.spawn_random_object()
+            
+            if self._keyboard_listener.check_spawn_avocado():
+                self.spawn_avocado()
+            
+            if self._keyboard_listener.check_spawn_mug():
+                self.spawn_mug()
                 
             if self._keyboard_listener.check_reset_pool():
                 self.reset_all_objects()
+            
+            if self._keyboard_listener.check_reset_arms():
+                self.reset_arms()
         
         vla_actions = action.get("actions")
 
@@ -539,30 +694,38 @@ class OpenArmBimanualEnvironment:
 
         self._step_count += 1
 
-        if hasattr(dones, 'any'):
-            self._done = dones.any().item()
-        else:
-            self._done = bool(dones)
-        
-        if self._step_count <= 5 or self._done:
-            print(f"[DEBUG] Step {self._step_count}: done={self._done}, dones_raw={dones}")
+        # Completely ignore environment's done signal - only quit via 'Q' key or window close
+        # This allows continuous operation without timeouts or resets
     
     def _handle_pause(self):
-        """Handle pause: prompt for new instruction and resume."""
+        """Handle pause: prompt for new instruction via terminal input."""
         print("\n" + "=" * 50)
         print("[PAUSED] Robot paused.")
         print(f"Current prompt: {self._prompt}")
         print("=" * 50)
-        print("Enter new prompt in the terminal (or press Enter to keep current):")
+        print("Type new prompt and press Enter (or just Enter to keep current):")
         
+        new_prompt = ""
         try:
-            new_prompt = input("> ").strip()
-            if new_prompt:
-                self._prompt = new_prompt
-                print(f"[INFO] Prompt updated to: {self._prompt}")
-            else:
-                print("[INFO] Keeping current prompt.")
-        except EOFError:
+            # Try to open /dev/tty directly for interactive input
+            # This works even when stdout is redirected
+            with open('/dev/tty', 'r') as tty:
+                print("> ", end="", flush=True)
+                new_prompt = tty.readline().strip()
+        except (OSError, IOError):
+            # Fallback to regular stdin
+            try:
+                print("> ", end="", flush=True)
+                new_prompt = input().strip()
+            except (EOFError, KeyboardInterrupt):
+                new_prompt = ""
+        except Exception as e:
+            print(f"[WARN] Could not read input: {e}")
+            new_prompt = ""
+        
+        if new_prompt:
+            self.set_prompt(new_prompt)
+        else:
             print("[INFO] Keeping current prompt.")
         
         print("[RESUMED] Continuing execution...")
@@ -615,11 +778,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     keyboard_listener = KeyboardListener()
     keyboard_listener.start()
 
+    # Create the policy/broker FIRST so we can pass it to the wrapper
+    # This allows the wrapper to reset the action cache when the prompt changes
+    broker = action_chunk_broker.ActionChunkBroker(
+        policy=websocket_client_policy.WebsocketClientPolicy(
+            host=args_cli.host,
+            port=args_cli.port,
+        ),
+        action_horizon=args_cli.action_horizon,
+    )
+
     openpi_env = OpenArmBimanualEnvironment(
         env=env,
         prompt=args_cli.prompt,
         use_cameras=use_cameras,
         keyboard_listener=keyboard_listener,
+        policy=broker,  # Pass broker so wrapper can reset cache on prompt change
     )
 
     # Spawn objects if requested
@@ -641,15 +815,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     runtime = openpi_runtime.Runtime(
         environment=openpi_env,
-        agent=policy_agent.PolicyAgent(
-            policy=action_chunk_broker.ActionChunkBroker(
-                policy=websocket_client_policy.WebsocketClientPolicy(
-                    host=args_cli.host,
-                    port=args_cli.port,
-                ),
-                action_horizon=args_cli.action_horizon,
-            )
-        ),
+        agent=policy_agent.PolicyAgent(policy=broker),
         subscribers=[],
         max_hz=args_cli.max_hz,
         num_episodes=args_cli.num_episodes,

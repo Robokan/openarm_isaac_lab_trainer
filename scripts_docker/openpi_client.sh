@@ -30,7 +30,7 @@ TASK="Isaac-Reach-OpenArm-Bi-Teleop-v0"
 # Parse arguments
 HOST="localhost"
 PORT="8000"
-PROMPT="put your hands on the table"
+PROMPT="lift arms on the table."
 INTERACTIVE=""
 SPAWN_OBJECTS=""
 HEADLESS=""

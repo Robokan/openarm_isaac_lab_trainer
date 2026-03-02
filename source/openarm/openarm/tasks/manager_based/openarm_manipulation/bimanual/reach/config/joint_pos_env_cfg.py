@@ -393,6 +393,9 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
         # post init of parent
         super().__post_init__()
 
+        # Disable episode timeout for continuous teleoperation/inference
+        self.episode_length_s = 99999.0
+
         # Use factory USD (includes table + cameras)
         self.scene.robot = OPEN_ARM_FACTORY_HIGH_PD_CFG.replace(
             prim_path="{ENV_REGEX_NS}/Robot",
@@ -516,9 +519,9 @@ class OpenArmReachEnvCfg_TELEOP(OpenArmReachEnvCfg):
             use_default_offset=False,
         )
 
-        # Randomize starting joint pose (arms only, smaller offsets)
+        # No randomization on reset for inference - use exact default positions
         self.events.reset_robot_joints.func = mdp.reset_joints_by_offset
-        self.events.reset_robot_joints.params["position_range"] = (-0.5, 0.5)
+        self.events.reset_robot_joints.params["position_range"] = (0.0, 0.0)
         self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
         self.events.reset_robot_joints.params["asset_cfg"] = SceneEntityCfg(
             "robot",
