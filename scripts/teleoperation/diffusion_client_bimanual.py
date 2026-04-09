@@ -82,6 +82,32 @@ GRIPPER_OPEN_POS = 0.044
 VLA_DOF = 16
 ENV_DOF = 18
 
+# Arm raise trajectory - matches SparkJAX openpi_runner_node.py
+# 16 DOF: [left_arm(7), left_grip(1), right_arm(7), right_grip(1)]
+_LIFT_SPINE = np.array([
+    [0.266, -0.049, -0.064, 0.345, -0.007, 0.102, -0.023, 0.004,
+     -0.266, 0.049, 0.064, 0.345, 0.007, -0.102, 0.023, 0.004],
+    [0.287, -0.049, -0.064, 0.364, -0.006, 0.102, -0.072, 0.004,
+     -0.287, 0.049, 0.064, 0.364, 0.006, -0.102, 0.072, 0.004],
+    [0.559, -0.049, -0.064, 0.611, -0.006, 0.102, -0.228, 0.004,
+     -0.559, 0.049, 0.064, 0.611, 0.006, -0.102, 0.228, 0.004],
+    [0.866, -0.049, -0.064, 1.022, -0.008, 0.102, -0.423, 0.004,
+     -0.866, 0.049, 0.064, 1.022, 0.008, -0.102, 0.423, 0.004],
+    [1.052, -0.049, -0.064, 1.170, -0.011, 0.102, -0.713, 0.004,
+     -1.052, 0.049, 0.064, 1.170, 0.011, -0.102, 0.713, 0.004],
+    [1.253, -0.049, -0.064, 1.377, -0.011, 0.102, -0.955, 0.004,
+     -1.253, 0.049, 0.064, 1.377, 0.011, -0.102, 0.955, 0.004],
+    [1.359, -0.049, -0.064, 1.442, -0.011, 0.102, -1.179, 0.004,
+     -1.359, 0.049, 0.064, 1.442, 0.011, -0.102, 1.179, 0.004],
+    [1.427, -0.050, -0.064, 1.530, -0.011, 0.102, -1.285, 0.004,
+     -1.427, 0.050, 0.064, 1.530, 0.011, -0.102, 1.285, 0.004],
+    [1.427, -0.050, -0.064, 1.530, -0.011, 0.102, -1.391, 0.004,
+     -1.427, 0.050, 0.064, 1.530, 0.011, -0.102, 1.391, 0.004],
+], dtype=np.float64)
+_ARMS_UP = _LIFT_SPINE[-1].copy()
+_RAISE_DURATION_S = 1.5
+_RAISE_HZ = 50
+
 
 class KeyboardListener:
     """Keyboard listener using Isaac Sim's input system."""
@@ -291,6 +317,66 @@ class OpenArmBimanualEnvironment:
             self._robot.update(self._unwrapped.sim.get_physics_dt())
         
         print("[Robot] Arms reset to initial position")
+
+    def raise_arms(self):
+        """Raise arms to 'arms up' position - matches SparkJAX behavior.
+        
+        Interpolates through _LIFT_SPINE trajectory to reach _ARMS_UP position.
+        This ensures the simulation starts from the same pose as real robot.
+        """
+        print("[Robot] Raising arms to start position...")
+        
+        num_frames = int(_RAISE_DURATION_S * _RAISE_HZ)
+        n_wp = len(_LIFT_SPINE)
+        t_wp = np.linspace(0.0, 1.0, n_wp)
+        t_out = np.linspace(0.0, 1.0, num_frames)
+        
+        # Interpolate trajectory
+        trajectory = np.zeros((num_frames, 16), dtype=np.float64)
+        for j in range(16):
+            trajectory[:, j] = np.interp(t_out, t_wp, _LIFT_SPINE[:, j])
+        
+        step_time = 1.0 / _RAISE_HZ
+        
+        for i, pos in enumerate(trajectory):
+            # Expand 16 DOF to 18 DOF (duplicate gripper values)
+            left_arm = pos[0:7]
+            left_grip = pos[7]
+            right_arm = pos[8:15]
+            right_grip = pos[15]
+            
+            expanded = np.concatenate([
+                left_arm,
+                [left_grip, left_grip],
+                right_arm,
+                [right_grip, right_grip],
+            ])
+            
+            action_tensor = torch.tensor(
+                expanded, dtype=torch.float32, device=self._device
+            ).unsqueeze(0)
+            
+            self._env.step(action_tensor)
+            time.sleep(step_time)
+        
+        # Hold at final position for stability
+        hold_frames = int(_RAISE_HZ * 0.5)
+        final_pos = trajectory[-1]
+        expanded_final = np.concatenate([
+            final_pos[0:7],
+            [final_pos[7], final_pos[7]],
+            final_pos[8:15],
+            [final_pos[15], final_pos[15]],
+        ])
+        final_tensor = torch.tensor(
+            expanded_final, dtype=torch.float32, device=self._device
+        ).unsqueeze(0)
+        
+        for _ in range(hold_frames):
+            self._env.step(final_tensor)
+            time.sleep(step_time)
+        
+        print("[Robot] Arms raised successfully")
 
     def reset_all_objects(self):
         for obj_info in self._active_objects:
@@ -530,6 +616,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         keyboard_listener=keyboard_listener,
         policy=broker,
     )
+
+    # Reset environment and raise arms (matches SparkJAX real robot behavior)
+    openpi_env.reset()
+    openpi_env.raise_arms()
 
     if getattr(args_cli, 'spawn_objects', False):
         print("\n[INFO] Spawning object on workspace...")

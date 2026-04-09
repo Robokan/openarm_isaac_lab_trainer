@@ -13,6 +13,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 SPARKPACK_ROOT="$(dirname "$REPO_ROOT")"
 
+# Always enable X11 forwarding (needed even when restarting existing container)
+xhost +local:docker >/dev/null 2>&1
+xhost +local:root >/dev/null 2>&1
+
 # Check if container already exists
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     echo "Container '${CONTAINER_NAME}' already exists."
@@ -29,10 +33,6 @@ fi
 # Create cache directories if they don't exist
 mkdir -p ~/docker/isaac-sim/cache/{kit,ov,pip,glcache,computecache}
 mkdir -p ~/docker/isaac-sim/{logs,data,documents}
-
-# Enable X11 forwarding
-xhost +local:docker >/dev/null 2>&1
-xhost +local:root >/dev/null 2>&1
 
 # Ensure .Xauthority exists as a file (Docker mounts missing files as directories)
 touch "$HOME/.Xauthority" 2>/dev/null || true
