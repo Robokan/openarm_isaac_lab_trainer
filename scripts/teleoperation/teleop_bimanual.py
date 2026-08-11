@@ -2336,9 +2336,9 @@ def run_teleop(env, args):
                 lerobot_episode_count = max(episode_nums) + 1
                 print(f"[LeRobot] Found {len(existing_episodes)} existing episodes, starting from episode_{lerobot_episode_count}")
     
-    # LeRobot-compatible format - convert using openpi/examples/openarm/convert_to_lerobot.py
+    # LeRobot-compatible fallback format - convert with scripts/convert_teleop_to_lerobot.py
     print("[LeRobot] Will save in LeRobot-compatible format (parquet + images)")
-    print("[LeRobot] Convert to native format using: openpi/examples/openarm/convert_to_lerobot.py")
+    print("[LeRobot] Convert to native v3 with: python scripts/convert_teleop_to_lerobot.py --input vla_teleop_data")
     
     # Get USD stage for cube spawning and markers
     try:
